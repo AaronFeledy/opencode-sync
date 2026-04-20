@@ -33,7 +33,7 @@ bun link opencode-sync-plugin
 
 ```jsonc
 {
-  "plugins": [
+  "plugin": [
     "opencode-sync-plugin"
   ]
 }

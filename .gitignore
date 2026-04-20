@@ -17,6 +17,13 @@ bun.lockb
 *.db
 *.db-*
 
+# Local setup/bootstrap scripts that may contain secrets — keep out of the repo
+setup-*.sh
+bootstrap-*.sh
+*.secret
+secrets/
+secrets.*
+
 # Server runtime state (when running locally for dev)
 server/data/
 
