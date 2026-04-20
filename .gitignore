@@ -1,0 +1,25 @@
+node_modules
+dist
+*.log
+.DS_Store
+
+# Bun
+bun.lockb
+
+# TypeScript build info
+*.tsbuildinfo
+
+# Local dev
+.env
+.env.local
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+
+# Server runtime state (when running locally for dev)
+server/data/
+
+# IDE
+.vscode/
+.idea/

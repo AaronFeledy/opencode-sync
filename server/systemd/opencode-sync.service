@@ -1,0 +1,22 @@
+[Unit]
+Description=opencode-sync ledger server
+After=network-online.target zerotier-one.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=opencode-sync
+Group=opencode-sync
+EnvironmentFile=/etc/opencode-sync/env
+ExecStart=/usr/local/bin/opencode-sync-server
+Restart=on-failure
+RestartSec=5s
+StateDirectory=opencode-sync
+StateDirectoryMode=0750
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

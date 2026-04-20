@@ -1,0 +1,27 @@
+{
+  "name": "opencode-sync",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Cross-machine session + config sync for opencode, coordinated through a self-hosted server on your VPS.",
+  "workspaces": [
+    "shared",
+    "server",
+    "plugin"
+  ],
+  "scripts": {
+    "build": "bun run --cwd shared build && bun run --cwd plugin build && bun run --cwd server build",
+    "typecheck": "bun run --cwd shared typecheck && bun run --cwd plugin typecheck && bun run --cwd server typecheck",
+    "server:dev": "bun run --cwd server dev",
+    "server:start": "bun run --cwd server start",
+    "test": "bun run scripts/test.ts",
+    "pretest": "mkdir -p /tmp/opencode-sync-test-home"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "bun-types": "^1.3.12",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "bun": ">=1.1.0"
+  }
+}

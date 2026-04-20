@@ -1,0 +1,16 @@
+{
+  "name": "@opencode-sync/server",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "bun run --watch src/index.ts",
+    "start": "bun run src/index.ts",
+    "build": "bun build ./src/index.ts --target bun --compile --outfile dist/opencode-sync-server",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode-sync/shared": "workspace:*"
+  }
+}
