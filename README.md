@@ -72,12 +72,13 @@ cd ~/projects/opencode-sync
 bun install
 bun run --cwd plugin build
 
-# Register and consume the link
-cd plugin && bun link
-cd ~/.config/opencode && bun link opencode-sync-plugin
+# Drop a symlink into opencode's auto-load plugin directory
+mkdir -p ~/.config/opencode/plugins
+ln -s ~/projects/opencode-sync/plugin/dist/index.js \
+      ~/.config/opencode/plugins/opencode-sync-plugin.js
 ```
 
-Then add the plugin to the `"plugin"` array in `~/.config/opencode/opencode.json` and create `~/.config/opencode/opencode-sync.jsonc` per [`plugin/README.md`](./plugin/README.md). Use a unique `machine_id` on each machine (e.g. `desktop`, `laptop`, `vps`).
+Then create `~/.config/opencode/opencode-sync.jsonc` per [`plugin/README.md`](./plugin/README.md). Use a unique `machine_id` on each machine (e.g. `desktop`, `laptop`, `vps`). No `opencode.json` change is needed — opencode auto-loads everything in `~/.config/opencode/plugins/`.
 
 ### 3. Updating
 

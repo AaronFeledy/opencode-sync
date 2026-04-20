@@ -4,7 +4,7 @@ An opencode plugin that syncs sessions, messages, and config files across machin
 
 ## Installation
 
-This plugin is **not published to npm** — it lives in this repo and is installed by cloning the repo and linking the workspace into opencode's plugin loader.
+This plugin is **not published to npm** — it lives in this repo and is installed by cloning the repo and dropping a symlink into opencode's auto-load plugin directory (the same pattern opencode itself uses for local plugins like `~/.config/opencode/plugins/anthropic-auth.ts`).
 
 ### 1. Clone and build the repo on the machine
 
@@ -15,33 +15,40 @@ bun install
 bun run --cwd plugin build
 ```
 
-### 2. Link the plugin into opencode
+The build emits a single bundled file at `plugin/dist/index.js`.
 
-`bun link` registers the package globally on the machine, then opencode's `node_modules` resolves it.
+### 2. Symlink into opencode's auto-load plugin directory
 
 ```bash
-# Register the workspace as a globally linkable package
-cd ~/projects/opencode-sync/plugin
-bun link
-
-# Consume the link from opencode's config dir
-cd ~/.config/opencode
-bun link opencode-sync-plugin
+mkdir -p ~/.config/opencode/plugins
+ln -s ~/projects/opencode-sync/plugin/dist/index.js \
+      ~/.config/opencode/plugins/opencode-sync-plugin.js
 ```
 
-### 3. Enable it in `opencode.json` (or `opencode.jsonc`)
+That's the whole installation. opencode auto-loads every file in `~/.config/opencode/plugins/` on startup — no `opencode.json` change needed.
 
-```jsonc
-{
-  "plugin": [
-    "opencode-sync-plugin"
-  ]
-}
+> **Why not `bun link`?** opencode resolves named entries in `opencode.json`'s `"plugin"` array against `~/.cache/opencode/node_modules/<name>/` and `~/.config/opencode/plugin/<name>.js` (singular), but **not** against `~/.config/opencode/node_modules/`. `bun link` puts the package in the latter, so opencode never finds it. The symlink-into-`plugins/` (plural) approach matches what opencode does for its own bundled local plugins.
+
+### 3. Verify it loaded
+
+After starting opencode (TUI, `serve`, or `run`), you should see lines like this in stdout/stderr:
+
+```
+opencode-sync: initializing {"server":"http://...","machine":"desktop","syncInterval":15}
+opencode-sync: connected to server {"version":"0.0.1","serverTime":...}
+opencode-sync: state loaded {"lastPulledSeq":0,"trackedRows":0}
+opencode-sync: opened opencode database {"path":"/home/.../opencode.db"}
+```
+
+opencode's own log at `~/.local/share/opencode/log/<timestamp>.log` will also show:
+
+```
+service=plugin path=file:///home/.../opencode-sync-plugin.js loading plugin
 ```
 
 ### Updating
 
-Pull the repo and rebuild — the link stays valid:
+Pull the repo and rebuild — the symlink stays valid because `dist/index.js` is rewritten in place:
 
 ```bash
 cd ~/projects/opencode-sync && git pull && bun install && bun run --cwd plugin build

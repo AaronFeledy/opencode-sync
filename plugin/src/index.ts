@@ -19,8 +19,13 @@ import { createEventHandler } from "./hooks.js";
 import { applyLoadedOverrides } from "./overrides.js";
 
 // ── Plugin module exports ──────────────────────────────────────────
-
-export const id = "opencode-sync";
+//
+// opencode loads plugin files from ~/.config/opencode/plugins/ and iterates
+// every named export, requiring each to be a function. We MUST NOT export a
+// non-function named binding (e.g. a string `id`) at module top level —
+// that would trip opencode's plugin loader with "Plugin export is not a
+// function". The plugin's identity for our own logging is just the string
+// embedded inside the `log()` helper below.
 
 export const server: Plugin = async (_input, _options) => {
   const log = (msg: string, data?: Record<string, unknown>) => {
