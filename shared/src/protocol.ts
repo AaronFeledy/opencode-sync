@@ -65,6 +65,32 @@ export interface PullResponse {
   more: boolean;
 }
 
+// ── Heads (deletion-safety cross-check) ─────────────────────────────
+
+/**
+ * Request payload for `POST /sync/heads`. The plugin sends a list of
+ * `(kind, id)` pairs it's considering tombstoning; the server replies
+ * with the current `time_updated` and `deleted` state for each row it
+ * has on file. Rows the server has never seen are simply omitted from
+ * the response (not returned with a sentinel) — keeps the response
+ * compact when most candidates are unknown.
+ */
+export interface HeadsRequest {
+  machine_id: string;
+  row_keys: Array<{ kind: SyncKind; id: string }>;
+}
+
+export interface HeadEntry {
+  kind: SyncKind;
+  id: string;
+  time_updated: number;
+  deleted: boolean;
+}
+
+export interface HeadsResponse {
+  heads: HeadEntry[];
+}
+
 // ── Health ──────────────────────────────────────────────────────────
 
 export interface HealthResponse {

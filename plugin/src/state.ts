@@ -34,6 +34,40 @@ export interface SyncState {
   knownFiles: Record<string, { sha256: string; mtime: number; size: number }>;
   /** Last time we ran file sync (ms epoch) */
   lastFileSyncTime: number;
+  /**
+   * Fingerprint of the opencode.db file as observed at the end of the last
+   * successful push. Used by the deletion-safety guard to detect when the
+   * DB was wiped, restored from backup, or replaced from under us — in
+   * which case `buildDeletionEnvelopes` would otherwise interpret every
+   * `knownRows` entry as an intentional deletion and tombstone the entire
+   * fleet's data.
+   *
+   * `null` until the first successful capture (e.g. fresh install before
+   * the first sync, or older state.json upgraded in place).
+   *
+   * `mtime` and `size` come from `fs.statSync`; `inode` distinguishes
+   * "same path, different file" (atomic rename / restore-from-backup),
+   * which `mtime` alone can miss when the replacement happens to share a
+   * timestamp with the original.
+   */
+  dbFingerprint: { inode: number; mtime: number; size: number } | null;
+  /**
+   * Two-cycle deletion confirmation buffer. Keys are the same `${kind}:${id}`
+   * shape as `knownRows`; values track when we first noticed the row was
+   * missing and what `time_updated` we last knew it had.
+   *
+   * On detection, a candidate moves into this buffer instead of being
+   * tombstoned immediately. On the NEXT sync cycle, if it's still missing
+   * AND has been pending for at least `TOMBSTONE_CONFIRMATION_DELAY_MS`,
+   * we emit the tombstone. If the row reappears in the live DB, the
+   * pending entry is dropped — protects against transient DB-locked /
+   * mid-migration / mid-restore false positives.
+   *
+   * Persisted across plugin restarts so a crash mid-confirmation doesn't
+   * reset the timer (and doesn't open a window where a freshly-restarted
+   * plugin tombstones things on the very first cycle).
+   */
+  pendingTombstones: Record<string, { firstSeenAt: number; knownTimeUpdated: number }>;
 }
 
 /** JSON-serialisable representation of SyncState */
@@ -45,6 +79,8 @@ interface SyncStateJson {
   knownRows?: Record<string, number>;
   knownFiles?: Record<string, { sha256: string; mtime: number; size?: number }>;
   lastFileSyncTime: number;
+  dbFingerprint?: { inode: number; mtime: number; size: number } | null;
+  pendingTombstones?: Record<string, { firstSeenAt: number; knownTimeUpdated: number }>;
 }
 
 /**
@@ -77,6 +113,8 @@ export class StateManager {
       knownRows: {},
       knownFiles: {},
       lastFileSyncTime: 0,
+      dbFingerprint: null,
+      pendingTombstones: {},
     };
   }
 
@@ -94,6 +132,8 @@ export class StateManager {
       this._state.knownRows = this.parseKnownRows(json.knownRows);
       this._state.knownFiles = this.parseKnownFiles(json.knownFiles);
       this._state.lastFileSyncTime = json.lastFileSyncTime ?? 0;
+      this._state.dbFingerprint = this.parseDbFingerprint(json.dbFingerprint);
+      this._state.pendingTombstones = this.parsePendingTombstones(json.pendingTombstones);
 
       // Preserve machineId from constructor — don't override with stale file
     } catch {
@@ -113,6 +153,8 @@ export class StateManager {
       knownRows: this._state.knownRows,
       knownFiles: this._state.knownFiles,
       lastFileSyncTime: this._state.lastFileSyncTime,
+      dbFingerprint: this._state.dbFingerprint,
+      pendingTombstones: this._state.pendingTombstones,
     };
 
     atomicWriteFileSync(STATE_FILE, JSON.stringify(json, null, 2));
@@ -226,6 +268,71 @@ export class StateManager {
     if (changed) this.maybeSave();
   }
 
+  /**
+   * Capture the current opencode.db fingerprint. Called after a successful
+   * pushAll so the next sync cycle can detect a wipe/restore/replacement.
+   *
+   * Idempotent: same fingerprint passed in twice is a no-op (no save).
+   */
+  setDbFingerprint(
+    fingerprint: { inode: number; mtime: number; size: number } | null,
+  ): void {
+    const current = this._state.dbFingerprint;
+    if (
+      current === fingerprint ||
+      (current &&
+        fingerprint &&
+        current.inode === fingerprint.inode &&
+        current.mtime === fingerprint.mtime &&
+        current.size === fingerprint.size)
+    ) {
+      return;
+    }
+    this._state.dbFingerprint = fingerprint;
+    this.maybeSave();
+  }
+
+  /**
+   * Add a candidate to the two-cycle confirmation buffer. If the key is
+   * already present, the existing `firstSeenAt` is preserved (so the
+   * confirmation timer keeps counting from the original detection).
+   */
+  addPendingTombstone(rowKey: string, knownTimeUpdated: number): void {
+    if (rowKey in this._state.pendingTombstones) return;
+    this._state.pendingTombstones[rowKey] = {
+      firstSeenAt: Date.now(),
+      knownTimeUpdated,
+    };
+    this.maybeSave();
+  }
+
+  /**
+   * Drop entries from the confirmation buffer — called both when a row
+   * reappears (false positive) and after we successfully tombstone it.
+   */
+  removePendingTombstones(rowKeys: Iterable<string>): void {
+    let changed = false;
+    for (const key of rowKeys) {
+      if (key in this._state.pendingTombstones) {
+        delete this._state.pendingTombstones[key];
+        changed = true;
+      }
+    }
+    if (changed) this.maybeSave();
+  }
+
+  /**
+   * Wipe ALL pending tombstones in one shot — used by the deletion-safety
+   * guard when it defers the entire cycle (DB fingerprint mismatch, halt
+   * marker present, etc.) so a transient corruption doesn't accumulate
+   * pending entries that fire in concert later.
+   */
+  clearPendingTombstones(): void {
+    if (Object.keys(this._state.pendingTombstones).length === 0) return;
+    this._state.pendingTombstones = {};
+    this.maybeSave();
+  }
+
   replaceKnownFiles(entries: FileManifestEntry[]): void {
     this._state.knownFiles = Object.fromEntries(
       entries.map((entry) => [
@@ -250,6 +357,37 @@ export class StateManager {
     );
 
     return Object.fromEntries(entries) as Record<string, number>;
+  }
+
+  private parseDbFingerprint(
+    value: unknown,
+  ): { inode: number; mtime: number; size: number } | null {
+    if (!value || typeof value !== "object") return null;
+    const v = value as Record<string, unknown>;
+    const inode = v["inode"];
+    const mtime = v["mtime"];
+    const size = v["size"];
+    if (typeof inode !== "number" || !Number.isFinite(inode)) return null;
+    if (typeof mtime !== "number" || !Number.isFinite(mtime)) return null;
+    if (typeof size !== "number" || !Number.isFinite(size)) return null;
+    return { inode, mtime, size };
+  }
+
+  private parsePendingTombstones(
+    value: unknown,
+  ): Record<string, { firstSeenAt: number; knownTimeUpdated: number }> {
+    if (!value || typeof value !== "object") return {};
+    const out: Record<string, { firstSeenAt: number; knownTimeUpdated: number }> = {};
+    for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+      if (!raw || typeof raw !== "object") continue;
+      const e = raw as Record<string, unknown>;
+      const firstSeenAt = e["firstSeenAt"];
+      const knownTimeUpdated = e["knownTimeUpdated"];
+      if (typeof firstSeenAt !== "number" || !Number.isFinite(firstSeenAt)) continue;
+      if (typeof knownTimeUpdated !== "number" || !Number.isFinite(knownTimeUpdated)) continue;
+      out[key] = { firstSeenAt, knownTimeUpdated };
+    }
+    return out;
   }
 
   private parseKnownFiles(

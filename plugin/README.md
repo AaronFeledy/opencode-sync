@@ -31,13 +31,19 @@ That's the whole installation. opencode auto-loads every file in `~/.config/open
 
 ### 3. Verify it loaded
 
-After starting opencode (TUI, `serve`, or `run`), you should see lines like this in stdout/stderr:
+After starting opencode (TUI, `serve`, or `run`), tail the plugin log:
+
+```bash
+tail -f ~/.local/share/opencode/opencode-sync/plugin.log
+```
+
+You should see lines like:
 
 ```
-opencode-sync: initializing {"server":"http://...","machine":"desktop","syncInterval":15}
-opencode-sync: connected to server {"version":"0.0.1","serverTime":...}
-opencode-sync: state loaded {"lastPulledSeq":0,"trackedRows":0}
-opencode-sync: opened opencode database {"path":"/home/.../opencode.db"}
+2026-01-15T20:14:01.123Z INFO  opencode-sync: initializing {"server":"http://...","machine":"desktop","syncInterval":15,"logFile":"/home/.../plugin.log"}
+2026-01-15T20:14:01.456Z INFO  opencode-sync: connected to server {"version":"0.0.1","serverTime":...}
+2026-01-15T20:14:01.789Z INFO  opencode-sync: state loaded {"lastPulledSeq":0,"trackedRows":0}
+2026-01-15T20:14:02.012Z INFO  opencode-sync: opened opencode database {"path":"/home/.../opencode.db"}
 ```
 
 opencode's own log at `~/.local/share/opencode/log/<timestamp>.log` will also show:
@@ -45,6 +51,8 @@ opencode's own log at `~/.local/share/opencode/log/<timestamp>.log` will also sh
 ```
 service=plugin path=file:///home/.../opencode-sync-plugin.js loading plugin
 ```
+
+> **Why a file and not stdout?** The plugin runs inside the opencode process. Anything it wrote to stdout (or stderr) used to overlay the TUI's alternate-screen rendering — every sync cycle would smear `pushAll complete` lines across the chat UI. All plugin output now goes to `plugin.log` so the TUI stays clean. The log auto-rotates to `plugin.log.old` when it exceeds 10 MB.
 
 ### Updating
 
@@ -151,13 +159,21 @@ Overrides are shallow-merged over synced config at plugin load time. Use this fo
 
 ## Troubleshooting
 
-### State file location
+### State and log file locations
 
 The plugin persists its sync cursor and metadata at:
 
 ```
 ~/.local/share/opencode/opencode-sync/state.json
 ```
+
+All plugin output (init, sync, errors) is appended to:
+
+```
+~/.local/share/opencode/opencode-sync/plugin.log
+```
+
+The log rotates to `plugin.log.old` when it grows past 10 MB.
 
 ### Check sync health
 

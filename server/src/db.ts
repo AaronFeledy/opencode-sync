@@ -5,7 +5,7 @@
 import { Database } from "bun:sqlite";
 import { mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import type { SyncEnvelope, FileManifestEntry } from "@opencode-sync/shared";
+import type { SyncEnvelope, SyncKind, FileManifestEntry } from "@opencode-sync/shared";
 import type { Logger } from "./log.js";
 
 // ── Schema migrations ──────────────────────────────────────────────
@@ -156,6 +156,62 @@ export class LedgerDB {
     this.txUpsertBatch = this.db.transaction((envelopes: SyncEnvelope[]) =>
       envelopes.map((envelope) => this.upsertRow(envelope)),
     );
+  }
+
+  /**
+   * Look up current head state for a batch of (kind, id) pairs.
+   *
+   * Returns one entry per row the server has on file; rows the server
+   * has never seen are omitted (not returned with a sentinel — see
+   * HeadsResponse in shared/protocol.ts).
+   *
+   * Used by the plugin's deletion-safety guard: before tombstoning a
+   * row that's gone missing locally, it cross-checks here to confirm
+   * the server hasn't received a newer version from another peer
+   * (in which case pulling that version is preferable to overwriting
+   * it with a tombstone).
+   *
+   * Built dynamically rather than as a prepared statement because the
+   * IN-list size varies per request. SQLite's parameter limit is
+   * 32766 by default, so the route caller caps inputs well below that.
+   */
+  getHeads(
+    rowKeys: Array<{ kind: SyncKind; id: string }>,
+  ): Array<{ kind: SyncKind; id: string; time_updated: number; deleted: boolean }> {
+    if (rowKeys.length === 0) return [];
+
+    // Group by kind so we can use a single IN-clause per kind. Avoids
+    // an OR-of-AND-pairs query that SQLite can't index well.
+    const byKind = new Map<SyncKind, string[]>();
+    for (const { kind, id } of rowKeys) {
+      let ids = byKind.get(kind);
+      if (!ids) {
+        ids = [];
+        byKind.set(kind, ids);
+      }
+      ids.push(id);
+    }
+
+    const results: Array<{ kind: SyncKind; id: string; time_updated: number; deleted: boolean }> = [];
+
+    for (const [kind, ids] of byKind) {
+      const placeholders = ids.map(() => "?").join(",");
+      const rows = this.db
+        .query<{ id: string; time_updated: number; deleted: number }, string[]>(
+          `SELECT id, time_updated, deleted FROM sync_row WHERE kind = ? AND id IN (${placeholders})`,
+        )
+        .all(kind, ...ids);
+      for (const row of rows) {
+        results.push({
+          kind,
+          id: row.id,
+          time_updated: row.time_updated,
+          deleted: row.deleted === 1,
+        });
+      }
+    }
+
+    return results;
   }
 
   /** Read the current next_seq value. */

@@ -104,6 +104,44 @@ export function createEventHandler(ctx: HookContext): (input: { event: any }) =>
         if (sessionId) {
           const sync = ctx.sessionSync;
           if (sync) {
+            // While the deletion-safety halt is in effect, do NOT mark
+            // this deletion as "expected". The marker means we can't
+            // currently trust local DB state (wipe / restore / fingerprint
+            // mismatch), so a deletion observed during the halt window
+            // could be a legitimate user action OR a symptom of the same
+            // corruption that tripped the halt. Marking it expected would
+            // pollute the in-memory `expectedDeletions` set and cause an
+            // immediate fast-path tombstone (no two-cycle confirmation,
+            // no threshold gate) the moment the user clears the marker.
+            //
+            // The conservative path: skip the mark, skip the pushAll (it
+            // would be a no-op anyway after the entry guard). When sync
+            // resumes, the deletion will be detected via the normal
+            // missing-row scan and routed through full two-cycle
+            // confirmation — or trip the threshold again if it really
+            // was part of the original corruption.
+            if (sync.isHalted()) {
+              log("session.deleted while sync halted — deferring to post-recovery confirmation", {
+                sessionId,
+              });
+              break;
+            }
+
+            // Fast-path the deletion past the deletion-safety guard. Without
+            // this, the cascade tombstones (session + todos + session_share)
+            // would either be deferred for a sync cycle (~15s) or counted
+            // toward the threshold halt. With the explicit hint, the guard
+            // emits them immediately and exempts them from the percentage
+            // calculation entirely — only legitimately-suspicious deletions
+            // (i.e. ones we can't attribute to a user action) wait or halt.
+            //
+            // Note: messages and parts that cascaded with the session are
+            // NOT auto-marked here — we don't know their session_id at this
+            // point (they're already gone from local DB). They'll go through
+            // the conservative path: pending → confirmed after one cycle →
+            // tombstoned. Acceptable trade-off; ~15s of stale messages on
+            // peers vs. risk of mis-tombstoning.
+            sync.markExpectedDeletion(`session:${sessionId}`);
             try {
               await sync.pushAll();
             } catch (err) {

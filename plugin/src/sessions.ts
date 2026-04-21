@@ -6,11 +6,70 @@ import type { SyncEnvelope, SyncKind } from "@opencode-sync/shared";
 import type { DbReader } from "./db-read.js";
 import type { ApplyResult, DbWriter } from "./db-write.js";
 import type { SyncClient } from "./client.js";
+import { EndpointMissingError } from "./client.js";
 import type { StateManager } from "./state.js";
+import { writeHaltMarker, isSyncHalted, HALT_REASONS } from "./halt.js";
 
 // ── Constants ──────────────────────────────────────────────────────
 
 const PUSH_BATCH_SIZE = 100;
+
+/**
+ * Deletion-safety thresholds. All tombstone emission passes through
+ * `buildDeletionEnvelopes`, which consults these before allowing any
+ * row to be marked as deleted on the server.
+ */
+
+/**
+ * Below this many `knownRows` entries we never trigger the threshold
+ * halt — small states aren't a catastrophic-data-loss risk, and the
+ * threshold's false-positive rate gets unusably high at tiny sizes
+ * (losing 2-of-4 rows is 50%, but "50% of 4 rows" isn't a fleet
+ * disaster).
+ */
+const TOMBSTONE_THRESHOLD_MIN_KNOWN = 50;
+
+/**
+ * Threshold for unexpected deletions when NO `session.deleted` events
+ * have fired this cycle. With nothing supposedly being deleted by the
+ * user, more than half the rows going missing is almost certainly a
+ * DB wipe / restore / replacement.
+ */
+const TOMBSTONE_THRESHOLD_FRACTION_STRICT = 0.5;
+
+/**
+ * Threshold for unexpected deletions when at least one explicit
+ * `markExpectedDeletion` call landed this cycle. The user is actively
+ * deleting *something*, so we trust them more — only halt on
+ * near-total disappearance.
+ *
+ * Why this matters: opencode's cascade FK delete means a single user
+ * "delete this session" action can wipe 1 session row + many message
+ * rows + many part rows + a handful of todos. We auto-expand the
+ * `markExpectedDeletion('session:X')` hint to the session's todos and
+ * share row, but messages and parts can't be cascade-expanded without
+ * tracking parent_id in `knownRows` (a larger refactor). They flow
+ * through as "unexpected" but should not trigger a halt — the user
+ * really did mean to delete them.
+ *
+ * 0.95 still catches "DB wiped while a delete happened to be in
+ * flight" because total wipe means 100% > 95%.
+ */
+const TOMBSTONE_THRESHOLD_FRACTION_PERMISSIVE = 0.95;
+
+/**
+ * A pending-tombstone candidate must remain missing for at least this
+ * long before we actually emit the tombstone. Protects against
+ * transient conditions — mid-migration, SQLITE_BUSY recovery, a
+ * restore-in-progress — where the row is temporarily absent but about
+ * to reappear.
+ *
+ * 30s is comfortably larger than the default 15s sync interval so the
+ * confirmation takes at least two cycles (first sees → waits; second
+ * sees after delay → emits). On fast intervals the delay still gates
+ * on wall-clock time, not cycle count.
+ */
+const TOMBSTONE_CONFIRMATION_DELAY_MS = 30_000;
 
 function rowStateKey(kind: SyncKind, id: string): string {
   return `${kind}:${id}`;
@@ -37,6 +96,34 @@ export class SessionSync {
   private machineId: string;
   private log: (msg: string, data?: Record<string, unknown>) => void;
 
+  /**
+   * In-memory set of rowKeys the plugin has been told are "really"
+   * being deleted — populated by `markExpectedDeletion` from the
+   * `session.deleted` event hook. Rows in this set bypass the
+   * two-cycle confirmation AND the server cross-check (they still
+   * count toward the threshold but are subtracted before comparison
+   * so legitimate big-cascade deletes aren't halted).
+   *
+   * Intentionally NOT persisted — on a plugin restart we want to fall
+   * back to the conservative path. The next `session.deleted` event
+   * (if any) will re-populate.
+   */
+  private expectedDeletions: Set<string> = new Set();
+
+  /**
+   * In-memory mirror of the on-disk halt marker, set immediately when
+   * `buildDeletionEnvelopes` trips the threshold so a re-entrant
+   * `pushSession` later in the same cycle can't slip tombstones past
+   * the guard before the marker write has finished.
+   *
+   * Authoritative state lives on disk (`isSyncHalted()`); this flag is
+   * a fast-path cache only. Always check both via `isHaltedNow()` —
+   * the flag is `false` after a process restart even when the marker
+   * exists, and it never sees fingerprint-mismatch halts (those write
+   * the marker from `index.ts` without touching `SessionSync`).
+   */
+  private halted: boolean = false;
+
   constructor(
     dbReader: DbReader,
     dbWriter: DbWriter,
@@ -54,9 +141,75 @@ export class SessionSync {
   }
 
   /**
+   * Mark a row as "expected to be deleted" — the next
+   * `buildDeletionEnvelopes` call will fast-path its tombstone (no
+   * server cross-check, no two-cycle wait) and exclude it from the
+   * threshold calculation.
+   *
+   * Called from `hooks.ts` when opencode emits a deletion event we
+   * initiated locally. Also call this for any cascade children you
+   * know about (todos belonging to a deleted session, etc.) — we
+   * auto-expand known `todo:<sessionId>:*` keys but messages/parts
+   * have to be named explicitly.
+   */
+  markExpectedDeletion(rowKey: string): void {
+    this.expectedDeletions.add(rowKey);
+
+    // Auto-expand: if a whole session is being deleted, we know its
+    // todos share the same sessionId prefix in their rowKey. Cascade
+    // them without requiring the caller to enumerate.
+    const parsed = parseRowStateKey(rowKey);
+    if (parsed?.kind === "session") {
+      const prefix = `todo:${parsed.id}:`;
+      for (const knownKey of Object.keys(this.stateManager.state.knownRows)) {
+        if (knownKey.startsWith(prefix)) {
+          this.expectedDeletions.add(knownKey);
+        }
+      }
+      // Also the session_share (if any) — the rowKey is just "session_share:<sessionId>"
+      this.expectedDeletions.add(`session_share:${parsed.id}`);
+    }
+  }
+
+  /**
+   * True iff the deletion-safety guard has halted row sync — either via
+   * a same-process trip (`this.halted`) or via the persistent on-disk
+   * marker that survives plugin restarts and also captures halts
+   * written from outside `SessionSync` (e.g. fingerprint-mismatch in
+   * `index.ts`). Used by tests, introspection, and event hooks that
+   * need to know whether to bother queueing work.
+   */
+  isHalted(): boolean {
+    return this.isHaltedNow();
+  }
+
+  /**
+   * Internal halt check — every push/pull entry point consults this so
+   * a halt that was set after the SessionSync instance was constructed
+   * (or from a different code path) still blocks re-entry. The disk
+   * `existsSync` check is cheap and safer than caching a boot-time
+   * snapshot of the marker state.
+   */
+  private isHaltedNow(): boolean {
+    return this.halted || isSyncHalted();
+  }
+
+  /**
    * Push local changes for a specific session and all its related data.
+   *
+   * Skipped entirely while the deletion-safety halt is in effect — even
+   * though `pushSession` only emits live envelopes (never tombstones),
+   * pushing live rows during a halt extends `knownRows` with rows that
+   * the broken push path will then try to tombstone once the marker is
+   * cleared. The conservative answer is to freeze ALL row sync until
+   * the user has confirmed the local DB is in the state they expect.
    */
   async pushSession(sessionId: string): Promise<void> {
+    if (this.isHaltedNow()) {
+      this.log("pushSession skipped — sync halted by deletion-safety guard", { sessionId });
+      return;
+    }
+
     const full = this.dbReader.readSessionFull(sessionId);
     if (!full) {
       this.log("session not found locally, skipping push", { sessionId });
@@ -101,8 +254,29 @@ export class SessionSync {
    * network calls — fine for trickle syncs, but on a fresh peer with a
    * cursor of 0 it could easily consume gigabytes (each `part` row
    * carries a full JSON conversation blob).
+   *
+   * Halt behaviour, in order of precedence:
+   *
+   *   - On entry, if the deletion-safety halt is in effect (either this
+   *     process already tripped it, or the on-disk marker exists from a
+   *     prior run / fingerprint-mismatch / manual write), skip the
+   *     entire cycle. No pushes of any kind.
+   *
+   *   - If the guard trips *inside* this cycle (threshold fires from
+   *     within `buildDeletionEnvelopes`), any live-row batches that
+   *     were already flushed before the trip remain pushed — the
+   *     network calls can't be unwound. Any live rows buffered but not
+   *     yet flushed are also sent, so the user's actual data doesn't
+   *     get stranded mid-cycle. Tombstone emission is suppressed and
+   *     the halt is latched; the NEXT call will short-circuit at the
+   *     entry guard above.
    */
   async pushAll(): Promise<void> {
+    if (this.isHaltedNow()) {
+      this.log("pushAll skipped — sync halted by deletion-safety guard");
+      return;
+    }
+
     // Wrap the entire push so per-batch state mutations (`markPushed`,
     // `rememberRows`, `forgetRows`, `advancePushedRowTime`) only trigger a
     // single state.json write at the end instead of one per batch.
@@ -112,6 +286,7 @@ export class SessionSync {
       let totalSeen = 0;
       let totalAccepted = 0;
       let totalStale = 0;
+      let totalTombstones = 0;
       let maxPushedTime = 0;
       let pendingBatch: SyncEnvelope[] = [];
 
@@ -161,12 +336,35 @@ export class SessionSync {
         }
       }
 
+      // Compute deletion envelopes through the safety-guarded async path.
+      // Returns null when the guard halted the cycle (threshold tripped,
+      // fingerprint mismatch, etc.) — see buildDeletionEnvelopes for the
+      // full ordering. We still flush the live-row batches above so the
+      // user's actual data keeps making it to the server.
+      const tombstones = await this.buildDeletionEnvelopes();
+      if (tombstones === null) {
+        // Halted. Flush any pending live rows, then return.
+        await flushBatch();
+        if (totalSeen > 0) {
+          if (maxPushedTime > 0) {
+            this.stateManager.advancePushedRowTime(maxPushedTime);
+          }
+          this.log("pushAll partial — live rows pushed, deletions halted", {
+            total: totalSeen,
+            accepted: totalAccepted,
+            stale: totalStale,
+          });
+        }
+        return;
+      }
+
       // Tombstones come from comparing knownRows to live PKs — bounded by
       // the size of knownRows (PKs only, no row data), so loading them
       // all is fine.
-      for (const env of this.buildDeletionEnvelopes()) {
+      for (const env of tombstones) {
         pendingBatch.push(env);
         totalSeen++;
+        totalTombstones++;
         if (pendingBatch.length >= PUSH_BATCH_SIZE) {
           await flushBatch();
         }
@@ -174,6 +372,14 @@ export class SessionSync {
 
       // Final partial batch.
       await flushBatch();
+
+      // Successful tombstone emission means the candidates won't recur
+      // next cycle (server has them, knownRows lost them via
+      // forgetAcceptedTombstones). Drain expectedDeletions to avoid
+      // unbounded growth from accumulated session.deleted events.
+      if (totalTombstones > 0) {
+        this.expectedDeletions.clear();
+      }
 
       if (totalSeen === 0) {
         this.log("pushAll: nothing new to push");
@@ -191,6 +397,7 @@ export class SessionSync {
         total: totalSeen,
         accepted: totalAccepted,
         stale: totalStale,
+        tombstones: totalTombstones,
       });
     });
   }
@@ -348,9 +555,21 @@ export class SessionSync {
   }
 
   /**
-   * Full sync cycle: pull first (to get latest remote state), then push local changes.
+   * Full sync cycle: pull first (to get latest remote state), then push
+   * local changes.
+   *
+   * Skipped entirely when the deletion-safety halt is in effect. Pull
+   * has to be gated alongside push because pulling extends `knownRows`
+   * with rows the (still-broken) push path would then try to tombstone
+   * once the halt is cleared. The timer path in `index.ts` already
+   * blocks `runRowSync` on the same condition; this entry guard makes
+   * event-driven callers (`server.connected`, hook-driven sync) match.
    */
   async sync(): Promise<void> {
+    if (this.isHaltedNow()) {
+      this.log("sync skipped — sync halted by deletion-safety guard");
+      return;
+    }
     await this.pull();
     await this.pushAll();
   }
@@ -366,28 +585,247 @@ export class SessionSync {
     ];
   }
 
-  private buildDeletionEnvelopes(): SyncEnvelope[] {
-    // Use a PK-only scan for deletion detection rather than the (possibly
-    // delta-filtered) `currentEnvelopes` set. Otherwise an old, unchanged
-    // row would be absent from the delta and we'd falsely tombstone it.
+  /**
+   * Compute the set of tombstone envelopes to emit this cycle, gated by
+   * the deletion-safety guard. Returns `null` if the guard halts the
+   * cycle (caller should suppress tombstone emission entirely but may
+   * continue pushing live rows).
+   *
+   * The safety layers run in this order. Each is independently
+   * sufficient to halt or filter a candidate; later layers only see
+   * candidates that earlier layers approved.
+   *
+   *   1. PK scan & expected-deletions partition. Compute candidates =
+   *      knownRows \ liveKeys. Split into "expected" (rows we
+   *      affirmatively know are being deleted via session.deleted hooks)
+   *      vs "unexpected" (rows that just disappeared).
+   *
+   *   2. Threshold halt. If the unexpected set exceeds
+   *      TOMBSTONE_THRESHOLD_FRACTION of knownRows AND knownRows is
+   *      large enough to be statistically meaningful, write the halt
+   *      marker and return null. Future syncs are blocked until the
+   *      user clears the marker.
+   *
+   *   3. Server cross-check. Ask the server for its current head state
+   *      on each unexpected candidate. Drop any whose server head is
+   *      newer than what we last knew — pulling that newer version is
+   *      preferable to overwriting it with our tombstone. Falls back
+   *      gracefully if the server doesn't expose /sync/heads.
+   *
+   *   4. Two-cycle confirmation. New unexpected candidates go into
+   *      `pendingTombstones` and are NOT tombstoned this cycle. Only
+   *      candidates that have been continuously missing for at least
+   *      TOMBSTONE_CONFIRMATION_DELAY_MS get emitted. Reappeared
+   *      candidates are dropped from the pending buffer.
+   *
+   *   5. Expected deletions bypass steps 3 and 4 — they're emitted
+   *      immediately. They still count toward the tombstones returned,
+   *      but were excluded from the threshold in step 2.
+   *
+   * Uses a PK-only scan rather than the (possibly delta-filtered)
+   * `currentEnvelopes` set. Otherwise an old, unchanged row would be
+   * absent from the delta and we'd falsely tombstone it.
+   */
+  private async buildDeletionEnvelopes(): Promise<SyncEnvelope[] | null> {
     const liveKeys = this.dbReader.readAllRowKeys();
+    const knownRows = this.stateManager.state.knownRows;
+    const knownSize = Object.keys(knownRows).length;
 
-    return Object.entries(this.stateManager.state.knownRows).flatMap(([knownRowKey, timeUpdated]) => {
-      if (liveKeys.has(knownRowKey)) return [];
+    // ── Step 1: partition candidates ──
+    const expectedCandidates: Array<{ rowKey: string; knownTimeUpdated: number }> = [];
+    const unexpectedCandidates: Array<{ rowKey: string; knownTimeUpdated: number }> = [];
+    for (const [rowKey, knownTimeUpdated] of Object.entries(knownRows)) {
+      if (liveKeys.has(rowKey)) {
+        // Reappeared (or never gone) — clear any stale pending entry.
+        if (rowKey in this.stateManager.state.pendingTombstones) {
+          this.stateManager.removePendingTombstones([rowKey]);
+        }
+        continue;
+      }
+      if (this.expectedDeletions.has(rowKey)) {
+        expectedCandidates.push({ rowKey, knownTimeUpdated });
+      } else {
+        unexpectedCandidates.push({ rowKey, knownTimeUpdated });
+      }
+    }
 
-      const parsed = parseRowStateKey(knownRowKey);
-      if (!parsed) return [];
+    // ── Step 2: threshold halt ──
+    // Adaptive threshold: stricter (50%) when we have NO evidence the
+    // user is actively deleting anything; permissive (95%) when at
+    // least one expected deletion is present. The permissive mode
+    // exists so a single "delete this big session" action — which
+    // cascades to many uncategorised message/part rows that flow
+    // through as "unexpected" — doesn't trip the guard.
+    const fraction = expectedCandidates.length > 0
+      ? TOMBSTONE_THRESHOLD_FRACTION_PERMISSIVE
+      : TOMBSTONE_THRESHOLD_FRACTION_STRICT;
+    if (
+      knownSize >= TOMBSTONE_THRESHOLD_MIN_KNOWN &&
+      unexpectedCandidates.length > knownSize * fraction
+    ) {
+      const sample = unexpectedCandidates
+        .slice(0, 20)
+        .map((c) => c.rowKey);
+      this.log("DELETION-SAFETY HALT — too many unexpected tombstones", {
+        unexpected: unexpectedCandidates.length,
+        expected: expectedCandidates.length,
+        known: knownSize,
+        threshold_fraction: fraction,
+        sample,
+      });
+      writeHaltMarker({
+        triggeredAt: Date.now(),
+        reason: HALT_REASONS.TOMBSTONE_THRESHOLD,
+        message:
+          `Would have emitted ${unexpectedCandidates.length} unexpected tombstones ` +
+          `(${((unexpectedCandidates.length / knownSize) * 100).toFixed(1)}% of ` +
+          `${knownSize} known rows; threshold ${(fraction * 100).toFixed(0)}%). ` +
+          `This usually means the local opencode.db has been wiped, restored ` +
+          `from an older backup, or was opened from the wrong path. Sync push ` +
+          `is halted until you remove the marker file.`,
+        candidateCount: unexpectedCandidates.length,
+        knownRowsSize: knownSize,
+        sampleCandidates: sample,
+        extra: { expected_count: expectedCandidates.length, threshold_fraction: fraction },
+      });
+      this.halted = true;
+      // Drop any in-flight pending entries — when the user resolves the
+      // underlying problem and clears the marker, we want a clean slate
+      // rather than firing accumulated pending entries on first cycle.
+      this.stateManager.clearPendingTombstones();
+      return null;
+    }
 
-      return [{
+    // ── Step 3: server cross-check (best-effort) ──
+    let heads: Map<string, { time_updated: number; deleted: boolean }> | null = null;
+    if (unexpectedCandidates.length > 0) {
+      // Drop rowKeys that don't parse as `kind:id` — `parseRowStateKey`
+      // requires a `:` separator and a non-empty id. Under normal
+      // operation `knownRows` is only ever populated via `rowStateKey`
+      // which always emits valid keys, so a malformed entry here means
+      // either a manually-edited state.json or a future-schema rowKey
+      // we don't recognise. Log so the corruption is visible.
+      const headsRequest: Array<{ kind: SyncKind; id: string }> = [];
+      const malformed: string[] = [];
+      for (const candidate of unexpectedCandidates) {
+        const parsed = parseRowStateKey(candidate.rowKey);
+        if (parsed) {
+          headsRequest.push({ kind: parsed.kind, id: parsed.id });
+        } else {
+          malformed.push(candidate.rowKey);
+        }
+      }
+      if (malformed.length > 0) {
+        this.log("WARN: skipping malformed rowKeys during heads cross-check", {
+          count: malformed.length,
+          sample: malformed.slice(0, 10),
+        });
+      }
+      try {
+        heads = await this.client.getHeads(this.machineId, headsRequest);
+      } catch (err) {
+        if (err instanceof EndpointMissingError) {
+          // Older server without /sync/heads — degrade gracefully.
+          // Two-cycle confirmation still runs, just without server input.
+          this.log("server lacks /sync/heads endpoint, skipping cross-check");
+        } else {
+          // Network error — be conservative and SKIP this cycle's
+          // unexpected tombstones rather than emit blind. The pending
+          // buffer is left intact so subsequent cycles can resume once
+          // the network recovers; expected deletions still proceed.
+          this.log("getHeads failed, deferring unexpected tombstones this cycle", {
+            error: String(err),
+          });
+          return this.formatTombstones(expectedCandidates);
+        }
+      }
+    }
+
+    // ── Step 4: two-cycle confirmation + server-newer filter ──
+    const now = Date.now();
+    const tombstoneRows: Array<{ rowKey: string; knownTimeUpdated: number }> = [];
+    const reappeared: string[] = [];
+    for (const candidate of unexpectedCandidates) {
+      // Server has a newer version — prefer the remote, drop the tombstone.
+      const head = heads?.get(candidate.rowKey);
+      if (head && !head.deleted && head.time_updated > candidate.knownTimeUpdated) {
+        // Also drop any pending entry for this row — it's not actually
+        // gone everywhere, just locally outdated.
+        if (candidate.rowKey in this.stateManager.state.pendingTombstones) {
+          reappeared.push(candidate.rowKey);
+        }
+        continue;
+      }
+
+      const pending = this.stateManager.state.pendingTombstones[candidate.rowKey];
+      if (!pending) {
+        // First sighting — record and wait.
+        this.stateManager.addPendingTombstone(
+          candidate.rowKey,
+          candidate.knownTimeUpdated,
+        );
+        continue;
+      }
+
+      // Already pending — check the confirmation timer.
+      if (now - pending.firstSeenAt < TOMBSTONE_CONFIRMATION_DELAY_MS) {
+        continue;
+      }
+
+      // Confirmed: emit the tombstone. We use the originally-recorded
+      // `knownTimeUpdated` (from when it first went missing) so racing
+      // updates that happened to slip into knownRows after detection
+      // don't subtly change the LWW comparison the server will do.
+      tombstoneRows.push({
+        rowKey: candidate.rowKey,
+        knownTimeUpdated: pending.knownTimeUpdated,
+      });
+    }
+
+    if (reappeared.length > 0) {
+      this.stateManager.removePendingTombstones(reappeared);
+    }
+
+    // ── Step 5: format output ──
+    // Expected deletions are emitted immediately and unconditionally
+    // (subject only to the threshold above). Confirmed unexpected
+    // deletions join them. Pending entries that successfully made it
+    // out as tombstones are cleared from the buffer up-front; if the
+    // push later fails, `forgetAcceptedTombstones` won't fire — the
+    // entry will be re-detected and re-pended on the next cycle, which
+    // is the correct behaviour.
+    if (tombstoneRows.length > 0) {
+      this.stateManager.removePendingTombstones(
+        tombstoneRows.map((t) => t.rowKey),
+      );
+    }
+
+    return this.formatTombstones([...expectedCandidates, ...tombstoneRows]);
+  }
+
+  /**
+   * Convert a list of (rowKey, knownTimeUpdated) pairs into tombstone
+   * envelopes. Stamps each tombstone with `Math.max(now, knownTime + 1)`
+   * — guarantees LWW wins over the version we last saw.
+   */
+  private formatTombstones(
+    rows: Array<{ rowKey: string; knownTimeUpdated: number }>,
+  ): SyncEnvelope[] {
+    const out: SyncEnvelope[] = [];
+    for (const { rowKey, knownTimeUpdated } of rows) {
+      const parsed = parseRowStateKey(rowKey);
+      if (!parsed) continue;
+      out.push({
         kind: parsed.kind,
         id: parsed.id,
         machine_id: this.machineId,
-        time_updated: Math.max(Date.now(), timeUpdated + 1),
+        time_updated: Math.max(Date.now(), knownTimeUpdated + 1),
         server_seq: 0,
         deleted: true,
         data: null,
-      } satisfies SyncEnvelope];
-    });
+      });
+    }
+    return out;
   }
 
   private rememberAcceptedRows(

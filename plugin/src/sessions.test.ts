@@ -3,12 +3,13 @@ import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { PullResponse, SyncEnvelope, SyncKind } from "@opencode-sync/shared";
-import type { SyncClient } from "./client.js";
+import type { HeadEntry, PullResponse, SyncEnvelope, SyncKind } from "@opencode-sync/shared";
+import { EndpointMissingError, type SyncClient } from "./client.js";
 import { DbReader } from "./db-read.js";
 import { DbWriter } from "./db-write.js";
 import { SessionSync } from "./sessions.js";
 import { StateManager } from "./state.js";
+import { isSyncHalted, clearHaltMarker, readHaltDetails, HALT_MARKER_PATH } from "./halt.js";
 
 // Module-level guard — throws at import time if HOME is not a test sandbox.
 // State files live under ~/.local/share/opencode/opencode-sync/, so a wrong
@@ -22,6 +23,13 @@ if (!HOME.includes("opencode-sync-test-home")) {
       `HOME to a directory containing 'opencode-sync-test-home'.`,
   );
 }
+
+// Mirrors the production constant `TOMBSTONE_THRESHOLD_MIN_KNOWN` from
+// sessions.ts. Kept here (not imported) so tests don't grow a dependency
+// on a private module export. If this drifts from the production value
+// the tests asserting "knownRows is well above the threshold floor"
+// could become trivially true; review both together if either changes.
+const TOMBSTONE_MIN_KNOWN_FOR_TEST = 50;
 
 function createDbPath(): string {
   return path.join(os.tmpdir(), `opencode-sync-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
@@ -176,6 +184,20 @@ class MockClient {
   pullResponses: PullResponse[] = [];
   pullCalls: Array<{ since: number; exclude?: string }> = [];
 
+  /**
+   * Heads-endpoint behaviour control. Default = empty Map (server has
+   * no record of any candidate, so cross-check is permissive). Tests
+   * that want to simulate "server has a newer version" set entries
+   * here. Tests that want to simulate "server doesn't expose
+   * /sync/heads" set `headsThrowEndpointMissing = true`. Tests that
+   * want to simulate a transient network blip set
+   * `headsThrowError = true`.
+   */
+  headsResponses: Map<string, HeadEntry> = new Map();
+  headsThrowEndpointMissing = false;
+  headsThrowError = false;
+  headsCalls: Array<Array<{ kind: SyncKind; id: string }>> = [];
+
   async push(_machineId: string, envelopes: SyncEnvelope[]) {
     this.pushes.push(envelopes.map((envelope) => ({ ...envelope })));
     return {
@@ -189,6 +211,27 @@ class MockClient {
     this.pullCalls.push({ since, exclude });
     return this.pullResponses.shift() ?? { server_seq: 0, envelopes: [], more: false };
   }
+
+  async getHeads(
+    _machineId: string,
+    rowKeys: Array<{ kind: SyncKind; id: string }>,
+  ): Promise<Map<string, HeadEntry>> {
+    this.headsCalls.push(rowKeys);
+    if (this.headsThrowEndpointMissing) {
+      throw new EndpointMissingError("POST", "/sync/heads");
+    }
+    if (this.headsThrowError) {
+      throw new Error("simulated network blip");
+    }
+    // Return the configured subset that overlaps with the request.
+    const result = new Map<string, HeadEntry>();
+    for (const { kind, id } of rowKeys) {
+      const key = `${kind}:${id}`;
+      const head = this.headsResponses.get(key);
+      if (head) result.set(key, head);
+    }
+    return result;
+  }
 }
 
 beforeEach(() => {
@@ -198,18 +241,446 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // Clear deletion-safety halt marker if a test left one behind (the
+  // marker is sticky by design — survives plugin restart — so without
+  // this, a single tripped test would block every subsequent test).
+  clearHaltMarker();
   fs.rmSync(path.join(HOME, ".local", "share", "opencode", "opencode-sync"), {
     recursive: true,
     force: true,
   });
 });
 
-test("pushAll emits tombstones for rows deleted locally", async () => {
+test("pushAll defers tombstones for unexpected deletions until the confirmation window elapses", async () => {
+  // After the deletion-safety refactor, any row that disappears
+  // WITHOUT being marked via markExpectedDeletion must spend at least
+  // TOMBSTONE_CONFIRMATION_DELAY_MS (30s) in the pending buffer before
+  // being tombstoned. This protects against transient mid-migration /
+  // mid-restore states where rows briefly disappear and reappear.
+  //
+  // We exercise this by mocking Date.now to step past the window
+  // without sleeping the test.
   const dbPath = createDbPath();
   initDb(dbPath);
   seedSessionTree(dbPath);
 
   const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  // Cycle 1: seed knownRows with the live data.
+  await sync.pushAll();
+  expect(client.pushes[0]?.every((env) => !env.deleted)).toBe(true);
+
+  // Out-of-band local deletion (simulating opencode wiping a session
+  // through a path that didn't fire a session.deleted event we caught).
+  const db = new Database(dbPath);
+  db.exec("PRAGMA foreign_keys = ON");
+  db.run("DELETE FROM session WHERE id = ?", ["ses_1"]);
+  db.close();
+
+  // Cycle 2: candidates land in pendingTombstones, NO tombstones emitted.
+  client.pushes = [];
+  await sync.pushAll();
+  expect(client.pushes).toEqual([]);
+  expect(Object.keys(stateManager.state.pendingTombstones).sort()).toEqual([
+    "message:msg_1",
+    "part:part_1",
+    "session:ses_1",
+    "todo:ses_1:0",
+  ]);
+
+  // Advance wall clock past the 30s confirmation window.
+  const realNow = Date.now;
+  const future = realNow() + 60_000;
+  Date.now = () => future;
+  try {
+    // Cycle 3: confirmation window elapsed, tombstones emitted.
+    client.pushes = [];
+    await sync.pushAll();
+    const tombstones = client.pushes[0] ?? [];
+    expect(tombstones.every((env) => env.deleted)).toBe(true);
+    expect(tombstones.map((env) => `${env.kind}:${env.id}`).sort()).toEqual([
+      "message:msg_1",
+      "part:part_1",
+      "session:ses_1",
+      "todo:ses_1:0",
+    ]);
+    // Pending buffer was drained for the rows we just tombstoned.
+    expect(Object.keys(stateManager.state.pendingTombstones)).toEqual([]);
+  } finally {
+    Date.now = realNow;
+  }
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("pushAll fast-paths tombstones when the row is marked as an expected deletion", async () => {
+  // The session.deleted hook calls markExpectedDeletion before invoking
+  // pushAll. Marked rows skip BOTH the server cross-check and the
+  // two-cycle confirmation — they're emitted on the same cycle the
+  // deletion is observed.
+  //
+  // markExpectedDeletion('session:X') also auto-expands to include the
+  // session's todos (which share the prefix `todo:X:`) and any
+  // session_share — verifies the cascade-helper logic works.
+  const dbPath = createDbPath();
+  initDb(dbPath);
+  seedSessionTree(dbPath);
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  // Seed knownRows.
+  await sync.pushAll();
+
+  // Delete locally, mark as expected.
+  const db = new Database(dbPath);
+  db.exec("PRAGMA foreign_keys = ON");
+  db.run("DELETE FROM session WHERE id = ?", ["ses_1"]);
+  db.close();
+  sync.markExpectedDeletion("session:ses_1");
+
+  // Cycle 2: session+todo go through immediately; message+part still
+  // need confirmation (they don't share a session-id prefix in their
+  // rowKey, so the cascade auto-expansion can't catch them).
+  client.pushes = [];
+  await sync.pushAll();
+  const fastPath = (client.pushes[0] ?? []).map((e) => `${e.kind}:${e.id}`).sort();
+  expect(fastPath).toEqual(["session:ses_1", "todo:ses_1:0"]);
+
+  // message and part are still pending confirmation.
+  expect(Object.keys(stateManager.state.pendingTombstones).sort()).toEqual([
+    "message:msg_1",
+    "part:part_1",
+  ]);
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("pushAll halts when unexpected tombstones exceed the threshold (DB wipe scenario)", async () => {
+  // The catastrophic scenario: opencode.db is wiped/restored/replaced,
+  // state.json still has hundreds of knownRows. Without the threshold
+  // guard, buildDeletionEnvelopes would tombstone the entire fleet's
+  // data. WITH the guard, sync halts and writes a marker file the
+  // user must manually clear after investigating.
+  const dbPath = createDbPath();
+  initDb(dbPath);
+
+  // Seed a knownRows population large enough to trigger the threshold
+  // (TOMBSTONE_THRESHOLD_MIN_KNOWN = 50). Use the seed helper N times
+  // with distinct project/session ids.
+  const db = new Database(dbPath);
+  db.exec("PRAGMA foreign_keys = ON");
+  db.run(
+    `INSERT INTO project (id, worktree, vcs, name, icon_url, icon_color, time_created, time_updated, time_initialized, sandboxes, commands)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ["proj_big", "/tmp/big", "git", "Big", null, null, 1, 1, 1, "[]", null],
+  );
+  for (let i = 0; i < 100; i++) {
+    db.run(
+      `INSERT INTO session (id, project_id, parent_id, slug, directory, title, version, share_url, summary_additions, summary_deletions, summary_files, summary_diffs, revert, permission, time_created, time_updated, time_compacting, time_archived, workspace_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [`ses_${i}`, "proj_big", null, `s${i}`, "/tmp/big", `S${i}`, "1", null, null, null, null, null, null, null, 1, 1_000 + i, null, null, null],
+    );
+  }
+  db.close();
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  // Cycle 1: seed knownRows.
+  await sync.pushAll();
+  expect(Object.keys(stateManager.state.knownRows).length).toBeGreaterThan(50);
+
+  // Wipe the DB out from under us — simulates `rm opencode.db` or a
+  // restore-from-backup that replaced the file with an empty one.
+  const wipe = new Database(dbPath);
+  wipe.exec("DELETE FROM session; DELETE FROM project;");
+  wipe.close();
+
+  // Cycle 2: should halt.
+  client.pushes = [];
+  await sync.pushAll();
+
+  // No tombstones emitted; halt marker present; halted flag set.
+  expect(client.pushes.flat().filter((e) => e.deleted)).toEqual([]);
+  expect(isSyncHalted()).toBe(true);
+  expect(sync.isHalted()).toBe(true);
+
+  // Marker file contents include the threshold reason.
+  const details = readHaltDetails();
+  expect(details).not.toBeNull();
+  expect(details!.reason).toBe("tombstone_threshold");
+  expect(details!.candidateCount).toBeGreaterThan(50);
+  expect(details!.sampleCandidates?.length).toBeGreaterThan(0);
+
+  // Subsequent pushAll calls remain a no-op even after the threshold
+  // condition would technically resolve — only manual marker removal
+  // re-enables push.
+  client.pushes = [];
+  await sync.pushAll();
+  expect(client.pushes).toEqual([]);
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+  fs.rmSync(HALT_MARKER_PATH, { force: true });
+});
+
+test("threshold is permissive (95%) when at least one expected deletion is present", async () => {
+  // Adaptive threshold: when the user is actively deleting things
+  // (session.deleted hook fired → markExpectedDeletion was called),
+  // we trust them more and only halt on near-total disappearance
+  // (>95%). Otherwise a single "delete this big session" action with
+  // hundreds of cascade message/part rows would trip the strict 50%
+  // threshold even though nothing is wrong.
+  //
+  // To distinguish strict-vs-permissive we need an unexpected fraction
+  // BETWEEN 50% and 95% — a single huge session deletion produces
+  // ~99% which would halt under both. Layout: two sessions, one big
+  // (101 rows including cascade) gets deleted, one smaller (61 rows)
+  // stays live. 101 / 163 ≈ 62% — strict would halt, permissive does
+  // not.
+  const dbPath = createDbPath();
+  initDb(dbPath);
+
+  const seed = new Database(dbPath);
+  seed.exec("PRAGMA foreign_keys = ON");
+  seed.run(
+    `INSERT INTO project (id, worktree, vcs, name, icon_url, icon_color, time_created, time_updated, time_initialized, sandboxes, commands)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ["proj_y", "/tmp/y", "git", "Y", null, null, 1, 1, 1, "[]", null],
+  );
+  // Session A: deleted later (1 + 50msg + 50part = 101 rows go missing).
+  seed.run(
+    `INSERT INTO session (id, project_id, parent_id, slug, directory, title, version, share_url, summary_additions, summary_deletions, summary_files, summary_diffs, revert, permission, time_created, time_updated, time_compacting, time_archived, workspace_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ["ses_a", "proj_y", null, "a", "/tmp/y", "A", "1", null, null, null, null, null, null, null, 1, 1_000, null, null, null],
+  );
+  for (let i = 0; i < 50; i++) {
+    seed.run(
+      "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
+      [`msgA_${i}`, "ses_a", 1, 1_000, '{}'],
+    );
+    seed.run(
+      "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)",
+      [`partA_${i}`, `msgA_${i}`, "ses_a", 1, 1_000, '{}'],
+    );
+  }
+  // Session B: stays (1 + 30msg + 30part = 61 rows remain live).
+  seed.run(
+    `INSERT INTO session (id, project_id, parent_id, slug, directory, title, version, share_url, summary_additions, summary_deletions, summary_files, summary_diffs, revert, permission, time_created, time_updated, time_compacting, time_archived, workspace_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ["ses_b", "proj_y", null, "b", "/tmp/y", "B", "1", null, null, null, null, null, null, null, 1, 1_000, null, null, null],
+  );
+  for (let i = 0; i < 30; i++) {
+    seed.run(
+      "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
+      [`msgB_${i}`, "ses_b", 1, 1_000, '{}'],
+    );
+    seed.run(
+      "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)",
+      [`partB_${i}`, `msgB_${i}`, "ses_b", 1, 1_000, '{}'],
+    );
+  }
+  seed.close();
+
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    new MockClient() as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  // Cycle 1: seed knownRows. Total = 1 proj + 2 ses + 160 msg+part = 163.
+  await sync.pushAll();
+  expect(Object.keys(stateManager.state.knownRows).length).toBeGreaterThan(
+    TOMBSTONE_MIN_KNOWN_FOR_TEST,
+  );
+
+  // Delete session A — cascades to 100 children.
+  const db = new Database(dbPath);
+  db.exec("PRAGMA foreign_keys = ON");
+  db.run("DELETE FROM session WHERE id = ?", ["ses_a"]);
+  db.close();
+  // 101 missing / 163 known = 62%.
+  // STRICT (50%) → would halt. PERMISSIVE (95%) → would NOT halt.
+
+  sync.markExpectedDeletion("session:ses_a");
+
+  await sync.pushAll();
+
+  // PERMISSIVE branch fired → no halt, candidates flow through (session
+  // is expected → fast-path tombstone; msg/part are unexpected → pending).
+  expect(isSyncHalted()).toBe(false);
+  expect(sync.isHalted()).toBe(false);
+  // Pending buffer holds the cascade msg/part (they didn't fast-path).
+  expect(Object.keys(stateManager.state.pendingTombstones).length).toBeGreaterThan(50);
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("threshold guard does NOT halt when knownRows is below the minimum trigger size", async () => {
+  // TOMBSTONE_THRESHOLD_MIN_KNOWN exists so a small knownRows set
+  // doesn't trip the percentage guard on every legitimate cleanup.
+  // A user with 4 sessions deleting 3 of them shouldn't get halted.
+  // The two-cycle confirmation still applies — they just don't get
+  // an immediate halt.
+  const dbPath = createDbPath();
+  initDb(dbPath);
+  seedSessionTree(dbPath);
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  await sync.pushAll();
+  // Only ~5 knownRows — below the 50-row floor.
+  expect(Object.keys(stateManager.state.knownRows).length).toBeLessThan(50);
+
+  // Wipe the DB. With the threshold floor in effect, this should NOT
+  // halt — pending confirmation is still required, but no marker.
+  const db = new Database(dbPath);
+  db.exec("DELETE FROM todo; DELETE FROM part; DELETE FROM message; DELETE FROM session; DELETE FROM project;");
+  db.close();
+
+  client.pushes = [];
+  await sync.pushAll();
+
+  expect(isSyncHalted()).toBe(false);
+  expect(sync.isHalted()).toBe(false);
+  // Candidates buffered, no tombstones yet.
+  expect(client.pushes).toEqual([]);
+  expect(Object.keys(stateManager.state.pendingTombstones).length).toBeGreaterThan(0);
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("server cross-check drops tombstones for rows the server has newer", async () => {
+  // If another peer updated a row since we last synced, we'd rather
+  // pull that update than overwrite it with our tombstone. The
+  // /sync/heads cross-check exists to detect this case.
+  const dbPath = createDbPath();
+  initDb(dbPath);
+  seedSessionTree(dbPath, 1_000);
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  await sync.pushAll();
+  // knownRows knows ses_1 at time 1_000.
+
+  // Server reports ses_1 at time 5_000 — a peer updated it after our
+  // last sync. We delete it locally — but the server knows newer; we
+  // should NOT tombstone.
+  client.headsResponses.set("session:ses_1", {
+    kind: "session",
+    id: "ses_1",
+    time_updated: 5_000,
+    deleted: false,
+  });
+
+  const db = new Database(dbPath);
+  db.exec("PRAGMA foreign_keys = ON");
+  db.run("DELETE FROM session WHERE id = ?", ["ses_1"]);
+  db.close();
+
+  // Cycle 2 (after enough time for confirmation to fire if it would).
+  const realNow = Date.now;
+  Date.now = () => realNow() + 60_000;
+  try {
+    client.pushes = [];
+    await sync.pushAll();
+    // No tombstone for ses_1 — server has newer. (Cascade rows
+    // message/part/todo also dropped because their rowKeys aren't in
+    // the headsResponses map AND the test doesn't seed them as
+    // server-newer; but they would still need confirmation. Either
+    // way the test focuses on the SES_1 cross-check.)
+    const ses1Tombstones = client.pushes
+      .flat()
+      .filter((e) => e.kind === "session" && e.id === "ses_1");
+    expect(ses1Tombstones).toEqual([]);
+  } finally {
+    Date.now = realNow;
+  }
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("server cross-check degrades gracefully when /sync/heads is missing (older server)", async () => {
+  // EndpointMissingError means the server is older than the
+  // deletion-safety release. We should still emit tombstones using
+  // local-only confirmation — just without the server-newer filter.
+  const dbPath = createDbPath();
+  initDb(dbPath);
+  seedSessionTree(dbPath);
+
+  const client = new MockClient();
+  client.headsThrowEndpointMissing = true;
   const stateManager = new StateManager("desktop");
   const reader = new DbReader(dbPath);
   const writer = new DbWriter(dbPath);
@@ -229,16 +700,142 @@ test("pushAll emits tombstones for rows deleted locally", async () => {
   db.run("DELETE FROM session WHERE id = ?", ["ses_1"]);
   db.close();
 
+  // Cycle 2: pending registered (no error from the missing endpoint).
+  client.pushes = [];
+  await sync.pushAll();
+  expect(client.pushes).toEqual([]);
+  expect(Object.keys(stateManager.state.pendingTombstones).length).toBeGreaterThan(0);
+
+  // Cycle 3 after delay: tombstones emitted regardless of the missing endpoint.
+  const realNow = Date.now;
+  Date.now = () => realNow() + 60_000;
+  try {
+    client.pushes = [];
+    await sync.pushAll();
+    const tombstones = client.pushes.flat().filter((e) => e.deleted);
+    expect(tombstones.length).toBeGreaterThan(0);
+  } finally {
+    Date.now = realNow;
+  }
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("server cross-check defers tombstones on transient network failure", async () => {
+  // A non-EndpointMissing failure (DNS, 5xx, connection reset) means
+  // we can't trust the cross-check. Better to defer this cycle's
+  // unexpected tombstones than to barrel through blindly. Expected
+  // tombstones still flow.
+  const dbPath = createDbPath();
+  initDb(dbPath);
+  seedSessionTree(dbPath);
+
+  const client = new MockClient();
+  client.headsThrowError = true;
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
   await sync.pushAll();
 
-  const tombstones = client.pushes[1] ?? [];
-  expect(tombstones.every((envelope) => envelope.deleted)).toBe(true);
-  expect(tombstones.map((envelope) => `${envelope.kind}:${envelope.id}`).sort()).toEqual([
-    "message:msg_1",
-    "part:part_1",
-    "session:ses_1",
-    "todo:ses_1:0",
-  ]);
+  const db = new Database(dbPath);
+  db.exec("PRAGMA foreign_keys = ON");
+  db.run("DELETE FROM session WHERE id = ?", ["ses_1"]);
+  db.close();
+
+  // Mark only the session as expected (cascade rows are unexpected).
+  sync.markExpectedDeletion("session:ses_1");
+
+  client.pushes = [];
+  await sync.pushAll();
+  // Expected tombstones (session + todo via cascade) flowed.
+  // Unexpected ones (message + part) deferred.
+  const emitted = client.pushes.flat().map((e) => `${e.kind}:${e.id}`).sort();
+  expect(emitted).toContain("session:ses_1");
+  expect(emitted).toContain("todo:ses_1:0");
+  expect(emitted).not.toContain("message:msg_1");
+  expect(emitted).not.toContain("part:part_1");
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("two-cycle confirmation is reset when the row reappears in the live DB", async () => {
+  // Defends against false positives: a row briefly disappears (e.g.
+  // mid-migration, opencode is rewriting a table) but reappears.
+  // The pending entry should be cleared so we don't tombstone on the
+  // next cycle — even if the row goes missing AGAIN later, the
+  // confirmation timer must restart.
+  const dbPath = createDbPath();
+  initDb(dbPath);
+  seedSessionTree(dbPath);
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  await sync.pushAll();
+
+  // Cycle 2: delete, observe pending entry.
+  let db = new Database(dbPath);
+  db.exec("PRAGMA foreign_keys = ON");
+  db.run("DELETE FROM session WHERE id = ?", ["ses_1"]);
+  db.close();
+  client.pushes = [];
+  await sync.pushAll();
+  expect(stateManager.state.pendingTombstones["session:ses_1"]).toBeDefined();
+  const firstSeenAt = stateManager.state.pendingTombstones["session:ses_1"]!.firstSeenAt;
+
+  // Restore the row (simulating "the migration completed and the row
+  // came back").
+  db = new Database(dbPath);
+  db.exec("PRAGMA foreign_keys = ON");
+  db.run(
+    `INSERT INTO session (id, project_id, parent_id, slug, directory, title, version, share_url, summary_additions, summary_deletions, summary_files, summary_diffs, revert, permission, time_created, time_updated, time_compacting, time_archived, workspace_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ["ses_1", "proj_1", null, "session-1", "/tmp/project", "Session 1", "1", null, null, null, null, null, null, null, 1, 2_000, null, null, null],
+  );
+  db.close();
+
+  // Cycle 3: pending entry should be cleared.
+  client.pushes = [];
+  await sync.pushAll();
+  expect(stateManager.state.pendingTombstones["session:ses_1"]).toBeUndefined();
+
+  // Delete it AGAIN. Cycle 4 should re-pend with a NEW firstSeenAt
+  // (timer restarts; row doesn't get tombstoned just because it was
+  // missing once before).
+  db = new Database(dbPath);
+  db.exec("PRAGMA foreign_keys = ON");
+  db.run("DELETE FROM session WHERE id = ?", ["ses_1"]);
+  db.close();
+  client.pushes = [];
+  await sync.pushAll();
+  expect(stateManager.state.pendingTombstones["session:ses_1"]).toBeDefined();
+  // It's a fresh entry; firstSeenAt is recent (>= the original one).
+  expect(stateManager.state.pendingTombstones["session:ses_1"]!.firstSeenAt).toBeGreaterThanOrEqual(firstSeenAt);
+  // No tombstone yet.
+  expect(client.pushes.flat().filter((e) => e.deleted)).toEqual([]);
 
   reader.close();
   writer.close();
@@ -954,4 +1551,313 @@ test("advancePushedRowTime clamps to Date.now() to defend against forward clock 
   const before = stateManager.state.lastPushedRowTime;
   stateManager.advancePushedRowTime(past);
   expect(stateManager.state.lastPushedRowTime).toBe(before);
+});
+
+// ── Halt-bypass coverage ───────────────────────────────────────────
+//
+// These tests cover paths where the on-disk halt marker exists but
+// `SessionSync.halted` is `false` — which happens after a plugin
+// restart (in-memory flag does not survive process exit) and when the
+// fingerprint-mismatch halt in `index.ts` writes the marker without
+// touching the SessionSync instance. Before the fix, event-driven
+// callers (`session.deleted` → `pushAll`, `server.connected` →
+// `sync.sync()`) would slip past the halt because they only consulted
+// the in-memory flag.
+
+import { writeHaltMarker, HALT_REASONS } from "./halt.js";
+
+test("pushAll respects an externally-written halt marker even if this.halted is false", async () => {
+  // Simulates a plugin restart: marker on disk, fresh SessionSync
+  // instance with no in-memory halt state. Before the fix, pushAll
+  // would happily push (and delete) anything.
+  const dbPath = createDbPath();
+  initDb(dbPath);
+  seedSessionTree(dbPath);
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  // Halt was set by a previous process / fingerprint trip / threshold
+  // trip — `this.halted` is `false` because this is a fresh instance.
+  writeHaltMarker({
+    triggeredAt: Date.now(),
+    reason: HALT_REASONS.DB_FINGERPRINT_MISMATCH,
+    message: "simulated previous-run halt",
+  });
+  expect(isSyncHalted()).toBe(true);
+
+  await sync.pushAll();
+
+  // No network calls — neither live rows nor tombstones — should have
+  // been emitted.
+  expect(client.pushes).toEqual([]);
+  // Public introspection reflects the halt.
+  expect(sync.isHalted()).toBe(true);
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("pushSession respects an externally-written halt marker", async () => {
+  // Same scenario as above but for the per-session push path. Before
+  // the fix, an `session.idle` event after a restart would slip a
+  // live-row push past the halt — extending knownRows with rows the
+  // (still-broken) push path would later try to tombstone.
+  const dbPath = createDbPath();
+  initDb(dbPath);
+  seedSessionTree(dbPath);
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  writeHaltMarker({
+    triggeredAt: Date.now(),
+    reason: HALT_REASONS.TOMBSTONE_THRESHOLD,
+    message: "simulated previous-run halt",
+  });
+
+  await sync.pushSession("ses_1");
+
+  expect(client.pushes).toEqual([]);
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("sync() does NOT pull when an externally-written halt marker is present", async () => {
+  // Pull has to be gated alongside push because pulling extends
+  // knownRows with new rows that the broken push path would then try
+  // to tombstone once the halt is cleared. The timer path in index.ts
+  // already enforces this; this test verifies the entry guard inside
+  // SessionSync.sync() catches event-driven callers (server.connected)
+  // that bypass the timer.
+  const dbPath = createDbPath();
+  initDb(dbPath);
+  seedSessionTree(dbPath);
+
+  const client = new MockClient();
+  // If pull WERE called, this response would be consumed; assert
+  // afterwards that it wasn't.
+  client.pullResponses.push({
+    server_seq: 99,
+    more: false,
+    envelopes: [],
+  });
+
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  writeHaltMarker({
+    triggeredAt: Date.now(),
+    reason: HALT_REASONS.DB_FINGERPRINT_MISMATCH,
+    message: "simulated previous-run halt",
+  });
+
+  await sync.sync();
+
+  // Pull was never called — pullCalls is empty, pullResponses still has
+  // the unconsumed response.
+  expect(client.pullCalls).toEqual([]);
+  expect(client.pullResponses.length).toBe(1);
+  // Push also skipped.
+  expect(client.pushes).toEqual([]);
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("isHalted() returns true based on the on-disk marker even without an in-process trip", async () => {
+  // Verifies the public introspection method reflects disk state,
+  // which is what hooks.ts and the test suite rely on to decide
+  // whether to bother queueing per-session work after a restart.
+  const dbPath = createDbPath();
+  initDb(dbPath);
+  seedSessionTree(dbPath);
+
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    new MockClient() as unknown as SyncClient,
+    new StateManager("desktop"),
+    "desktop",
+    () => {},
+  );
+
+  expect(sync.isHalted()).toBe(false);
+
+  writeHaltMarker({
+    triggeredAt: Date.now(),
+    reason: HALT_REASONS.TOMBSTONE_THRESHOLD,
+    message: "external halt",
+  });
+
+  expect(sync.isHalted()).toBe(true);
+
+  // Clearing the marker (which is what manual recovery does) flips it
+  // back without any in-process state change.
+  clearHaltMarker();
+  expect(sync.isHalted()).toBe(false);
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("a once-halted SessionSync stays halted even after the marker is cleared", async () => {
+  // Defence in depth: the in-memory `halted` flag is a one-way latch
+  // for the current process. Manual marker clear is meant to be a
+  // human action signalling "I've inspected, restore the data, you can
+  // resume" — but it doesn't unwind any pending tombstone state that
+  // was prepared mid-cycle. To prevent racy resume scenarios within
+  // the same process, once `this.halted` flips true we keep refusing
+  // to push until the process restarts (which clears the in-memory
+  // latch and re-evaluates the marker fresh).
+  const dbPath = createDbPath();
+  initDb(dbPath);
+
+  // Seed enough rows to trip the threshold, then wipe.
+  const seed = new Database(dbPath);
+  seed.exec("PRAGMA foreign_keys = ON");
+  seed.run(
+    `INSERT INTO project (id, worktree, vcs, name, icon_url, icon_color, time_created, time_updated, time_initialized, sandboxes, commands)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ["proj_z", "/tmp/z", "git", "Z", null, null, 1, 1, 1, "[]", null],
+  );
+  for (let i = 0; i < 100; i++) {
+    seed.run(
+      `INSERT INTO session (id, project_id, parent_id, slug, directory, title, version, share_url, summary_additions, summary_deletions, summary_files, summary_diffs, revert, permission, time_created, time_updated, time_compacting, time_archived, workspace_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [`ses_z_${i}`, "proj_z", null, `s${i}`, "/tmp/z", `S${i}`, "1", null, null, null, null, null, null, null, 1, 1_000 + i, null, null, null],
+    );
+  }
+  seed.close();
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  // Cycle 1: seed knownRows.
+  await sync.pushAll();
+  // Wipe → cycle 2 trips the threshold.
+  const wipe = new Database(dbPath);
+  wipe.exec("DELETE FROM session; DELETE FROM project;");
+  wipe.close();
+  client.pushes = [];
+  await sync.pushAll();
+  expect(sync.isHalted()).toBe(true);
+  expect(isSyncHalted()).toBe(true);
+
+  // Manually clear the marker as a user would after restoring data.
+  clearHaltMarker();
+  expect(isSyncHalted()).toBe(false);
+
+  // Same process: in-memory latch still set, push remains a no-op.
+  client.pushes = [];
+  await sync.pushAll();
+  expect(client.pushes).toEqual([]);
+  expect(sync.isHalted()).toBe(true);
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("getHeads still throws EndpointMissingError on a 404 from /sync/heads", async () => {
+  // The 404 → EndpointMissingError translation moved out of the generic
+  // `request()` helper into `getHeads` itself (so a 404 from a
+  // different endpoint — e.g. `GET /files/blob/:sha256` for a missing
+  // blob — surfaces as a generic HttpError, not an `EndpointMissingError`
+  // misleading other callers). Verify the externally-visible behaviour
+  // for getHeads is unchanged.
+  const { SyncClient: RealSyncClient } = await import("./client.js");
+
+  // Spin up a tiny one-shot server that 404s on /sync/heads.
+  const server = Bun.serve({
+    port: 0,
+    fetch: () => new Response("Not Found", { status: 404 }),
+  });
+  try {
+    const client = new RealSyncClient(`http://127.0.0.1:${server.port}`, "tok");
+    let caught: unknown = null;
+    try {
+      await client.getHeads("desktop", [{ kind: "session" as SyncKind, id: "x" }]);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(EndpointMissingError);
+  } finally {
+    server.stop(true);
+  }
+});
+
+test("non-getHeads 404s surface as HttpError, not EndpointMissingError", async () => {
+  // Regression: previously any 404 anywhere (e.g. a missing blob)
+  // would surface as `EndpointMissingError`, which mis-implies
+  // "server lacks this endpoint" when the server actually has it but
+  // the resource is missing. With the scoping fix, only `getHeads`
+  // produces `EndpointMissingError`; other callers see `HttpError`
+  // exposing a `status` field they can branch on.
+  const { SyncClient: RealSyncClient, HttpError } = await import("./client.js");
+
+  const server = Bun.serve({
+    port: 0,
+    fetch: () => new Response("Blob not found", { status: 404 }),
+  });
+  try {
+    const client = new RealSyncClient(`http://127.0.0.1:${server.port}`, "tok");
+    let caught: unknown = null;
+    try {
+      await client.getBlob("nonexistent_sha256");
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(HttpError);
+    expect(caught).not.toBeInstanceOf(EndpointMissingError);
+    expect((caught as InstanceType<typeof HttpError>).status).toBe(404);
+  } finally {
+    server.stop(true);
+  }
 });

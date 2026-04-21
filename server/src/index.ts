@@ -8,7 +8,7 @@ import { createLogger } from "./log.js";
 import { LedgerDB } from "./db.js";
 import { checkAuth } from "./auth.js";
 import { handleHealth } from "./routes/health.js";
-import { handleSyncPush, handleSyncPull } from "./routes/sync.js";
+import { handleSyncPush, handleSyncPull, handleSyncHeads } from "./routes/sync.js";
 import {
   handleFilesManifest,
   handleFileBlob,
@@ -71,6 +71,11 @@ async function handleRequest(request: Request): Promise<Response> {
   // GET /sync/pull
   if (method === "GET" && path === "/sync/pull") {
     return handleSyncPull(request, db, logger);
+  }
+
+  // POST /sync/heads — deletion-safety cross-check
+  if (method === "POST" && path === "/sync/heads") {
+    return handleSyncHeads(request, db, logger);
   }
 
   // GET /files/manifest

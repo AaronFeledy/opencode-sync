@@ -3,6 +3,7 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { logger } from "./logger.js";
 
 /**
  * Promisified setTimeout.
@@ -23,7 +24,7 @@ export function debounce<T extends (...args: any[]) => void>(fn: T, ms: number):
       timer = null;
       // Handle async functions — catch unhandled rejections
       Promise.resolve(fn(...args)).catch((err) => {
-        console.error("opencode-sync: debounced function error:", err);
+        logger.error("debounced function error:", err);
       });
     }, ms);
   };

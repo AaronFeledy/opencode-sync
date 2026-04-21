@@ -7,13 +7,32 @@ import type { Logger } from "../log.js";
 import type { LedgerDB } from "../db.js";
 import {
   SYNC_KINDS,
+  type HeadsResponse,
   type PushResponse,
   type PullResponse,
   type StaleEntry,
   type SyncEnvelope,
+  type SyncKind,
 } from "@opencode-sync/shared";
 
 const VALID_KINDS = new Set<string>(SYNC_KINDS);
+
+/**
+ * Type-narrowing predicate so callers don't have to `as SyncKind` cast
+ * every time they check membership against the runtime set. Mirrors
+ * `VALID_KINDS.has` but tells TypeScript the result.
+ */
+function isSyncKind(value: string): value is SyncKind {
+  return VALID_KINDS.has(value);
+}
+
+/**
+ * Cap on the number of (kind, id) pairs allowed in a single
+ * `POST /sync/heads` request. Keeps the SQLite query under the default
+ * SQLITE_MAX_VARIABLE_NUMBER (32766) with comfortable headroom even
+ * after grouping by kind blows up the parameter count slightly.
+ */
+const HEADS_MAX_BATCH = 5000;
 
 // ── Push ────────────────────────────────────────────────────────────
 
@@ -140,6 +159,110 @@ export async function handleSyncPush(
     server_seq: serverSeq,
     accepted,
     stale,
+  };
+
+  return Response.json(response);
+}
+
+// ── Heads (deletion-safety cross-check) ─────────────────────────────
+
+/**
+ * POST /sync/heads — return the server's current `time_updated` and
+ * `deleted` state for a batch of `(kind, id)` pairs. Used by the
+ * plugin's deletion-safety guard to confirm a row is "really" gone
+ * (or stale) before propagating a tombstone for it.
+ *
+ * Rows the server has never seen are omitted from the response — the
+ * caller treats absence as "server doesn't know this row, safe to
+ * tombstone if local says so."
+ */
+export async function handleSyncHeads(
+  req: Request,
+  db: LedgerDB,
+  logger: Logger,
+): Promise<Response> {
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return Response.json({ error: "Invalid JSON body" }, { status: 400 });
+  }
+
+  if (!body || typeof body !== "object") {
+    return Response.json({ error: "Request body must be a JSON object" }, { status: 400 });
+  }
+
+  const { machine_id, row_keys } = body as Record<string, unknown>;
+
+  if (typeof machine_id !== "string" || machine_id.length === 0) {
+    return Response.json(
+      { error: "machine_id is required and must be a non-empty string" },
+      { status: 400 },
+    );
+  }
+
+  if (!Array.isArray(row_keys)) {
+    return Response.json({ error: "row_keys must be an array" }, { status: 400 });
+  }
+
+  if (row_keys.length === 0) {
+    // Vacuous request — return immediately with empty heads. Avoids
+    // round-tripping an obviously-empty response through the DB layer.
+    const response: HeadsResponse = { heads: [] };
+    return Response.json(response);
+  }
+
+  if (row_keys.length > HEADS_MAX_BATCH) {
+    return Response.json(
+      { error: `row_keys array exceeds maximum batch size of ${HEADS_MAX_BATCH}` },
+      { status: 400 },
+    );
+  }
+
+  // Validate every entry up-front. Keep this strict — an invalid `kind`
+  // making it into the SQL builder would just be filtered out by the
+  // primary-key index, but reject loudly so misbehaving clients learn.
+  const validated: Array<{ kind: SyncKind; id: string }> = [];
+  for (const raw of row_keys) {
+    if (!raw || typeof raw !== "object") {
+      return Response.json(
+        { error: "Each row_keys entry must be an object" },
+        { status: 400 },
+      );
+    }
+    const entry = raw as Record<string, unknown>;
+    if (typeof entry.kind !== "string" || !isSyncKind(entry.kind)) {
+      return Response.json(
+        { error: `row_keys entry has invalid kind; must be one of: ${SYNC_KINDS.join(", ")}` },
+        { status: 400 },
+      );
+    }
+    if (typeof entry.id !== "string" || entry.id.length === 0) {
+      return Response.json(
+        { error: "row_keys entry id must be a non-empty string" },
+        { status: 400 },
+      );
+    }
+    validated.push({ kind: entry.kind, id: entry.id });
+  }
+
+  const heads = db.getHeads(validated);
+
+  logger.debug("sync heads", {
+    machine_id,
+    requested: validated.length,
+    returned: heads.length,
+  });
+
+  // No cast needed: `db.getHeads` returns `SyncKind` directly now that
+  // the validated input is typed.
+  const response: HeadsResponse = {
+    heads: heads.map((h) => ({
+      kind: h.kind,
+      id: h.id,
+      time_updated: h.time_updated,
+      deleted: h.deleted,
+    })),
   };
 
   return Response.json(response);

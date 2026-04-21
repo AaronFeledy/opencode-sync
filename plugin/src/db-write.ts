@@ -6,6 +6,7 @@
 import { Database, type SQLQueryBindings } from "bun:sqlite";
 import type { SyncEnvelope, SyncKind } from "@opencode-sync/shared";
 import { parseRowPrimaryKey } from "@opencode-sync/shared";
+import { logger } from "./logger.js";
 
 // ── Column definitions per kind ────────────────────────────────────
 
@@ -89,7 +90,7 @@ export class DbWriter {
     // dereferences would throw a TypeError that escapes applyEnvelope, when
     // the contract is to return "error" instead.
     if (!(kind in TABLE_COLUMNS)) {
-      console.error(`opencode-sync: unknown envelope kind: ${kind}`);
+      logger.error(`unknown envelope kind: ${kind}`);
       return "error";
     }
 
@@ -157,7 +158,7 @@ export class DbWriter {
       this.db.run(sql, params);
       return true;
     } catch (err) {
-      console.error(`opencode-sync: SQL upsert error for ${kind}:`, err);
+      logger.error(`SQL upsert error for ${kind}:`, err);
       return false;
     }
   }
@@ -192,7 +193,7 @@ export class DbWriter {
       this.db.run(sql, pkValues);
       return "applied";
     } catch (err) {
-      console.error(`opencode-sync: SQL delete error for ${kind}:`, err);
+      logger.error(`SQL delete error for ${kind}:`, err);
       return "error";
     }
   }

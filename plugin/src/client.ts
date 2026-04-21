@@ -7,8 +7,12 @@ import type {
   PushResponse,
   PullResponse,
   HealthResponse,
+  HeadsRequest,
+  HeadsResponse,
+  HeadEntry,
   FileManifest,
   SyncEnvelope,
+  SyncKind,
 } from "@opencode-sync/shared";
 import { sleep } from "./util.js";
 
@@ -34,6 +38,48 @@ export class StaleError extends Error {
   ) {
     super(`opencode-sync: ${method} ${urlPath} rejected as stale (409): ${body}`);
     this.name = "StaleError";
+  }
+}
+
+/**
+ * Thrown for any non-2xx HTTP response that isn't already routed to a
+ * more specific error type (`StaleError` for 409, `EndpointMissingError`
+ * for `getHeads` 404). Exposes `status` so callers can branch on the
+ * code instead of substring-matching the message.
+ */
+export class HttpError extends Error {
+  constructor(
+    public status: number,
+    public method: string,
+    public urlPath: string,
+    public body: string,
+  ) {
+    super(`opencode-sync: ${method} ${urlPath} failed with ${status}: ${body}`);
+    this.name = "HttpError";
+  }
+}
+
+/**
+ * Thrown by `getHeads` when the server doesn't expose `/sync/heads`
+ * (404). Older servers — pre deletion-safety — return 404 here, and
+ * the deletion-safety guard treats this as "fall back to local-only
+ * confirmation" rather than failing the whole sync. Distinct error
+ * type so the caller can branch on it cleanly.
+ *
+ * Scoped to `getHeads` only. Other endpoints that legitimately 404
+ * (e.g. `GET /files/blob/:sha256` for a missing blob) surface as a
+ * generic `HttpError` and are handled by their own callers — using
+ * `EndpointMissingError` for those would mis-imply "this server lacks
+ * the endpoint" when the server actually has it but the resource is
+ * missing.
+ */
+export class EndpointMissingError extends Error {
+  constructor(
+    public method: string,
+    public urlPath: string,
+  ) {
+    super(`opencode-sync: ${method} ${urlPath} not found on server (404)`);
+    this.name = "EndpointMissingError";
   }
 }
 
@@ -66,6 +112,48 @@ export class SyncClient {
     if (exclude) params.set("exclude", exclude);
     if (limit !== undefined) params.set("limit", String(limit));
     return this.fetchJson<PullResponse>("GET", `/sync/pull?${params.toString()}`);
+  }
+
+  /**
+   * Cross-check head state for a batch of `(kind, id)` pairs. Used by
+   * the deletion-safety guard before emitting tombstones — if the server
+   * has a strictly-newer version of a candidate, we'd rather pull that
+   * version than overwrite it with a tombstone.
+   *
+   * Returns a Map keyed by `${kind}:${id}` for ergonomic lookup.
+   *
+   * Older servers (pre deletion-safety) don't expose `/sync/heads` and
+   * will return 404. We surface that as `EndpointMissingError` so the
+   * caller can fall back to local-only confirmation rather than aborting
+   * sync.
+   */
+  async getHeads(
+    machineId: string,
+    rowKeys: Array<{ kind: SyncKind; id: string }>,
+  ): Promise<Map<string, HeadEntry>> {
+    if (rowKeys.length === 0) return new Map();
+
+    const body: HeadsRequest = { machine_id: machineId, row_keys: rowKeys };
+
+    let res: HeadsResponse;
+    try {
+      res = await this.fetchJson<HeadsResponse>("POST", "/sync/heads", body);
+    } catch (err) {
+      // Endpoint-scoped 404 translation — happens here (not in `request()`)
+      // so a 404 from a different endpoint (e.g. blob-not-found) doesn't
+      // accidentally surface as `EndpointMissingError` and confuse its
+      // callers.
+      if (err instanceof HttpError && err.status === 404) {
+        throw new EndpointMissingError("POST", "/sync/heads");
+      }
+      throw err;
+    }
+
+    const map = new Map<string, HeadEntry>();
+    for (const head of res.heads) {
+      map.set(`${head.kind}:${head.id}`, head);
+    }
+    return map;
   }
 
   async getManifest(): Promise<FileManifest> {
@@ -148,12 +236,16 @@ export class SyncClient {
           throw new StaleError(method, urlPath, text);
         }
 
-        // Non-retryable client errors
+        // Non-retryable client errors (including 404). Surface as a
+        // typed `HttpError` exposing `status` so endpoint-specific
+        // callers can translate to a more meaningful error type at
+        // their boundary (e.g. `getHeads` translates 404 →
+        // `EndpointMissingError`). Doing the translation here would
+        // make 404 ambiguous: "server lacks the endpoint" vs. "the
+        // resource at this endpoint is missing" (e.g. blob 404).
         if (res.status >= 400 && res.status < 500) {
           const text = await res.text().catch(() => "");
-          throw new Error(
-            `opencode-sync: ${method} ${urlPath} failed with ${res.status}: ${text}`,
-          );
+          throw new HttpError(res.status, method, urlPath, text);
         }
 
         // Retryable server errors
