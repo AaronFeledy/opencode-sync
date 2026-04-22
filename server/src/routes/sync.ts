@@ -34,6 +34,15 @@ function isSyncKind(value: string): value is SyncKind {
  */
 const HEADS_MAX_BATCH = 5000;
 
+/**
+ * Cap on the number of envelopes accepted in a single POST /sync/push.
+ * Bounds the SQLite write-transaction size (upsertBatch runs in one tx)
+ * so a malicious or buggy client can't wedge the lock for arbitrary
+ * durations. The plugin's PUSH_BATCH_SIZE is 100 (plugin/src/sessions.ts),
+ * so legitimate clients are nowhere near this cap. See FINDINGS.md H4.
+ */
+const PUSH_MAX_BATCH = 5000;
+
 // ── Push ────────────────────────────────────────────────────────────
 
 export async function handleSyncPush(
@@ -68,6 +77,13 @@ export async function handleSyncPush(
 
   if (envelopes.length === 0) {
     return Response.json({ error: "envelopes array must not be empty" }, { status: 400 });
+  }
+
+  if (envelopes.length > PUSH_MAX_BATCH) {
+    return Response.json(
+      { error: `envelopes array exceeds maximum batch size of ${PUSH_MAX_BATCH}` },
+      { status: 400 },
+    );
   }
 
   // Validate every envelope before touching the database — `upsertBatch`

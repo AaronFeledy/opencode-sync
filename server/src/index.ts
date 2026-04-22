@@ -47,6 +47,16 @@ function parseListenAddress(listen: string): { hostname: string; port: number } 
 
 const { hostname, port } = parseListenAddress(config.listen);
 
+/**
+ * Upper bound on request body size. Bun's default is 128 MiB; we tighten
+ * to 64 MiB because legitimate clients never come close — plugin's
+ * PUSH_BATCH_SIZE is 100 envelopes and even a worst-case envelope
+ * (a full message `data` JSON) is well under 1 MiB. A 64 MiB ceiling
+ * still leaves 128× the real-world batch size in headroom, and bounds
+ * memory cost of `req.json()` parsing. See FINDINGS.md H4.
+ */
+const MAX_BODY_BYTES = 64 * 1024 * 1024;
+
 // ── Router ─────────────────────────────────────────────────────────
 
 async function handleRequest(request: Request): Promise<Response> {
@@ -125,6 +135,7 @@ async function handleRequest(request: Request): Promise<Response> {
 const server = Bun.serve({
   hostname,
   port,
+  maxRequestBodySize: MAX_BODY_BYTES,
   fetch: handleRequest,
   error(error: Error) {
     logger.error("Unhandled server error", { message: error.message, stack: error.stack });
