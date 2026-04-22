@@ -7,6 +7,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { FileManifestEntry, SyncKind } from "@opencode-sync/shared";
 import { atomicWriteFileSync } from "./util.js";
+import { logger } from "./logger.js";
 
 /**
  * Threshold beyond which a single `(kind, id, server_seq)` envelope is
@@ -193,30 +194,77 @@ export class StateManager {
     };
   }
 
-  /** Load state from disk, creating directory if needed. */
+  /**
+   * Load state from disk, creating directory if needed.
+   *
+   * On corruption (malformed JSON), the corrupt file is backed up to
+   * `${STATE_FILE}.corrupt-${timestamp}` and the in-memory state is
+   * left at constructor defaults. On filesystem errors (EACCES, EIO),
+   * the error is rethrown so the caller sees a loud failure rather
+   * than silently resetting to defaults. See FINDINGS.md M3.
+   */
   load(): void {
     if (!fs.existsSync(STATE_FILE)) return;
 
+    let raw: string;
     try {
-      const raw = fs.readFileSync(STATE_FILE, "utf-8");
-      const json = JSON.parse(raw) as Partial<SyncStateJson>;
-
-      this._state.lastPulledSeq = json.lastPulledSeq ?? 0;
-      this._state.lastPushedRowIds = new Set(json.lastPushedRowIds ?? []);
-      this._state.lastPushedRowTime = json.lastPushedRowTime ?? 0;
-      this._state.knownRows = this.parseKnownRows(json.knownRows);
-      this._state.knownFiles = this.parseKnownFiles(json.knownFiles);
-      this._state.lastFileSyncTime = json.lastFileSyncTime ?? 0;
-      this._state.dbFingerprint = this.parseDbFingerprint(json.dbFingerprint);
-      this._state.pendingTombstones = this.parsePendingTombstones(json.pendingTombstones);
-      this._state.pullErrorCounts = this.parsePullErrorCounts(json.pullErrorCounts);
-      this._state.poisonedEnvelopes = this.parsePoisonedEnvelopes(json.poisonedEnvelopes);
-      this._state.rowParents = this.parseRowParents(json.rowParents);
-
-      // Preserve machineId from constructor — don't override with stale file
-    } catch {
-      // Corrupted state file — start fresh
+      raw = fs.readFileSync(STATE_FILE, "utf-8");
+    } catch (err) {
+      // fs-level failure is NOT "corrupt" — surface it so the operator
+      // sees a loud error rather than an opaque re-pull-from-zero.
+      logger.error("state.load: failed to read state file", {
+        path: STATE_FILE,
+        error: String(err),
+      });
+      throw err;
     }
+
+    let json: Partial<SyncStateJson>;
+    try {
+      json = JSON.parse(raw) as Partial<SyncStateJson>;
+    } catch (err) {
+      // Back up the corrupt file before the next save() clobbers it.
+      // `rename` is atomic on the same filesystem, so the original
+      // bytes are preserved even if the save-before-next-load races.
+      const backup = `${STATE_FILE}.corrupt-${Date.now()}`;
+      try {
+        fs.renameSync(STATE_FILE, backup);
+      } catch (backupErr) {
+        logger.error(
+          "state.load: corrupt state.json AND backup failed — resetting to defaults",
+          {
+            path: STATE_FILE,
+            parseError: String(err),
+            backupError: String(backupErr),
+          },
+        );
+        return;
+      }
+      logger.error(
+        "state.load: corrupt state.json — backed up and reset to defaults",
+        {
+          path: STATE_FILE,
+          backup,
+          bytes: raw.length,
+          error: String(err),
+        },
+      );
+      return;
+    }
+
+    this._state.lastPulledSeq = json.lastPulledSeq ?? 0;
+    this._state.lastPushedRowIds = new Set(json.lastPushedRowIds ?? []);
+    this._state.lastPushedRowTime = json.lastPushedRowTime ?? 0;
+    this._state.knownRows = this.parseKnownRows(json.knownRows);
+    this._state.knownFiles = this.parseKnownFiles(json.knownFiles);
+    this._state.lastFileSyncTime = json.lastFileSyncTime ?? 0;
+    this._state.dbFingerprint = this.parseDbFingerprint(json.dbFingerprint);
+    this._state.pendingTombstones = this.parsePendingTombstones(json.pendingTombstones);
+    this._state.pullErrorCounts = this.parsePullErrorCounts(json.pullErrorCounts);
+    this._state.poisonedEnvelopes = this.parsePoisonedEnvelopes(json.poisonedEnvelopes);
+    this._state.rowParents = this.parseRowParents(json.rowParents);
+
+    // Preserve machineId from constructor — don't override with stale file.
   }
 
   /** Persist state to disk atomically. */
