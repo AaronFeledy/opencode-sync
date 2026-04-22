@@ -70,7 +70,15 @@ export class FileSync {
 
         if (!fs.existsSync(absPath)) continue;
 
-        const stat = fs.statSync(absPath);
+        // `lstatSync` so a symlinked configured root is visible as a
+        // symlink and can be refused. Following it could leak arbitrary
+        // filesystem paths (e.g. /etc/passwd, a git-managed dotfiles
+        // repo with secrets) into the sync stream. See FINDINGS.md M5.
+        const stat = fs.lstatSync(absPath);
+        if (stat.isSymbolicLink()) {
+          this.log("configured sync path is a symlink, skipping", { path: absPath });
+          continue;
+        }
         if (stat.isDirectory()) {
           this.walkDir(absPath, CONFIG_BASE, entries, cache);
         } else if (stat.isFile()) {
@@ -143,6 +151,10 @@ export class FileSync {
     const localManifest = await this.computeLocalManifest();
     const previousLocalFiles = new Map(Object.entries(this.stateManager.state.knownFiles));
     const justDeletedRemote = new Set<string>();
+    // Paths whose remote-delete failed transiently this cycle. Used to
+    // skip the remote→local download branch so the file we're trying
+    // to delete doesn't get silently resurrected before the retry.
+    const pendingRemoteDeletes = new Set<string>();
 
     // Track the post-sync state of each file as we go, so we can persist
     // `knownFiles` without a second filesystem walk + hash pass at the end.
@@ -177,22 +189,47 @@ export class FileSync {
       if (remote.sha256 !== previous.sha256) continue;
 
       // Stamp the tombstone with the current wall-clock time. The server
-      // applies LWW: if another machine has uploaded a newer version since
-      // we last pulled, the server returns 409 and `deleteRemoteFile`
-      // returns false — we then leave knownFiles untouched and pick up the
-      // remote on the next pull.
-      const ok = await this.deleteRemoteFile(relpath, Date.now());
-      if (ok) {
+      // applies LWW:
+      //   - "ok":    remote accepted our tombstone, drop the entry.
+      //   - "stale": another machine uploaded a newer version since we
+      //              last pulled. Drop the entry; next pull will pick up
+      //              the remote and re-download.
+      //   - "error": transient failure (network blip, 5xx). Retain the
+      //              previous entry in `postSyncByPath` so next cycle's
+      //              `previousLocalFiles` still contains it, the
+      //              deletion-detection loop re-fires, and the user's
+      //              delete survives the failure. Without this, the
+      //              remote-only download branch would silently resurrect
+      //              the file — see FINDINGS.md H1.
+      const result = await this.deleteRemoteFile(relpath, Date.now());
+      if (result === "ok") {
         justDeletedRemote.add(relpath);
         uploaded++;
-        // The file was already absent locally; nothing to mutate in post-sync.
+      } else if (result === "error") {
+        // previousLocalFiles entries only carry {sha256, mtime, size} —
+        // rebuild a full FileManifestEntry so replaceKnownFiles can
+        // persist it on the next save.
+        postSyncByPath.set(relpath, {
+          relpath,
+          sha256: previous.sha256,
+          mtime: previous.mtime,
+          size: previous.size,
+          machine_id: this.machineId,
+          deleted: false,
+        });
+        pendingRemoteDeletes.add(relpath);
       }
+      // "stale": deliberately drop — next pull reconciles to remote.
     }
 
     // ── Process remote entries (download or conflict) ──
 
     for (const remote of remoteManifest) {
       if (justDeletedRemote.has(remote.relpath)) continue;
+      // Skip downloads for paths whose tombstone upload we're retrying —
+      // otherwise the remote-only download branch would silently
+      // resurrect the file the user just deleted (FINDINGS.md H1).
+      if (pendingRemoteDeletes.has(remote.relpath)) continue;
 
       const local = localByPath.get(remote.relpath);
 
@@ -333,24 +370,27 @@ export class FileSync {
     }
   }
 
-  private async deleteRemoteFile(relpath: string, mtime: number): Promise<boolean> {
+  private async deleteRemoteFile(
+    relpath: string,
+    mtime: number,
+  ): Promise<"ok" | "stale" | "error"> {
     try {
       await this.client.deleteFile(relpath, this.machineId, mtime);
       this.log("deleted remote file", { relpath, mtime });
-      return true;
+      return "ok";
     } catch (err) {
       if (err instanceof StaleError) {
         // Expected: the remote file changed since we last pulled. The next
         // pull will reconcile by either re-downloading the live version or
         // applying a newer tombstone.
         this.log("delete rejected as stale, will resync from remote", { relpath });
-        return false;
+        return "stale";
       }
       this.log("failed to delete remote file", {
         relpath,
         error: String(err),
       });
-      return false;
+      return "error";
     }
   }
 
@@ -437,7 +477,16 @@ export class FileSync {
     baseDir: string,
     entries: FileManifestEntry[],
     cache: Record<string, { sha256: string; mtime: number; size: number }>,
+    depth: number = 0,
   ): void {
+    // Defense-in-depth against pathological directory trees. With the
+    // symlink skip below, cycles are already prevented; this just caps
+    // cost for users with unusually deep real trees.
+    if (depth > 16) {
+      this.log("walkDir depth limit exceeded, skipping", { dirPath });
+      return;
+    }
+
     let dirEntries: fs.Dirent[];
     try {
       dirEntries = fs.readdirSync(dirPath, { withFileTypes: true });
@@ -446,15 +495,28 @@ export class FileSync {
     }
 
     for (const dirent of dirEntries) {
+      // Refuse to follow symlinks — both to prevent leaking arbitrary
+      // filesystem paths into the sync stream and to prevent recursion
+      // cycles from symlinks-to-ancestors. See FINDINGS.md M5.
+      if (dirent.isSymbolicLink()) continue;
+
       const fullPath = path.join(dirPath, dirent.name);
       const relpath = path.relative(baseDir, fullPath);
 
       if (this.shouldIgnore(relpath)) continue;
 
       if (dirent.isDirectory()) {
-        this.walkDir(fullPath, baseDir, entries, cache);
+        this.walkDir(fullPath, baseDir, entries, cache, depth + 1);
       } else if (dirent.isFile()) {
-        const stat = fs.statSync(fullPath);
+        // `lstatSync` so a swap-to-symlink race between readdir and stat
+        // doesn't slip through. Belt-and-braces with the dirent check.
+        let stat: fs.Stats;
+        try {
+          stat = fs.lstatSync(fullPath);
+        } catch {
+          continue;
+        }
+        if (stat.isSymbolicLink()) continue;
         entries.push(this.buildManifestEntry(fullPath, relpath, stat, cache));
       }
     }

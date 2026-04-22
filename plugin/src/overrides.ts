@@ -35,6 +35,20 @@ export function loadOverrides(): Record<string, unknown> | null {
 }
 
 /**
+ * Keys that could contribute to prototype-pollution attacks when present
+ * in an overrides object. `__proto__` directly assigns to the prototype
+ * chain; `constructor.prototype` and plain `prototype` are the classic
+ * escape hatches. Overrides live in the user's home directory so the
+ * threat model is "a malicious dotfiles repo clone", but the cost of
+ * filtering is one comparison per key. See FINDINGS.md M4.
+ */
+const FORBIDDEN_OVERRIDE_KEYS: ReadonlySet<string> = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+]);
+
+/**
  * Returns true if the value is a plain object (not array, null, Date, etc.)
  * suitable for recursive merging.
  */
@@ -66,6 +80,7 @@ export function applyOverrides(
   const result: Record<string, unknown> = { ...base };
 
   for (const key of Object.keys(overrides)) {
+    if (FORBIDDEN_OVERRIDE_KEYS.has(key)) continue;
     const overrideValue = overrides[key];
     if (overrideValue === undefined) continue;
 

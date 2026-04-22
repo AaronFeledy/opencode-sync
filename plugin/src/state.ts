@@ -5,8 +5,26 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { FileManifestEntry } from "@opencode-sync/shared";
+import type { FileManifestEntry, SyncKind } from "@opencode-sync/shared";
 import { atomicWriteFileSync } from "./util.js";
+import { logger } from "./logger.js";
+
+/**
+ * Threshold beyond which a single `(kind, id, server_seq)` envelope is
+ * considered "poison" — malformed, unknown kind on an older client, or
+ * persistently SQL-incompatible — and skipped past so subsequent pulls
+ * can proceed. Before H3, a single bad envelope blocked ALL subsequent
+ * pulls forever.
+ *
+ * At the default 15s sync interval, 10 retries ≈ 2.5 min of transient
+ * error tolerance — long enough for FK-ordering inversions and
+ * SQLITE_BUSY squirms to resolve, short enough that genuine poison
+ * stops blocking progress within a few minutes.
+ */
+export const PULL_POISON_THRESHOLD = 10;
+
+/** Cap on `poisonedEnvelopes` to bound `state.json` growth under attack. */
+const POISONED_ENVELOPES_MAX = 500;
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -68,6 +86,52 @@ export interface SyncState {
    * plugin tombstones things on the very first cycle).
    */
   pendingTombstones: Record<string, { firstSeenAt: number; knownTimeUpdated: number }>;
+  /**
+   * Pull-apply attempt counters keyed by `${kind}:${id}:${server_seq}`.
+   * Incremented each time `applyEnvelope` returns `"error"` (or throws)
+   * for an envelope with this exact triple. When a counter exceeds
+   * `PULL_POISON_THRESHOLD`, the envelope is skipped permanently —
+   * its server_seq is crossed, a warning is logged, and the key is
+   * moved to `poisonedEnvelopes` for operator audit. A successful
+   * apply (or skipped/conflict) removes the counter. See FINDINGS.md H3.
+   */
+  pullErrorCounts: Record<string, number>;
+  /**
+   * Envelopes that exceeded `PULL_POISON_THRESHOLD` and were skipped.
+   * Kept as a diagnostic breadcrumb — operator can inspect the server
+   * ledger for these `server_seq`s. FIFO-capped at
+   * `POISONED_ENVELOPES_MAX` to bound state.json growth under attack
+   * scenarios.
+   */
+  poisonedEnvelopes: Array<{
+    kind: SyncKind;
+    id: string;
+    server_seq: number;
+    skippedAt: number;
+    lastError?: string;
+  }>;
+  /**
+   * Secondary index: child rowKey -> parent session id. Used by
+   * `markExpectedDeletion` to cascade-expand a deleted session's
+   * rowKey into all of its children (messages, parts, todos,
+   * session_share), so the deletion-safety threshold doesn't halt on
+   * a routine "delete my biggest session" action.
+   *
+   * Without this index, only todos (prefix-scannable via
+   * `todo:<sessionId>:*`) and `session_share` (keyed directly by
+   * session id) could be cascade-expanded. Messages and parts are
+   * keyed by their own ids (`message:<msgid>`, `part:<partid>`), so
+   * they couldn't be discovered from a session delete alone — leaving
+   * them in `unexpectedCandidates` where they'd trip the 95%
+   * threshold on users whose session tree dominated knownRows.
+   *
+   * Populated in `rememberRows` by parsing `session_id` out of
+   * envelope data for `message`, `part`, `todo`, and `session_share`.
+   * Cleared in `forgetRows`. Persists across restarts. Entries for
+   * kinds with no parent (project, session, permission) are not
+   * stored. See FINDINGS.md M1.
+   */
+  rowParents: Record<string, string>;
 }
 
 /** JSON-serialisable representation of SyncState */
@@ -81,6 +145,15 @@ interface SyncStateJson {
   lastFileSyncTime: number;
   dbFingerprint?: { inode: number; mtime: number; size: number } | null;
   pendingTombstones?: Record<string, { firstSeenAt: number; knownTimeUpdated: number }>;
+  pullErrorCounts?: Record<string, number>;
+  poisonedEnvelopes?: Array<{
+    kind: string;
+    id: string;
+    server_seq: number;
+    skippedAt: number;
+    lastError?: string;
+  }>;
+  rowParents?: Record<string, string>;
 }
 
 /**
@@ -115,30 +188,83 @@ export class StateManager {
       lastFileSyncTime: 0,
       dbFingerprint: null,
       pendingTombstones: {},
+      pullErrorCounts: {},
+      poisonedEnvelopes: [],
+      rowParents: {},
     };
   }
 
-  /** Load state from disk, creating directory if needed. */
+  /**
+   * Load state from disk, creating directory if needed.
+   *
+   * On corruption (malformed JSON), the corrupt file is backed up to
+   * `${STATE_FILE}.corrupt-${timestamp}` and the in-memory state is
+   * left at constructor defaults. On filesystem errors (EACCES, EIO),
+   * the error is rethrown so the caller sees a loud failure rather
+   * than silently resetting to defaults. See FINDINGS.md M3.
+   */
   load(): void {
     if (!fs.existsSync(STATE_FILE)) return;
 
+    let raw: string;
     try {
-      const raw = fs.readFileSync(STATE_FILE, "utf-8");
-      const json = JSON.parse(raw) as Partial<SyncStateJson>;
-
-      this._state.lastPulledSeq = json.lastPulledSeq ?? 0;
-      this._state.lastPushedRowIds = new Set(json.lastPushedRowIds ?? []);
-      this._state.lastPushedRowTime = json.lastPushedRowTime ?? 0;
-      this._state.knownRows = this.parseKnownRows(json.knownRows);
-      this._state.knownFiles = this.parseKnownFiles(json.knownFiles);
-      this._state.lastFileSyncTime = json.lastFileSyncTime ?? 0;
-      this._state.dbFingerprint = this.parseDbFingerprint(json.dbFingerprint);
-      this._state.pendingTombstones = this.parsePendingTombstones(json.pendingTombstones);
-
-      // Preserve machineId from constructor — don't override with stale file
-    } catch {
-      // Corrupted state file — start fresh
+      raw = fs.readFileSync(STATE_FILE, "utf-8");
+    } catch (err) {
+      // fs-level failure is NOT "corrupt" — surface it so the operator
+      // sees a loud error rather than an opaque re-pull-from-zero.
+      logger.error("state.load: failed to read state file", {
+        path: STATE_FILE,
+        error: String(err),
+      });
+      throw err;
     }
+
+    let json: Partial<SyncStateJson>;
+    try {
+      json = JSON.parse(raw) as Partial<SyncStateJson>;
+    } catch (err) {
+      // Back up the corrupt file before the next save() clobbers it.
+      // `rename` is atomic on the same filesystem, so the original
+      // bytes are preserved even if the save-before-next-load races.
+      const backup = `${STATE_FILE}.corrupt-${Date.now()}`;
+      try {
+        fs.renameSync(STATE_FILE, backup);
+      } catch (backupErr) {
+        logger.error(
+          "state.load: corrupt state.json AND backup failed — resetting to defaults",
+          {
+            path: STATE_FILE,
+            parseError: String(err),
+            backupError: String(backupErr),
+          },
+        );
+        return;
+      }
+      logger.error(
+        "state.load: corrupt state.json — backed up and reset to defaults",
+        {
+          path: STATE_FILE,
+          backup,
+          bytes: raw.length,
+          error: String(err),
+        },
+      );
+      return;
+    }
+
+    this._state.lastPulledSeq = json.lastPulledSeq ?? 0;
+    this._state.lastPushedRowIds = new Set(json.lastPushedRowIds ?? []);
+    this._state.lastPushedRowTime = json.lastPushedRowTime ?? 0;
+    this._state.knownRows = this.parseKnownRows(json.knownRows);
+    this._state.knownFiles = this.parseKnownFiles(json.knownFiles);
+    this._state.lastFileSyncTime = json.lastFileSyncTime ?? 0;
+    this._state.dbFingerprint = this.parseDbFingerprint(json.dbFingerprint);
+    this._state.pendingTombstones = this.parsePendingTombstones(json.pendingTombstones);
+    this._state.pullErrorCounts = this.parsePullErrorCounts(json.pullErrorCounts);
+    this._state.poisonedEnvelopes = this.parsePoisonedEnvelopes(json.poisonedEnvelopes);
+    this._state.rowParents = this.parseRowParents(json.rowParents);
+
+    // Preserve machineId from constructor — don't override with stale file.
   }
 
   /** Persist state to disk atomically. */
@@ -155,6 +281,9 @@ export class StateManager {
       lastFileSyncTime: this._state.lastFileSyncTime,
       dbFingerprint: this._state.dbFingerprint,
       pendingTombstones: this._state.pendingTombstones,
+      pullErrorCounts: this._state.pullErrorCounts,
+      poisonedEnvelopes: this._state.poisonedEnvelopes,
+      rowParents: this._state.rowParents,
     };
 
     atomicWriteFileSync(STATE_FILE, JSON.stringify(json, null, 2));
@@ -162,11 +291,31 @@ export class StateManager {
 
   /**
    * Compute the `since` filter to use when scanning local tables for a
-   * `pushAll`. Returns `lastPushedRowTime - PUSH_CURSOR_MARGIN_MS`, clamped
-   * to >= 0. On a fresh state (cursor=0) returns 0, so the first push reads
-   * everything.
+   * `pushAll`. Normally returns `lastPushedRowTime - PUSH_CURSOR_MARGIN_MS`.
+   *
+   * M6: detect wall-clock backjumps and reset the cursor. If
+   * `Date.now()` has moved backward past our saved cursor by more than
+   * the margin (NTP step after suspend/resume, VM migration, BIOS
+   * battery failure, container clock drift), fresh local rows written
+   * with the post-jump `Date.now()` would have `time_updated <
+   * lastPushedRowTime - margin` and be permanently invisible to
+   * `iterateAllEnvelopes` until wall clock caught up — potentially
+   * hours. Detecting this here and resetting the cursor to the current
+   * wall clock ensures post-jump rows are picked up on the next push.
    */
   pushReadSince(): number {
+    const now = Date.now();
+    // If the wall clock is much earlier than our saved cursor, a
+    // backjump has happened. Reset so newly-written rows (which now
+    // carry smaller time_updated values) aren't filtered out.
+    if (now + PUSH_CURSOR_MARGIN_MS < this._state.lastPushedRowTime) {
+      logger.log("push cursor rewinding: wall clock moved backward past saved cursor", {
+        now,
+        lastPushedRowTime: this._state.lastPushedRowTime,
+      });
+      this._state.lastPushedRowTime = now;
+      this.maybeSave();
+    }
     return Math.max(0, this._state.lastPushedRowTime - PUSH_CURSOR_MARGIN_MS);
   }
 
@@ -244,13 +393,29 @@ export class StateManager {
     this.maybeSave();
   }
 
-  rememberRows(rows: Record<string, number>): void {
+  /**
+   * Record that a set of rows are known to the server. The `rows` map
+   * values can be either a plain `time_updated` number (legacy shape)
+   * or an object carrying the row's `time_updated` plus an optional
+   * `parent` session id for cascade-expansion via M1's rowParents
+   * index. Mixing shapes in one call is allowed.
+   */
+  rememberRows(rows: Record<string, number | { time_updated: number; parent?: string }>): void {
     let changed = false;
 
-    for (const [rowKey, timeUpdated] of Object.entries(rows)) {
-      if (this._state.knownRows[rowKey] === timeUpdated) continue;
-      this._state.knownRows[rowKey] = timeUpdated;
-      changed = true;
+    for (const [rowKey, entry] of Object.entries(rows)) {
+      const timeUpdated = typeof entry === "number" ? entry : entry.time_updated;
+      const parent = typeof entry === "number" ? undefined : entry.parent;
+
+      if (this._state.knownRows[rowKey] !== timeUpdated) {
+        this._state.knownRows[rowKey] = timeUpdated;
+        changed = true;
+      }
+
+      if (parent !== undefined && this._state.rowParents[rowKey] !== parent) {
+        this._state.rowParents[rowKey] = parent;
+        changed = true;
+      }
     }
 
     if (changed) this.maybeSave();
@@ -260,9 +425,14 @@ export class StateManager {
     let changed = false;
 
     for (const rowKey of rowKeys) {
-      if (!(rowKey in this._state.knownRows)) continue;
-      delete this._state.knownRows[rowKey];
-      changed = true;
+      if (rowKey in this._state.knownRows) {
+        delete this._state.knownRows[rowKey];
+        changed = true;
+      }
+      if (rowKey in this._state.rowParents) {
+        delete this._state.rowParents[rowKey];
+        changed = true;
+      }
     }
 
     if (changed) this.maybeSave();
@@ -333,6 +503,53 @@ export class StateManager {
     this.maybeSave();
   }
 
+  /**
+   * Increment the per-envelope error counter and return the new value.
+   * Keyed by `${kind}:${id}:${server_seq}`. See FINDINGS.md H3.
+   */
+  incrementPullErrorCount(envelopeKey: string): number {
+    const next = (this._state.pullErrorCounts[envelopeKey] ?? 0) + 1;
+    this._state.pullErrorCounts[envelopeKey] = next;
+    this.maybeSave();
+    return next;
+  }
+
+  /**
+   * Drop the counter for an envelope — called on successful apply OR
+   * when we decide to poison-skip (the durable record moves to
+   * `poisonedEnvelopes`).
+   */
+  clearPullErrorCount(envelopeKey: string): void {
+    if (!(envelopeKey in this._state.pullErrorCounts)) return;
+    delete this._state.pullErrorCounts[envelopeKey];
+    this.maybeSave();
+  }
+
+  /**
+   * Record an envelope as permanently skipped. FIFO-capped at
+   * `POISONED_ENVELOPES_MAX` to bound state.json growth under attack.
+   */
+  recordPoisonedEnvelope(entry: {
+    kind: SyncKind;
+    id: string;
+    server_seq: number;
+    lastError?: string;
+  }): void {
+    this._state.poisonedEnvelopes.push({
+      kind: entry.kind,
+      id: entry.id,
+      server_seq: entry.server_seq,
+      skippedAt: Date.now(),
+      lastError: entry.lastError,
+    });
+    if (this._state.poisonedEnvelopes.length > POISONED_ENVELOPES_MAX) {
+      this._state.poisonedEnvelopes = this._state.poisonedEnvelopes.slice(
+        this._state.poisonedEnvelopes.length - POISONED_ENVELOPES_MAX,
+      );
+    }
+    this.maybeSave();
+  }
+
   replaceKnownFiles(entries: FileManifestEntry[]): void {
     this._state.knownFiles = Object.fromEntries(
       entries.map((entry) => [
@@ -386,6 +603,62 @@ export class StateManager {
       if (typeof firstSeenAt !== "number" || !Number.isFinite(firstSeenAt)) continue;
       if (typeof knownTimeUpdated !== "number" || !Number.isFinite(knownTimeUpdated)) continue;
       out[key] = { firstSeenAt, knownTimeUpdated };
+    }
+    return out;
+  }
+
+  private parsePullErrorCounts(value: unknown): Record<string, number> {
+    if (!value || typeof value !== "object") return {};
+    const out: Record<string, number> = {};
+    for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+      if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
+        out[key] = raw;
+      }
+    }
+    return out;
+  }
+
+  private parsePoisonedEnvelopes(
+    value: unknown,
+  ): Array<{ kind: SyncKind; id: string; server_seq: number; skippedAt: number; lastError?: string }> {
+    if (!Array.isArray(value)) return [];
+    const out: Array<{
+      kind: SyncKind;
+      id: string;
+      server_seq: number;
+      skippedAt: number;
+      lastError?: string;
+    }> = [];
+    for (const raw of value) {
+      if (!raw || typeof raw !== "object") continue;
+      const v = raw as Record<string, unknown>;
+      const kind = v["kind"];
+      const id = v["id"];
+      const server_seq = v["server_seq"];
+      const skippedAt = v["skippedAt"];
+      const lastError = v["lastError"];
+      if (typeof kind !== "string") continue;
+      if (typeof id !== "string") continue;
+      if (typeof server_seq !== "number" || !Number.isFinite(server_seq)) continue;
+      if (typeof skippedAt !== "number" || !Number.isFinite(skippedAt)) continue;
+      out.push({
+        kind: kind as SyncKind,
+        id,
+        server_seq,
+        skippedAt,
+        ...(typeof lastError === "string" ? { lastError } : {}),
+      });
+    }
+    return out;
+  }
+
+  private parseRowParents(value: unknown): Record<string, string> {
+    if (!value || typeof value !== "object") return {};
+    const out: Record<string, string> = {};
+    for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+      if (typeof raw === "string" && raw.length > 0) {
+        out[key] = raw;
+      }
     }
     return out;
   }

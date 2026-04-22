@@ -3,6 +3,7 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as crypto from "node:crypto";
 import { logger } from "./logger.js";
 
 /**
@@ -51,7 +52,10 @@ export function sha256Hex(data: string | Buffer | Uint8Array): string {
 export function atomicWriteFileSync(filePath: string, data: string | Buffer): void {
   const dir = path.dirname(filePath);
   fs.mkdirSync(dir, { recursive: true });
-  const tmp = path.join(dir, `.tmp-${path.basename(filePath)}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  // Use crypto.randomUUID() rather than Math.random so concurrent writers
+  // (e.g. the sync and logger writing state simultaneously) can't collide
+  // on a temp filename. See FINDINGS.md L2.
+  const tmp = path.join(dir, `.tmp-${path.basename(filePath)}-${crypto.randomUUID()}`);
   try {
     fs.writeFileSync(tmp, data);
     fs.renameSync(tmp, filePath);
@@ -66,7 +70,7 @@ export function atomicWriteFileSync(filePath: string, data: string | Buffer): vo
  */
 export async function atomicWriteFile(filePath: string, data: string | Buffer): Promise<void> {
   const dir = path.dirname(filePath);
-  const tmp = path.join(dir, `.tmp-${path.basename(filePath)}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  const tmp = path.join(dir, `.tmp-${path.basename(filePath)}-${crypto.randomUUID()}`);
   try {
     await fs.promises.writeFile(tmp, data);
     await fs.promises.rename(tmp, filePath);

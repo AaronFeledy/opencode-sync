@@ -94,6 +94,26 @@ export class DbWriter {
       return "error";
     }
 
+    // Re-validate `time_updated` — the server also validates on push
+    // (routes/sync.ts), but an older/buggy/malicious server, direct
+    // ledger corruption, or a third-party client bypassing the server
+    // API could still emit pathological values. `0` and negatives
+    // break the LWW comparison semantics: `knownTimeUpdated = 0`
+    // compares equal to any freshly-zeroed local row, silently
+    // treating the envelope as skipped even when content differs; a
+    // negative `time_updated` on a tombstone would stamp an impossible
+    // pushed-rowtime on downstream peers. See FINDINGS.md M8.
+    if (
+      typeof envelope.time_updated !== "number" ||
+      !Number.isFinite(envelope.time_updated) ||
+      envelope.time_updated <= 0
+    ) {
+      logger.error(
+        `invalid envelope time_updated: ${envelope.time_updated} (kind=${kind}, id=${envelope.id})`,
+      );
+      return "error";
+    }
+
     if (deleted) {
       return this.deleteRow(kind, envelope);
     }
@@ -145,9 +165,34 @@ export class DbWriter {
 
   private upsertRow(kind: SyncKind, data: Record<string, SQLQueryBindings>): boolean {
     const columns = TABLE_COLUMNS[kind]!;
+    const pkCols = PK_COLUMNS[kind]!;
+    const pkSet = new Set(pkCols);
+    const nonPkCols = columns.filter((c) => !pkSet.has(c));
+
+    // True UPSERT — NOT `INSERT OR REPLACE`. SQLite's REPLACE conflict
+    // resolution DELETEs the existing row before inserting, which with
+    // `PRAGMA foreign_keys = ON` cascades to every child row (messages,
+    // parts, todos, session_share for session; sessions/permissions for
+    // project). A routine cross-peer session title bump or
+    // time_compacting tick would silently wipe the entire conversation.
+    //
+    // `ON CONFLICT(<pk>) DO UPDATE SET ...` performs an in-place UPDATE
+    // on conflict, leaving child rows intact. Composite PKs (todo's
+    // (session_id, position)) are handled by listing all PK columns in
+    // the conflict target. If a table has only PK columns and no
+    // non-PK columns, there's nothing to update on conflict — degrade
+    // to DO NOTHING so the INSERT becomes a no-op rather than a parse
+    // error on an empty SET list. (No table in SYNC_KINDS currently
+    // falls into that case, but the guard is free.)
     const placeholders = columns.map(() => "?").join(", ");
     const colList = columns.join(", ");
-    const sql = `INSERT OR REPLACE INTO ${kind} (${colList}) VALUES (${placeholders})`;
+    const pkList = pkCols.join(", ");
+    const setList = nonPkCols.map((c) => `${c} = excluded.${c}`).join(", ");
+    const onConflict =
+      nonPkCols.length === 0
+        ? `ON CONFLICT(${pkList}) DO NOTHING`
+        : `ON CONFLICT(${pkList}) DO UPDATE SET ${setList}`;
+    const sql = `INSERT INTO ${kind} (${colList}) VALUES (${placeholders}) ${onConflict}`;
 
     const params: SQLQueryBindings[] = columns.map((col) => {
       const val = data[col];

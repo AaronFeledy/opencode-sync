@@ -7,7 +7,7 @@ import type { HeadEntry, PullResponse, SyncEnvelope, SyncKind } from "@opencode-
 import { EndpointMissingError, type SyncClient } from "./client.js";
 import { DbReader } from "./db-read.js";
 import { DbWriter } from "./db-write.js";
-import { SessionSync } from "./sessions.js";
+import { SessionSync, parseRowStateKey } from "./sessions.js";
 import { StateManager } from "./state.js";
 import { isSyncHalted, clearHaltMarker, readHaltDetails, HALT_MARKER_PATH } from "./halt.js";
 
@@ -362,19 +362,26 @@ test("pushAll fast-paths tombstones when the row is marked as an expected deleti
   db.close();
   sync.markExpectedDeletion("session:ses_1");
 
-  // Cycle 2: session+todo go through immediately; message+part still
-  // need confirmation (they don't share a session-id prefix in their
-  // rowKey, so the cascade auto-expansion can't catch them).
+  // Cycle 2: every cascade child of the deleted session should fast-
+  // path through the tombstone pipeline. After M1 added the rowParents
+  // secondary index, messages/parts/todos are all discovered via their
+  // parent session and flow through on the same cycle as the session
+  // itself (session_share isn't seeded by seedSessionTree so it's not
+  // in this list). Before M1, messages and parts were stuck in
+  // pendingTombstones awaiting two-cycle confirmation.
   client.pushes = [];
   await sync.pushAll();
   const fastPath = (client.pushes[0] ?? []).map((e) => `${e.kind}:${e.id}`).sort();
-  expect(fastPath).toEqual(["session:ses_1", "todo:ses_1:0"]);
-
-  // message and part are still pending confirmation.
-  expect(Object.keys(stateManager.state.pendingTombstones).sort()).toEqual([
+  expect(fastPath).toEqual([
     "message:msg_1",
     "part:part_1",
+    "session:ses_1",
+    "todo:ses_1:0",
   ]);
+
+  // With full cascade-expansion there should be NO pending entries
+  // left for this session's descendants.
+  expect(Object.keys(stateManager.state.pendingTombstones)).toEqual([]);
 
   reader.close();
   writer.close();
@@ -549,12 +556,20 @@ test("threshold is permissive (95%) when at least one expected deletion is prese
 
   await sync.pushAll();
 
-  // PERMISSIVE branch fired → no halt, candidates flow through (session
-  // is expected → fast-path tombstone; msg/part are unexpected → pending).
+  // After M1 (rowParents cascade): every descendant of ses_a is marked
+  // expected at deletion time, so there are zero unexpectedCandidates
+  // from ses_a and the permissive-branch check never even needs to
+  // fire. No halt, no pending entries for ses_a children, and all
+  // cascade rows fast-path straight to tombstones.
   expect(isSyncHalted()).toBe(false);
   expect(sync.isHalted()).toBe(false);
-  // Pending buffer holds the cascade msg/part (they didn't fast-path).
-  expect(Object.keys(stateManager.state.pendingTombstones).length).toBeGreaterThan(50);
+  // With cascade expansion working, the pending buffer is empty for
+  // ses_a's descendants — they all fast-path.
+  for (const k of Object.keys(stateManager.state.pendingTombstones)) {
+    // If anything landed in pending, it must NOT be from ses_a.
+    const parent = stateManager.state.rowParents[k];
+    expect(parent).not.toBe("ses_a");
+  }
 
   reader.close();
   writer.close();
@@ -748,23 +763,22 @@ test("server cross-check defers tombstones on transient network failure", async 
 
   await sync.pushAll();
 
+  // Delete a message directly without marking expected — this creates
+  // a genuine unexpectedCandidate that exercises the getHeads-failure
+  // defer path. (After M1, deleting a whole session would cascade
+  // every descendant into expectedDeletions via rowParents, leaving
+  // nothing unexpected to defer.)
   const db = new Database(dbPath);
   db.exec("PRAGMA foreign_keys = ON");
-  db.run("DELETE FROM session WHERE id = ?", ["ses_1"]);
+  db.run("DELETE FROM message WHERE id = ?", ["msg_1"]);
   db.close();
-
-  // Mark only the session as expected (cascade rows are unexpected).
-  sync.markExpectedDeletion("session:ses_1");
 
   client.pushes = [];
   await sync.pushAll();
-  // Expected tombstones (session + todo via cascade) flowed.
-  // Unexpected ones (message + part) deferred.
+  // The unexpected message tombstone was deferred by the getHeads
+  // failure — NOT emitted this cycle.
   const emitted = client.pushes.flat().map((e) => `${e.kind}:${e.id}`).sort();
-  expect(emitted).toContain("session:ses_1");
-  expect(emitted).toContain("todo:ses_1:0");
   expect(emitted).not.toContain("message:msg_1");
-  expect(emitted).not.toContain("part:part_1");
 
   reader.close();
   writer.close();
@@ -1833,6 +1847,433 @@ test("getHeads still throws EndpointMissingError on a 404 from /sync/heads", asy
   }
 });
 
+test("H2: getHeads failure clears pendingTombstones to prevent instant-tombstone on long recovery", async () => {
+  // Before the fix, a multi-minute network outage would park pending
+  // entries with a stale firstSeenAt; the first recovered cycle saw
+  // `now - firstSeenAt >> 30s` and emitted tombstones without any
+  // post-recovery confirmation. See FINDINGS.md H2.
+  const dbPath = createDbPath();
+  initDb(dbPath);
+  seedSessionTree(dbPath);
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  // Cycle 1: establish knownRows.
+  await sync.pushAll();
+
+  // Delete a row (not expected) to create an unexpected candidate.
+  const db = new Database(dbPath);
+  db.exec("PRAGMA foreign_keys = ON");
+  db.run("DELETE FROM message WHERE id = ?", ["msg_1"]);
+  db.close();
+
+  // Cycle 2: first observation while getHeads is WORKING → pending
+  // entry is created.
+  client.pushes = [];
+  await sync.pushAll();
+  expect(stateManager.state.pendingTombstones["message:msg_1"]).toBeDefined();
+
+  // Cycle 3: getHeads now fails (simulate a network outage starting).
+  // Pending entry must be cleared so a long outage doesn't drift its
+  // firstSeenAt past the confirmation window.
+  client.headsThrowError = true;
+  client.pushes = [];
+  await sync.pushAll();
+  expect(stateManager.state.pendingTombstones["message:msg_1"]).toBeUndefined();
+  // And we did NOT emit a tombstone for the unexpected candidate.
+  expect(
+    client.pushes.flat().find((e) => e.deleted && e.id === "msg_1"),
+  ).toBeUndefined();
+
+  // Cycle 4: network recovers. Row is still gone. First recovered
+  // cycle should create a FRESH pending entry, not instant-tombstone.
+  client.headsThrowError = false;
+  client.pushes = [];
+  await sync.pushAll();
+  expect(stateManager.state.pendingTombstones["message:msg_1"]).toBeDefined();
+  expect(
+    client.pushes.flat().find((e) => e.deleted && e.id === "msg_1"),
+  ).toBeUndefined();
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("H3: poison envelope is skipped past after PULL_POISON_THRESHOLD retries", async () => {
+  // Before the fix, a permanently-bad envelope (unknown kind, malformed
+  // data, FK-ordering inversion that never resolves) blocked all
+  // subsequent pulls forever because the pull loop broke on the first
+  // error without advancing the cursor. Now the envelope's error
+  // counter persists across cycles; once it exceeds the threshold, the
+  // envelope is recorded in poisonedEnvelopes, the cursor advances, and
+  // subsequent pulls proceed. See FINDINGS.md H3.
+  const dbPath = createDbPath();
+  initDb(dbPath);
+
+  const originalError = console.error;
+  console.error = () => {};
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  // A single envelope that will always fail to apply (unknown kind).
+  const poisonEnvelope = {
+    kind: "workspace" as SyncKind, // not in SYNC_KINDS — applyEnvelope returns "error"
+    id: "ws_1",
+    machine_id: "laptop",
+    time_updated: 9_000,
+    server_seq: 10,
+    deleted: false,
+    data: {},
+  };
+
+  // Simulate 10 pull cycles. Each cycle re-queues the same poison page.
+  // Before the 10th cycle, the cursor stays at 0 and poisonedEnvelopes
+  // is empty. On the 10th (threshold) the envelope is skipped past.
+  for (let i = 0; i < 10; i++) {
+    client.pullResponses.push({
+      server_seq: 10,
+      more: false,
+      envelopes: [{ ...poisonEnvelope } as unknown as SyncEnvelope],
+    });
+  }
+
+  // Cycles 1-9: counter increments, cursor does NOT advance.
+  for (let i = 0; i < 9; i++) {
+    await sync.pull();
+    expect(stateManager.state.lastPulledSeq).toBe(0);
+    expect(stateManager.state.poisonedEnvelopes.length).toBe(0);
+    expect(stateManager.state.pullErrorCounts["workspace:ws_1:10"]).toBe(i + 1);
+  }
+
+  // Cycle 10: threshold hit. Envelope is recorded as poisoned and
+  // skipped past; the cursor advances so subsequent pulls work.
+  await sync.pull();
+  expect(stateManager.state.poisonedEnvelopes.length).toBe(1);
+  expect(stateManager.state.poisonedEnvelopes[0]?.kind as string).toBe("workspace");
+  expect(stateManager.state.poisonedEnvelopes[0]?.id).toBe("ws_1");
+  expect(stateManager.state.poisonedEnvelopes[0]?.server_seq).toBe(10);
+  expect(stateManager.state.pullErrorCounts["workspace:ws_1:10"]).toBeUndefined();
+  expect(stateManager.state.lastPulledSeq).toBe(10);
+
+  console.error = originalError;
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("H3: already-poisoned envelope is skipped on re-pull, not re-counted (bugbot regression)", async () => {
+  // Regression for the cursor-blocked re-poison bug bugbot caught:
+  //
+  // Scenario: a batch `[env_A_transient, env_B_poisonable]` where env_A
+  // is a transient error (FK ordering that persists) and env_B reaches
+  // threshold while env_A is still failing. When env_B hits threshold
+  // on cycle N, `firstErrorSeq` has already been set to env_A.seq. The
+  // poison-skip path tries `if (firstErrorSeq === null) lastGoodSeq =
+  // env_B.seq` — but firstErrorSeq is NOT null, so the cursor does
+  // NOT advance past env_B.
+  //
+  // Next pull re-delivers [env_A, env_B] at the same cursor. Without
+  // bugbot's fix, applyEnvelope is called on env_B, the counter
+  // increments from 1 (was cleared on poison), and env_B needs 10 MORE
+  // cycles to re-poison — producing a duplicate poisonedEnvelopes entry.
+  // With bugbot's fix, env_B is detected as already-poisoned at the
+  // top of the loop and skipped cleanly.
+  const dbPath = createDbPath();
+  initDb(dbPath);
+
+  const originalError = console.error;
+  console.error = () => {};
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  // env_A: FK violation (references a project that doesn't exist) →
+  // applyEnvelope returns "error" persistently.
+  const envA: SyncEnvelope = {
+    kind: "session",
+    id: "ses_orphan",
+    machine_id: "laptop",
+    time_updated: 5_000,
+    server_seq: 5,
+    deleted: false,
+    data: {
+      id: "ses_orphan",
+      project_id: "proj_missing",
+      parent_id: null,
+      slug: "o",
+      directory: "/tmp",
+      title: "O",
+      version: "1",
+      share_url: null,
+      summary_additions: null,
+      summary_deletions: null,
+      summary_files: null,
+      summary_diffs: null,
+      revert: null,
+      permission: null,
+      time_created: 1,
+      time_updated: 5_000,
+      time_compacting: null,
+      time_archived: null,
+      workspace_id: null,
+    },
+  };
+  // env_B: poison (unknown kind).
+  const envB = {
+    kind: "workspace" as SyncKind,
+    id: "ws_1",
+    machine_id: "laptop",
+    time_updated: 9_000,
+    server_seq: 10,
+    deleted: false,
+    data: {},
+  };
+
+  // Cycles 1-9: only env_B in the batch. It fails every cycle → counter=9.
+  for (let i = 0; i < 9; i++) {
+    client.pullResponses.push({
+      server_seq: 10,
+      more: false,
+      envelopes: [{ ...envB } as unknown as SyncEnvelope],
+    });
+    await sync.pull();
+  }
+  expect(stateManager.state.pullErrorCounts["workspace:ws_1:10"]).toBe(9);
+  expect(stateManager.state.poisonedEnvelopes.length).toBe(0);
+
+  // Cycle 10: env_A appears BEFORE env_B in the batch. env_A fails
+  // first (transient, counter=1, firstErrorSeq set). env_B then fails
+  // and reaches threshold (counter=10 → POISON). At poison time,
+  // firstErrorSeq is already set to env_A.seq, so the cursor CANNOT
+  // advance past env_B.
+  client.pullResponses.push({
+    server_seq: 10,
+    more: false,
+    envelopes: [envA, { ...envB } as unknown as SyncEnvelope],
+  });
+  await sync.pull();
+
+  // env_B poisoned exactly once.
+  expect(stateManager.state.poisonedEnvelopes.length).toBe(1);
+  expect(stateManager.state.poisonedEnvelopes[0]?.id).toBe("ws_1");
+  const firstPoisonedAt = stateManager.state.poisonedEnvelopes[0]?.skippedAt;
+  // env_B counter cleared at poison time.
+  expect(stateManager.state.pullErrorCounts["workspace:ws_1:10"]).toBeUndefined();
+  // env_A counter = 1 (it's transient).
+  expect(stateManager.state.pullErrorCounts["session:ses_orphan:5"]).toBe(1);
+  // Cursor stayed at 0 (couldn't advance past env_B because env_A was
+  // the first error in the batch).
+  expect(stateManager.state.lastPulledSeq).toBe(0);
+
+  // Cycle 11: re-deliver both envelopes. env_A still fails (transient),
+  // env_B is already poisoned → MUST be skipped at the top of the loop
+  // WITHOUT re-invoking applyEnvelope and WITHOUT re-incrementing the
+  // counter. Bugbot's fix is what makes this pass.
+  client.pullResponses.push({
+    server_seq: 10,
+    more: false,
+    envelopes: [envA, { ...envB } as unknown as SyncEnvelope],
+  });
+  await sync.pull();
+
+  // No duplicate poisonedEnvelopes entry for env_B.
+  expect(stateManager.state.poisonedEnvelopes.length).toBe(1);
+  expect(stateManager.state.poisonedEnvelopes[0]?.skippedAt).toBe(firstPoisonedAt);
+  // env_B counter is NOT re-incremented (stays undefined, not 1).
+  expect(stateManager.state.pullErrorCounts["workspace:ws_1:10"]).toBeUndefined();
+  // env_A counter continued to grow (2 now).
+  expect(stateManager.state.pullErrorCounts["session:ses_orphan:5"]).toBe(2);
+
+  console.error = originalError;
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("H3: transient error clears counter on successful retry", async () => {
+  // A truly transient error (FK-ordering inversion that resolves when
+  // the parent arrives) should NOT accumulate toward the poison
+  // threshold. On successful apply, the counter is cleared.
+  const dbPath = createDbPath();
+  initDb(dbPath);
+
+  const originalError = console.error;
+  console.error = () => {};
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  // Cycle 1: envelope references a non-existent parent project → FK fails.
+  const sessionEnv = {
+    kind: "session" as SyncKind,
+    id: "ses_new",
+    machine_id: "laptop",
+    time_updated: 9_000,
+    server_seq: 5,
+    deleted: false,
+    data: {
+      id: "ses_new",
+      project_id: "proj_not_yet_synced",
+      parent_id: null,
+      slug: "s",
+      directory: "/tmp",
+      title: "New",
+      version: "1",
+      share_url: null,
+      summary_additions: null,
+      summary_deletions: null,
+      summary_files: null,
+      summary_diffs: null,
+      revert: null,
+      permission: null,
+      time_created: 1,
+      time_updated: 9_000,
+      time_compacting: null,
+      time_archived: null,
+      workspace_id: null,
+    },
+  };
+  client.pullResponses.push({ server_seq: 5, more: false, envelopes: [sessionEnv] });
+  await sync.pull();
+  expect(stateManager.state.pullErrorCounts["session:ses_new:5"]).toBe(1);
+  expect(stateManager.state.lastPulledSeq).toBe(0);
+
+  // Cycle 2: parent project arrives first in a separate pull, then session.
+  // After the project lands, a retry of the session succeeds.
+  {
+    const db = new Database(dbPath);
+    db.exec("PRAGMA foreign_keys = ON");
+    db.run(
+      `INSERT INTO project (id, worktree, vcs, name, icon_url, icon_color, time_created, time_updated, time_initialized, sandboxes, commands)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ["proj_not_yet_synced", "/tmp/p", "git", "P", null, null, 1, 1, 1, "[]", null],
+    );
+    db.close();
+  }
+  client.pullResponses.push({ server_seq: 5, more: false, envelopes: [sessionEnv] });
+  await sync.pull();
+  // Counter should be cleared, cursor advanced, no poison recorded.
+  expect(stateManager.state.pullErrorCounts["session:ses_new:5"]).toBeUndefined();
+  expect(stateManager.state.poisonedEnvelopes.length).toBe(0);
+  expect(stateManager.state.lastPulledSeq).toBe(5);
+
+  console.error = originalError;
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("M8: applyEnvelope rejects time_updated = 0", async () => {
+  // `time_updated = 0` poisons LWW comparisons (compares equal to any
+  // zero-stamped local row → skipped branch silently ignores content
+  // differences). Plugin rejects stricter than server. See FINDINGS.md M8.
+  const dbPath = createDbPath();
+  initDb(dbPath);
+
+  const originalError = console.error;
+  console.error = () => {};
+
+  const writer = new DbWriter(dbPath);
+  const result = writer.applyEnvelope({
+    kind: "session",
+    id: "ses_bad",
+    machine_id: "laptop",
+    time_updated: 0,
+    server_seq: 1,
+    deleted: false,
+    data: {
+      id: "ses_bad",
+      project_id: "proj_x",
+      parent_id: null,
+      slug: "s",
+      directory: "/tmp",
+      title: "Bad",
+      version: "1",
+      share_url: null,
+      summary_additions: null,
+      summary_deletions: null,
+      summary_files: null,
+      summary_diffs: null,
+      revert: null,
+      permission: null,
+      time_created: 1,
+      time_updated: 0,
+      time_compacting: null,
+      time_archived: null,
+      workspace_id: null,
+    },
+  });
+  expect(result).toBe("error");
+  writer.close();
+  console.error = originalError;
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("M8: applyEnvelope rejects negative time_updated", async () => {
+  const dbPath = createDbPath();
+  initDb(dbPath);
+  const originalError = console.error;
+  console.error = () => {};
+
+  const writer = new DbWriter(dbPath);
+  const result = writer.applyEnvelope({
+    kind: "session",
+    id: "ses_bad",
+    machine_id: "laptop",
+    time_updated: -1,
+    server_seq: 1,
+    deleted: false,
+    data: null,
+  });
+  expect(result).toBe("error");
+  writer.close();
+  console.error = originalError;
+  fs.rmSync(dbPath, { force: true });
+});
+
 test("non-getHeads 404s surface as HttpError, not EndpointMissingError", async () => {
   // Regression: previously any 404 anywhere (e.g. a missing blob)
   // would surface as `EndpointMissingError`, which mis-implies
@@ -1860,4 +2301,172 @@ test("non-getHeads 404s surface as HttpError, not EndpointMissingError", async (
   } finally {
     server.stop(true);
   }
+});
+
+// ── M7: parseRowStateKey bounds ──
+
+test("M7: parseRowStateKey rejects an empty kind prefix", () => {
+  expect(parseRowStateKey(":foo")).toBeNull();
+});
+
+test("M7: parseRowStateKey rejects a rowKey with no separator", () => {
+  expect(parseRowStateKey("foo")).toBeNull();
+});
+
+test("M7: parseRowStateKey rejects an empty id", () => {
+  expect(parseRowStateKey("session:")).toBeNull();
+});
+
+test("M7: parseRowStateKey rejects an unknown kind not in SYNC_KINDS", () => {
+  expect(parseRowStateKey("workspace:x")).toBeNull();
+  expect(parseRowStateKey("nonsense:y")).toBeNull();
+});
+
+test("M7: parseRowStateKey accepts valid kind+id (including composite todo)", () => {
+  expect(parseRowStateKey("session:ses_1")).toEqual({ kind: "session", id: "ses_1" });
+  expect(parseRowStateKey("todo:ses_1:0")).toEqual({ kind: "todo", id: "ses_1:0" });
+});
+
+// ── M1: rowParents secondary index enables cascade-expansion ──
+
+test("M1: rowParents is populated for message/part/todo/session_share on push", async () => {
+  const dbPath = createDbPath();
+  initDb(dbPath);
+  seedSessionTree(dbPath);
+
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    new MockClient() as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  await sync.pushAll();
+
+  // message, part, todo should all point at ses_1 in rowParents.
+  expect(stateManager.state.rowParents["message:msg_1"]).toBe("ses_1");
+  expect(stateManager.state.rowParents["part:part_1"]).toBe("ses_1");
+  expect(stateManager.state.rowParents["todo:ses_1:0"]).toBe("ses_1");
+
+  // session / project should NOT have parent entries (they're roots).
+  expect(stateManager.state.rowParents["session:ses_1"]).toBeUndefined();
+  expect(stateManager.state.rowParents["project:proj_1"]).toBeUndefined();
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("M1: session deletion of a large session does not halt (cascade marked expected)", async () => {
+  // The motivating scenario: a user with one session dominating
+  // knownRows deletes it. 100+ messages+parts cascade via FK. Before
+  // M1, only session/todo/share were auto-expanded as expected →
+  // msgs+parts landed in unexpectedCandidates → 95% threshold trips →
+  // HALT on a routine user action.
+  //
+  // After M1, rowParents maps each child to its session at remember-
+  // time, so markExpectedDeletion walks the index and marks them all
+  // expected. No halt, no pending entries for the cascade.
+  const dbPath = createDbPath();
+  initDb(dbPath);
+
+  const seed = new Database(dbPath);
+  seed.exec("PRAGMA foreign_keys = ON");
+  seed.run(
+    `INSERT INTO project (id, worktree, vcs, name, icon_url, icon_color, time_created, time_updated, time_initialized, sandboxes, commands)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ["proj_m1", "/tmp/m1", "git", "M1", null, null, 1, 1, 1, "[]", null],
+  );
+  seed.run(
+    `INSERT INTO session (id, project_id, parent_id, slug, directory, title, version, share_url, summary_additions, summary_deletions, summary_files, summary_diffs, revert, permission, time_created, time_updated, time_compacting, time_archived, workspace_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ["ses_big", "proj_m1", null, "big", "/tmp/m1", "Big", "1", null, null, null, null, null, null, null, 1, 1_000, null, null, null],
+  );
+  for (let i = 0; i < 80; i++) {
+    seed.run(
+      "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
+      [`bm_${i}`, "ses_big", 1, 1_000, '{}'],
+    );
+    seed.run(
+      "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)",
+      [`bp_${i}`, `bm_${i}`, "ses_big", 1, 1_000, '{}'],
+    );
+  }
+  seed.close();
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  // Cycle 1: populate knownRows and rowParents.
+  await sync.pushAll();
+  const knownBefore = Object.keys(stateManager.state.knownRows).length;
+  expect(knownBefore).toBeGreaterThan(TOMBSTONE_MIN_KNOWN_FOR_TEST);
+
+  // Delete the big session — FK cascades to all 160 children.
+  const db = new Database(dbPath);
+  db.exec("PRAGMA foreign_keys = ON");
+  db.run("DELETE FROM session WHERE id = ?", ["ses_big"]);
+  db.close();
+
+  sync.markExpectedDeletion("session:ses_big");
+
+  client.pushes = [];
+  await sync.pushAll();
+
+  // No halt — this is the whole point of M1.
+  expect(isSyncHalted()).toBe(false);
+  expect(sync.isHalted()).toBe(false);
+
+  // All descendants fast-pathed to tombstones.
+  const emitted = client.pushes.flat().filter((e) => e.deleted).map((e) => `${e.kind}:${e.id}`).sort();
+  expect(emitted).toContain("session:ses_big");
+  expect(emitted.filter((k) => k.startsWith("message:")).length).toBe(80);
+  expect(emitted.filter((k) => k.startsWith("part:")).length).toBe(80);
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("M1: rowParents is forgotten when the row is forgotten", async () => {
+  const dbPath = createDbPath();
+  initDb(dbPath);
+  seedSessionTree(dbPath);
+
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    new MockClient() as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  await sync.pushAll();
+  expect(stateManager.state.rowParents["message:msg_1"]).toBe("ses_1");
+
+  stateManager.forgetRows(["message:msg_1"]);
+  expect(stateManager.state.rowParents["message:msg_1"]).toBeUndefined();
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
 });

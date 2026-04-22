@@ -3,7 +3,7 @@
  */
 
 import { Database } from "bun:sqlite";
-import { mkdirSync, existsSync } from "node:fs";
+import { mkdirSync, existsSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import type { SyncEnvelope, SyncKind, FileManifestEntry } from "@opencode-sync/shared";
 import type { Logger } from "./log.js";
@@ -61,6 +61,8 @@ export class LedgerDB {
   private stmtGetManifest;
   private stmtGetManifestEntry;
   private stmtUpsertManifest;
+  private stmtCountLiveRefsBySha;
+  private stmtClearTombstoneSha;
 
   // Batch transaction wrapper — see upsertBatch().
   private txUpsertBatch: (
@@ -142,6 +144,16 @@ export class LedgerDB {
       `INSERT INTO file_manifest (relpath, sha256, size, mtime, machine_id, deleted)
        VALUES (?, ?, ?, ?, ?, ?)
        ON CONFLICT(relpath) DO UPDATE SET sha256 = excluded.sha256, size = excluded.size, mtime = excluded.mtime, machine_id = excluded.machine_id, deleted = excluded.deleted`,
+    );
+
+    // H5: ref-counted blob GC. On every manifest upsert, count how many
+    // live (deleted=0) rows still reference the previous sha; if the
+    // count drops to zero, the blob is orphaned and we unlink it.
+    this.stmtCountLiveRefsBySha = this.db.prepare<{ n: number }, [string]>(
+      "SELECT COUNT(*) AS n FROM file_manifest WHERE sha256 = ? AND deleted = 0",
+    );
+    this.stmtClearTombstoneSha = this.db.prepare(
+      "UPDATE file_manifest SET sha256 = '', size = 0 WHERE deleted = 1 AND sha256 = ?",
     );
 
     // Wrap the batch upsert in a SQLite transaction. Provides:
@@ -419,8 +431,28 @@ export class LedgerDB {
     };
   }
 
-  /** Insert or update a file manifest entry. */
+  /**
+   * Insert or update a file manifest entry, garbage-collecting any blob
+   * that no longer has any live (deleted=0) manifest row pointing at it.
+   *
+   * GC strategy (H5): after the upsert, if the previous row pointed at
+   * a DIFFERENT sha than the new row's sha, check whether any other
+   * manifest row still references the old sha as a live entry. If not,
+   * unlink the blob file AND clear the sha on any tombstone rows that
+   * still mention it (so clients don't see a dangling sha they can't
+   * fetch). Unlinking happens AFTER the transaction so a crash mid-way
+   * leaves an orphan blob rather than a dangling reference.
+   *
+   * See FINDINGS.md H5. Without this, blobs accumulate forever — a
+   * serious concern for `auth_json` sync, where every rotated token's
+   * blob stays fetchable by anyone with OPENCODE_SYNC_TOKEN.
+   */
   upsertManifestEntry(entry: FileManifestEntry): void {
+    // Capture the previous sha BEFORE the upsert so we can check
+    // whether it becomes orphaned.
+    const prev = this.stmtGetManifestEntry.get(entry.relpath);
+    const prevSha = prev?.sha256 ?? "";
+
     this.stmtUpsertManifest.run(
       entry.relpath,
       entry.sha256,
@@ -429,6 +461,32 @@ export class LedgerDB {
       entry.machine_id,
       entry.deleted ? 1 : 0,
     );
+
+    if (!prevSha || prevSha === entry.sha256) return;
+
+    // Is the previous sha still referenced by any live row?
+    const refs = this.stmtCountLiveRefsBySha.get(prevSha);
+    if (!refs || refs.n > 0) return;
+
+    // Orphaned: clear tombstone references then unlink the blob file.
+    this.stmtClearTombstoneSha.run(prevSha);
+
+    const blobPath = this.getBlobPath(prevSha);
+    try {
+      if (existsSync(blobPath)) {
+        unlinkSync(blobPath);
+        this.logger.info("blob gc'd", { sha256: prevSha });
+      }
+    } catch (err) {
+      // Blob unlink is best-effort: a failure (e.g. EBUSY on Windows,
+      // EACCES if somehow the mode is bad) leaves an orphan blob, which
+      // is strictly safer than the inverse — a future manual /admin/gc
+      // pass or the next overwrite of the same sha will reclaim it.
+      this.logger.warn("blob gc failed", {
+        sha256: prevSha,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   /** Get the full filesystem path for a blob by its sha256. */

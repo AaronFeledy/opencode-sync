@@ -2,7 +2,7 @@ import { beforeEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { SyncClient } from "./client.js";
+import { StaleError, type SyncClient } from "./client.js";
 import { FileSync } from "./files.js";
 import { StateManager } from "./state.js";
 import { sha256Hex } from "./util.js";
@@ -45,6 +45,18 @@ class MockClient {
   deletes: string[] = [];
   deleteMtimes: number[] = [];
 
+  /**
+   * Optional failure injection for `deleteFile`. Test code can set this
+   * to a function that throws (e.g. `StaleError` or a generic `Error`)
+   * to exercise the H1 failed-delete-retention path and the stale-drop
+   * path. Default behaviour records the call and succeeds.
+   */
+  deleteFileImpl?: (
+    relpath: string,
+    machineId: string,
+    mtime: number,
+  ) => Promise<void>;
+
   async getManifest(): Promise<FileManifestEntry[]> {
     return this.manifest.map((entry) => ({ ...entry }));
   }
@@ -65,7 +77,11 @@ class MockClient {
     this.uploads.push({ relpath, data: Buffer.from(data).toString("utf-8"), mtime });
   }
 
-  async deleteFile(relpath: string, _machineId: string, mtime: number): Promise<void> {
+  async deleteFile(relpath: string, machineId: string, mtime: number): Promise<void> {
+    if (this.deleteFileImpl) {
+      await this.deleteFileImpl(relpath, machineId, mtime);
+      return;
+    }
     this.deletes.push(relpath);
     this.deleteMtimes.push(mtime);
   }
@@ -213,4 +229,177 @@ test("maps auth.json to a server-safe relpath", async () => {
 
   expect(client.uploads).toHaveLength(1);
   expect(client.uploads[0]?.relpath).toBe(AUTH_SYNC_PATH);
+});
+
+// ── H1 regression: transient delete failure must retain knownFiles entry ──
+
+test("H1: transient delete failure retains knownFiles entry and retries next cycle", async () => {
+  // Before the fix, a non-stale error from deleteFile dropped the
+  // relpath from postSyncByPath → replaceKnownFiles cleared it →
+  // next cycle the remote-only download branch silently resurrected
+  // the file. See FINDINGS.md H1.
+  const relpath = "agents/custom.md";
+  const previousEntry = toManifestEntry(relpath, "hello\n", 1_000, "desktop");
+
+  const stateManager = new StateManager("desktop");
+  stateManager.replaceKnownFiles([previousEntry]);
+
+  const client = new MockClient();
+  client.manifest = [{ ...previousEntry }];
+  client.blobs.set(previousEntry.sha256, new TextEncoder().encode("hello\n"));
+
+  let failNext = true;
+  client.deleteFileImpl = async (rp, _machineId, mtime) => {
+    if (failNext) {
+      failNext = false;
+      throw new Error("ECONNREFUSED");
+    }
+    client.deletes.push(rp);
+    client.deleteMtimes.push(mtime);
+  };
+
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, agents: true },
+    stateManager,
+    () => {},
+  );
+
+  // First cycle: delete throws → counts as no-op upload but the
+  // previous entry must stay in knownFiles.
+  await fileSync.sync();
+  expect(client.deletes).toEqual([]);
+  expect(stateManager.state.knownFiles[relpath]).toBeDefined();
+  expect(stateManager.state.knownFiles[relpath]?.sha256).toBe(previousEntry.sha256);
+  // File must NOT have been resurrected locally by the download branch.
+  expect(fs.existsSync(path.join(CONFIG_BASE, relpath))).toBe(false);
+
+  // Second cycle: network recovers, delete succeeds, entry is finally
+  // dropped.
+  await fileSync.sync();
+  expect(client.deletes).toEqual([relpath]);
+  expect(stateManager.state.knownFiles[relpath]).toBeUndefined();
+});
+
+test("H1: stale delete response does NOT cause a retry next cycle", async () => {
+  // When the server 409s a delete because the remote has moved on,
+  // our delete intent should be dropped (not retried). The next pull's
+  // remote-only download branch picks up the fresh remote; if we
+  // retained the delete intent instead, we'd repeatedly retry a delete
+  // that can never succeed.
+  const relpath = "agents/custom.md";
+  const oldContent = "hello\n";
+  const newContent = "hello from another machine\n";
+  const previousEntry = toManifestEntry(relpath, oldContent, 1_000, "desktop");
+  const newRemoteEntry = toManifestEntry(relpath, newContent, 5_000, "laptop");
+
+  const stateManager = new StateManager("desktop");
+  stateManager.replaceKnownFiles([previousEntry]);
+
+  const client = new MockClient();
+  // Remote has advanced to a newer version (different sha + mtime).
+  client.manifest = [{ ...newRemoteEntry }];
+  client.blobs.set(newRemoteEntry.sha256, new TextEncoder().encode(newContent));
+
+  let deleteCalls = 0;
+  client.deleteFileImpl = async () => {
+    deleteCalls++;
+    throw new StaleError("DELETE", `/files/manifest/${relpath}`, "stale");
+  };
+
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, agents: true },
+    stateManager,
+    () => {},
+  );
+
+  // Cycle 1: sha differs between previous and remote, so the tombstone
+  // loop's `remote.sha256 !== previous.sha256` guard short-circuits
+  // before even calling deleteFile — we correctly defer to remote.
+  await fileSync.sync();
+  expect(deleteCalls).toBe(0);
+  // File was downloaded from remote — knownFiles now holds the new sha.
+  expect(stateManager.state.knownFiles[relpath]?.sha256).toBe(newRemoteEntry.sha256);
+
+  // Cycle 2: another pass should also not attempt delete — local now
+  // matches remote, so we're in the "same content" branch.
+  await fileSync.sync();
+  expect(deleteCalls).toBe(0);
+});
+
+// ── M5 regression: walkDir must refuse to follow symlinks ──
+
+test("M5: walkDir skips symlinks to files (no leak, no upload)", async () => {
+  const real = path.join(CONFIG_BASE, "agents", "real.md");
+  writeTrackedFile(real, "real content\n", 1_000);
+
+  // Create a symlink whose target is outside the sync tree — if we
+  // followed it, its contents would be uploaded.
+  const secret = path.join(os.tmpdir(), `secret-${Date.now()}.txt`);
+  fs.writeFileSync(secret, "SECRET DATA — must not leak\n");
+  const link = path.join(CONFIG_BASE, "agents", "link.md");
+  fs.symlinkSync(secret, link);
+
+  const client = new MockClient();
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, agents: true },
+    new StateManager("desktop"),
+    () => {},
+  );
+
+  const manifest = await fileSync.computeLocalManifest();
+  const paths = manifest.map((e) => e.relpath).sort();
+  expect(paths).toEqual(["agents/real.md"]); // link excluded
+
+  fs.unlinkSync(secret);
+});
+
+test("M5: walkDir skips symlinks to directories (prevents recursion cycles)", async () => {
+  const agentsDir = path.join(CONFIG_BASE, "agents");
+  fs.mkdirSync(agentsDir, { recursive: true });
+  writeTrackedFile(path.join(agentsDir, "a.md"), "a\n", 1_000);
+  // Classic loop: agents/loop -> agents/
+  fs.symlinkSync(agentsDir, path.join(agentsDir, "loop"));
+
+  const client = new MockClient();
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, agents: true },
+    new StateManager("desktop"),
+    () => {},
+  );
+
+  // Must complete without stack overflow.
+  const manifest = await fileSync.computeLocalManifest();
+  expect(manifest.map((e) => e.relpath)).toEqual(["agents/a.md"]);
+});
+
+test("M5: symlinked configured root is refused", async () => {
+  // Simulate `~/.config/opencode/agents` being a user-created symlink
+  // to an external dotfiles repo. We should NOT descend it and upload
+  // unrelated content.
+  const external = fs.mkdtempSync(path.join(os.tmpdir(), "ext-agents-"));
+  writeTrackedFile(path.join(external, "ext.md"), "ext content\n", 1_000);
+  fs.mkdirSync(CONFIG_BASE, { recursive: true });
+  fs.symlinkSync(external, path.join(CONFIG_BASE, "agents"));
+
+  const client = new MockClient();
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, agents: true },
+    new StateManager("desktop"),
+    () => {},
+  );
+
+  const manifest = await fileSync.computeLocalManifest();
+  expect(manifest).toHaveLength(0);
+
+  fs.rmSync(external, { recursive: true, force: true });
 });

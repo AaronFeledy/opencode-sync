@@ -345,3 +345,82 @@ test("handleSyncHeads rejects non-array row_keys", async () => {
 
   db.close();
 });
+
+test("H4: handleSyncPush rejects batches exceeding PUSH_MAX_BATCH", async () => {
+  // Protects the SQLite write transaction from being wedged by a
+  // malicious or buggy client that tries to submit millions of
+  // envelopes in one call. Legitimate clients use PUSH_BATCH_SIZE=100,
+  // well below the 5000 cap. See FINDINGS.md H4.
+  const db = new LedgerDB(createDataDir(), silentLogger);
+
+  const envelopes = Array.from({ length: 5001 }, (_, i) => ({
+    id: `s-${i}`,
+    kind: "session",
+    machine_id: "m1",
+    time_updated: 1000 + i,
+    deleted: false,
+    data: {
+      id: `s-${i}`,
+      project_id: "p1",
+      parent_id: null,
+      slug: "s",
+      directory: "/tmp",
+      title: "T",
+      version: "1",
+      share_url: null,
+      summary_additions: null,
+      summary_deletions: null,
+      summary_files: null,
+      summary_diffs: null,
+      revert: null,
+      permission: null,
+      time_created: 1,
+      time_updated: 1000 + i,
+      time_compacting: null,
+      time_archived: null,
+      workspace_id: null,
+    },
+  }));
+
+  const res = await handleSyncPush(
+    pushRequest({ machine_id: "m1", envelopes }),
+    db,
+    silentLogger,
+  );
+
+  expect(res.status).toBe(400);
+  const body = (await res.json()) as { error: string };
+  expect(body.error).toMatch(/maximum batch size/);
+
+  db.close();
+});
+
+test("M8: handleSyncPush rejects time_updated <= 0", async () => {
+  // Tightened from `< 0` to `<= 0` so zero can't poison LWW. Plugin
+  // enforces the same. See FINDINGS.md M8.
+  const db = new LedgerDB(createDataDir(), silentLogger);
+
+  const res = await handleSyncPush(
+    pushRequest({
+      machine_id: "m1",
+      envelopes: [
+        {
+          id: "s1",
+          kind: "session",
+          machine_id: "m1",
+          time_updated: 0,
+          deleted: false,
+          data: {},
+        },
+      ],
+    }),
+    db,
+    silentLogger,
+  );
+
+  expect(res.status).toBe(400);
+  const body = (await res.json()) as { error: string };
+  expect(body.error).toMatch(/positive/);
+
+  db.close();
+});

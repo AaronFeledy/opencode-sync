@@ -289,6 +289,13 @@ export const server: Plugin = async (_input, _options) => {
           `to prevent propagating row deletions to every other peer.`,
         extra: { ...fpCmp.details, previous_fingerprint: previousFp, current_fingerprint: currentFp },
       });
+      // Drop any in-flight pending-tombstone confirmations. Without this,
+      // a pending entry stamped with `firstSeenAt = T0` sits through the
+      // halt, and on the first cycle after the user resolves the issue
+      // (possibly hours later) `now - firstSeenAt` is far larger than
+      // the 30s confirmation window → the row is instantly tombstoned
+      // without any post-recovery re-confirmation. See FINDINGS.md H2.
+      stateManager.clearPendingTombstones();
       // Intentionally do NOT set `haltLogged = true` here. The next tick
       // will see `isSyncHalted()` and emit the standard "ROW SYNC HALTED
       // — deletion-safety marker present" message with marker_path and

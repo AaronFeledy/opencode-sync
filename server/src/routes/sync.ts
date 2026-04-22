@@ -34,6 +34,15 @@ function isSyncKind(value: string): value is SyncKind {
  */
 const HEADS_MAX_BATCH = 5000;
 
+/**
+ * Cap on the number of envelopes accepted in a single POST /sync/push.
+ * Bounds the SQLite write-transaction size (upsertBatch runs in one tx)
+ * so a malicious or buggy client can't wedge the lock for arbitrary
+ * durations. The plugin's PUSH_BATCH_SIZE is 100 (plugin/src/sessions.ts),
+ * so legitimate clients are nowhere near this cap. See FINDINGS.md H4.
+ */
+const PUSH_MAX_BATCH = 5000;
+
 // ── Push ────────────────────────────────────────────────────────────
 
 export async function handleSyncPush(
@@ -68,6 +77,13 @@ export async function handleSyncPush(
 
   if (envelopes.length === 0) {
     return Response.json({ error: "envelopes array must not be empty" }, { status: 400 });
+  }
+
+  if (envelopes.length > PUSH_MAX_BATCH) {
+    return Response.json(
+      { error: `envelopes array exceeds maximum batch size of ${PUSH_MAX_BATCH}` },
+      { status: 400 },
+    );
   }
 
   // Validate every envelope before touching the database — `upsertBatch`
@@ -111,10 +127,15 @@ export async function handleSyncPush(
     if (
       typeof envelope.time_updated !== "number" ||
       !Number.isFinite(envelope.time_updated) ||
-      envelope.time_updated < 0
+      envelope.time_updated <= 0
     ) {
+      // Reject 0 explicitly: `time_updated = 0` breaks LWW comparison
+      // on the plugin side (any freshly-zeroed local row would compare
+      // equal and silently skip content differences). Keep the server
+      // and plugin in lockstep so a stray 0 can't poison the ledger.
+      // See FINDINGS.md M8.
       return Response.json(
-        { error: "envelope.time_updated must be a non-negative finite number" },
+        { error: "envelope.time_updated must be a positive finite number" },
         { status: 400 },
       );
     }
@@ -287,8 +308,11 @@ export function handleSyncPull(
     return Response.json({ error: "since must be a non-negative integer" }, { status: 400 });
   }
 
-  // Parse `exclude` — optional machine_id to filter out
-  const exclude = url.searchParams.get("exclude") ?? undefined;
+  // Parse `exclude` — optional machine_id to filter out. Treat empty
+  // string (`?exclude=`) as "no filter" so callers can set the query
+  // parameter unconditionally. See FINDINGS.md L5.
+  const excludeRaw = url.searchParams.get("exclude");
+  const exclude = excludeRaw && excludeRaw.length > 0 ? excludeRaw : undefined;
 
   // Parse `limit` — optional, defaults to 500
   const limitRaw = url.searchParams.get("limit");

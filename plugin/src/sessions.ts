@@ -2,12 +2,12 @@
  * Session sync orchestration — push/pull/reconcile session data
  * between the local opencode DB and the remote sync server.
  */
-import type { SyncEnvelope, SyncKind } from "@opencode-sync/shared";
+import { SYNC_KINDS, type SyncEnvelope, type SyncKind } from "@opencode-sync/shared";
 import type { DbReader } from "./db-read.js";
 import type { ApplyResult, DbWriter } from "./db-write.js";
 import type { SyncClient } from "./client.js";
 import { EndpointMissingError } from "./client.js";
-import type { StateManager } from "./state.js";
+import { PULL_POISON_THRESHOLD, type StateManager } from "./state.js";
 import { writeHaltMarker, isSyncHalted, HALT_REASONS } from "./halt.js";
 
 // ── Constants ──────────────────────────────────────────────────────
@@ -75,15 +75,51 @@ function rowStateKey(kind: SyncKind, id: string): string {
   return `${kind}:${id}`;
 }
 
-function parseRowStateKey(rowKey: string): { kind: SyncKind; id: string } | null {
-  const separator = rowKey.indexOf(":");
-  if (separator === -1) return null;
+/**
+ * Extract the parent session id for child row kinds. Used by M1's
+ * `rowParents` secondary index so `markExpectedDeletion` can cascade-
+ * expand a deleted session into its messages/parts/todos/shares
+ * rather than leaving them in unexpectedCandidates and tripping the
+ * deletion-safety threshold.
+ *
+ * Returns undefined for kinds with no session parent (project,
+ * session, permission) or if the envelope's data lacks a session_id.
+ */
+function envelopeParentSession(envelope: SyncEnvelope): string | undefined {
+  if (
+    envelope.kind !== "message" &&
+    envelope.kind !== "part" &&
+    envelope.kind !== "todo" &&
+    envelope.kind !== "session_share"
+  ) {
+    return undefined;
+  }
+  const data = envelope.data as Record<string, unknown> | null | undefined;
+  if (!data || typeof data !== "object") return undefined;
+  // session_share's rowPrimaryKey is the session id itself, but the
+  // data also carries it via `session_id` in the schema. Prefer the
+  // data field for consistency.
+  const sid = data["session_id"];
+  return typeof sid === "string" && sid.length > 0 ? sid : undefined;
+}
 
-  const kind = rowKey.slice(0, separator) as SyncKind;
+/** Exported for test access only. Parses rowKey back into kind+id. */
+export function parseRowStateKey(rowKey: string): { kind: SyncKind; id: string } | null {
+  const separator = rowKey.indexOf(":");
+  // `separator === 0` means an empty kind ("" + ":id"); reject along with
+  // "no separator" so callers get a consistent null for any malformed key.
+  // See FINDINGS.md M7.
+  if (separator <= 0) return null;
+
+  const kind = rowKey.slice(0, separator);
   const id = rowKey.slice(separator + 1);
 
   if (!id) return null;
-  return { kind, id };
+  // Validate kind against the runtime SYNC_KINDS set — the downstream
+  // cast-to-SyncKind would otherwise silently propagate unknown kinds
+  // into push/heads traffic where they'd be rejected server-side.
+  if (!(SYNC_KINDS as readonly string[]).includes(kind)) return null;
+  return { kind: kind as SyncKind, id };
 }
 
 // ── Sync orchestrator ──────────────────────────────────────────────
@@ -155,19 +191,33 @@ export class SessionSync {
   markExpectedDeletion(rowKey: string): void {
     this.expectedDeletions.add(rowKey);
 
-    // Auto-expand: if a whole session is being deleted, we know its
-    // todos share the same sessionId prefix in their rowKey. Cascade
-    // them without requiring the caller to enumerate.
+    // Auto-expand: if a whole session is being deleted, every row
+    // whose `rowParents` entry points at this session should also be
+    // marked expected. Without this (M1), users who delete their
+    // biggest session would see messages/parts cascade through the
+    // FK and land in unexpectedCandidates, tripping the 95% threshold
+    // halt on a routine action.
     const parsed = parseRowStateKey(rowKey);
     if (parsed?.kind === "session") {
-      const prefix = `todo:${parsed.id}:`;
+      const sessionId = parsed.id;
+      for (const [childKey, parentSessionId] of Object.entries(
+        this.stateManager.state.rowParents,
+      )) {
+        if (parentSessionId === sessionId) {
+          this.expectedDeletions.add(childKey);
+        }
+      }
+      // Belt-and-braces for the transition window before `rowParents`
+      // is populated (e.g. first sync after upgrade): the legacy
+      // todo-prefix scan + the directly-keyed session_share entry
+      // still fire even if rowParents is empty for this session.
+      const todoPrefix = `todo:${sessionId}:`;
       for (const knownKey of Object.keys(this.stateManager.state.knownRows)) {
-        if (knownKey.startsWith(prefix)) {
+        if (knownKey.startsWith(todoPrefix)) {
           this.expectedDeletions.add(knownKey);
         }
       }
-      // Also the session_share (if any) — the rowKey is just "session_share:<sessionId>"
-      this.expectedDeletions.add(`session_share:${parsed.id}`);
+      this.expectedDeletions.add(`session_share:${sessionId}`);
     }
   }
 
@@ -427,7 +477,7 @@ export class SessionSync {
         this.machineId,
       );
 
-      const rememberedRows: Record<string, number> = {};
+      const rememberedRows: Record<string, { time_updated: number; parent?: string }> = {};
       const forgottenRows = new Set<string>();
 
       // Track the last server_seq we successfully processed BEFORE the
@@ -441,25 +491,46 @@ export class SessionSync {
       // cursor. Transient errors (FK violation when parent hasn't
       // arrived yet, SQLITE_BUSY, etc.) became permanent data loss.
       //
-      // Trade-off: a permanently-bad envelope (e.g. unknown kind on an
-      // older client, malformed data) blocks all sync progress until
-      // resolved. A persisted attempt-counter would handle that
-      // gracefully — left as a follow-up.
+      // H3: to prevent a permanently-bad envelope from blocking all
+      // subsequent pulls forever, each failing envelope has a persisted
+      // retry counter keyed by `${kind}:${id}:${server_seq}`. After
+      // `PULL_POISON_THRESHOLD` retries, the envelope is recorded in
+      // `poisonedEnvelopes` and skipped past — the cursor advances so
+      // subsequent pulls can proceed. See FINDINGS.md H3.
       let lastGoodSeq = this.stateManager.state.lastPulledSeq;
       let firstErrorSeq: number | null = null;
 
       for (const envelope of res.envelopes) {
+        const envelopeKey = `${envelope.kind}:${envelope.id}:${envelope.server_seq}`;
+        
+        // Skip already-poisoned envelopes to avoid re-applying and duplicate
+        // entries. Advance cursor if no prior error blocked us.
+        const alreadyPoisoned = this.stateManager.state.poisonedEnvelopes.some(
+          (p) =>
+            p.kind === envelope.kind &&
+            p.id === envelope.id &&
+            p.server_seq === envelope.server_seq,
+        );
+        if (alreadyPoisoned) {
+          if (firstErrorSeq === null) {
+            lastGoodSeq = envelope.server_seq;
+          }
+          continue;
+        }
+        
         let result: ApplyResult;
+        let thrownError: string | null = null;
         try {
           result = this.dbWriter.applyEnvelope(envelope);
         } catch (err) {
           // Defensive: applyEnvelope is supposed to return "error" rather
           // than throw, but anything that does escape lands here.
           result = "error";
+          thrownError = String(err);
           this.log("envelope apply threw (will retry next cycle)", {
             kind: envelope.kind,
             id: envelope.id,
-            error: String(err),
+            error: thrownError,
           });
         }
 
@@ -469,25 +540,68 @@ export class SessionSync {
           if (envelope.deleted) {
             forgottenRows.add(rowKey);
           } else {
-            rememberedRows[rowKey] = envelope.time_updated;
+            const parent = envelopeParentSession(envelope);
+            rememberedRows[rowKey] = parent !== undefined
+              ? { time_updated: envelope.time_updated, parent }
+              : { time_updated: envelope.time_updated };
+          }
+          // Clear any prior error counter on success.
+          if (envelopeKey in this.stateManager.state.pullErrorCounts) {
+            this.stateManager.clearPullErrorCount(envelopeKey);
           }
         } else if (result === "conflict") {
           // Local row is strictly newer than the remote — preserve local
           // and report as a real conflict (per SPEC §6.3 step 4).
           conflicts++;
-        } else if (result === "error") {
+          // Conflict is a successful LWW outcome — clear any counter.
+          if (envelopeKey in this.stateManager.state.pullErrorCounts) {
+            this.stateManager.clearPullErrorCount(envelopeKey);
+          }
+        } else if (result === "skipped") {
+          // Idempotent no-op — also counts as success for the counter.
+          if (envelopeKey in this.stateManager.state.pullErrorCounts) {
+            this.stateManager.clearPullErrorCount(envelopeKey);
+          }
+        } else {
+          // result === "error"
           errors++;
+          const attempts = this.stateManager.incrementPullErrorCount(envelopeKey);
+          if (attempts >= PULL_POISON_THRESHOLD) {
+            // Permanent skip: record for operator audit, clear the
+            // counter, treat as "applied-for-cursor-purposes" so the
+            // loop continues past it.
+            this.log("POISON ENVELOPE — skipping after N retries", {
+              kind: envelope.kind,
+              id: envelope.id,
+              server_seq: envelope.server_seq,
+              attempts,
+              lastError: thrownError ?? undefined,
+            });
+            this.stateManager.recordPoisonedEnvelope({
+              kind: envelope.kind,
+              id: envelope.id,
+              server_seq: envelope.server_seq,
+              ...(thrownError ? { lastError: thrownError } : {}),
+            });
+            this.stateManager.clearPullErrorCount(envelopeKey);
+            // Advance lastGoodSeq so the cursor crosses the poisoned
+            // envelope and subsequent pulls can proceed.
+            if (firstErrorSeq === null) {
+              lastGoodSeq = envelope.server_seq;
+            }
+            continue;
+          }
           if (firstErrorSeq === null) firstErrorSeq = envelope.server_seq;
           this.log("envelope apply failed (will retry next cycle)", {
             kind: envelope.kind,
             id: envelope.id,
             time_updated: envelope.time_updated,
             server_seq: envelope.server_seq,
+            attempts,
           });
           // Don't advance lastGoodSeq past the error.
           continue;
         }
-        // "skipped" is the normal idempotent no-op when local == remote.
 
         // Track the highest seq successfully processed up to (but not
         // including) the first error. After the first error, we still
@@ -730,12 +844,19 @@ export class SessionSync {
           this.log("server lacks /sync/heads endpoint, skipping cross-check");
         } else {
           // Network error — be conservative and SKIP this cycle's
-          // unexpected tombstones rather than emit blind. The pending
-          // buffer is left intact so subsequent cycles can resume once
-          // the network recovers; expected deletions still proceed.
+          // unexpected tombstones rather than emit blind. Also clear
+          // the pending-confirmation buffer: if we left it intact, a
+          // long outage would drift `firstSeenAt` far past the 30s
+          // confirmation window and the first recovered cycle would
+          // emit tombstones without any post-recovery re-check. The
+          // detection itself is re-derived cheaply from knownRows vs
+          // live DB on every cycle, so clearing only costs us at most
+          // one cycle of progress through the confirmation window.
+          // Expected deletions still proceed below. See FINDINGS.md H2.
           this.log("getHeads failed, deferring unexpected tombstones this cycle", {
             error: String(err),
           });
+          this.stateManager.clearPendingTombstones();
           return this.formatTombstones(expectedCandidates);
         }
       }
@@ -833,12 +954,16 @@ export class SessionSync {
     stale: Array<{ kind: SyncKind; id: string }>,
   ): void {
     const staleKeys = new Set(stale.map((entry) => rowStateKey(entry.kind, entry.id)));
-    const rememberedRows = Object.fromEntries(
-      envelopes
-        .filter((envelope) => !envelope.deleted)
-        .filter((envelope) => !staleKeys.has(rowStateKey(envelope.kind, envelope.id)))
-        .map((envelope) => [rowStateKey(envelope.kind, envelope.id), envelope.time_updated]),
-    );
+    const rememberedRows: Record<string, { time_updated: number; parent?: string }> = {};
+    for (const envelope of envelopes) {
+      if (envelope.deleted) continue;
+      const rowKey = rowStateKey(envelope.kind, envelope.id);
+      if (staleKeys.has(rowKey)) continue;
+      const parent = envelopeParentSession(envelope);
+      rememberedRows[rowKey] = parent !== undefined
+        ? { time_updated: envelope.time_updated, parent }
+        : { time_updated: envelope.time_updated };
+    }
 
     if (Object.keys(rememberedRows).length > 0) {
       this.stateManager.rememberRows(rememberedRows);
