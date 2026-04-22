@@ -502,6 +502,22 @@ export class SessionSync {
 
       for (const envelope of res.envelopes) {
         const envelopeKey = `${envelope.kind}:${envelope.id}:${envelope.server_seq}`;
+        
+        // Skip already-poisoned envelopes to avoid re-applying and duplicate
+        // entries. Advance cursor if no prior error blocked us.
+        const alreadyPoisoned = this.stateManager.state.poisonedEnvelopes.some(
+          (p) =>
+            p.kind === envelope.kind &&
+            p.id === envelope.id &&
+            p.server_seq === envelope.server_seq,
+        );
+        if (alreadyPoisoned) {
+          if (firstErrorSeq === null) {
+            lastGoodSeq = envelope.server_seq;
+          }
+          continue;
+        }
+        
         let result: ApplyResult;
         let thrownError: string | null = null;
         try {
