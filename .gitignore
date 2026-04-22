@@ -30,3 +30,4 @@ server/data/
 # IDE
 .vscode/
 .idea/
+FINDINGS.md
