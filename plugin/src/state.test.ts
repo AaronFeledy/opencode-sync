@@ -70,6 +70,39 @@ test("M3: load() tolerates partial JSON (missing fields default safely)", () => 
   expect(files.filter((f) => f.startsWith("state.json.corrupt-"))).toEqual([]);
 });
 
+test("M6: pushReadSince detects wall-clock backjump and resets the cursor", () => {
+  const sm = new StateManager("desktop");
+
+  // Stamp the cursor far in the "future" relative to current Date.now()
+  // — simulating a scenario where previous pushes happened under a
+  // forward-skewed clock that has since been corrected backward.
+  const now = Date.now();
+  const farFuture = now + 30 * 60_000; // 30 min ahead
+  // Bypass advancePushedRowTime's clamp by directly setting state via
+  // a sequence that reaches the state through normal channels — the
+  // cleanest way is to write state.json manually.
+  // Use reflection through the public `state` getter's mutability.
+  // NOTE: internal field access for testing only.
+  (sm as unknown as { _state: { lastPushedRowTime: number } })._state.lastPushedRowTime = farFuture;
+
+  // First call must detect the backjump and reset.
+  const since = sm.pushReadSince();
+  // After reset, lastPushedRowTime should be roughly now (±1s test jitter).
+  expect(sm.state.lastPushedRowTime).toBeLessThan(farFuture);
+  expect(sm.state.lastPushedRowTime).toBeGreaterThan(now - 1000);
+  // pushReadSince returns the reset-time minus margin.
+  expect(since).toBeLessThan(now);
+});
+
+test("M6: pushReadSince is unchanged under normal forward-clock conditions", () => {
+  const sm = new StateManager("desktop");
+  sm.advancePushedRowTime(Date.now() - 100); // recent, in the past
+  const before = sm.state.lastPushedRowTime;
+  sm.pushReadSince();
+  // No reset — clock hasn't gone backward.
+  expect(sm.state.lastPushedRowTime).toBe(before);
+});
+
 test("M3: save() then load() round-trips all fields", () => {
   const sm1 = new StateManager("desktop");
   sm1.updateSeq(123);

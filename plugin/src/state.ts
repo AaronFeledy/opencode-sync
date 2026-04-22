@@ -291,11 +291,31 @@ export class StateManager {
 
   /**
    * Compute the `since` filter to use when scanning local tables for a
-   * `pushAll`. Returns `lastPushedRowTime - PUSH_CURSOR_MARGIN_MS`, clamped
-   * to >= 0. On a fresh state (cursor=0) returns 0, so the first push reads
-   * everything.
+   * `pushAll`. Normally returns `lastPushedRowTime - PUSH_CURSOR_MARGIN_MS`.
+   *
+   * M6: detect wall-clock backjumps and reset the cursor. If
+   * `Date.now()` has moved backward past our saved cursor by more than
+   * the margin (NTP step after suspend/resume, VM migration, BIOS
+   * battery failure, container clock drift), fresh local rows written
+   * with the post-jump `Date.now()` would have `time_updated <
+   * lastPushedRowTime - margin` and be permanently invisible to
+   * `iterateAllEnvelopes` until wall clock caught up — potentially
+   * hours. Detecting this here and resetting the cursor to the current
+   * wall clock ensures post-jump rows are picked up on the next push.
    */
   pushReadSince(): number {
+    const now = Date.now();
+    // If the wall clock is much earlier than our saved cursor, a
+    // backjump has happened. Reset so newly-written rows (which now
+    // carry smaller time_updated values) aren't filtered out.
+    if (now + PUSH_CURSOR_MARGIN_MS < this._state.lastPushedRowTime) {
+      logger.log("push cursor rewinding: wall clock moved backward past saved cursor", {
+        now,
+        lastPushedRowTime: this._state.lastPushedRowTime,
+      });
+      this._state.lastPushedRowTime = now;
+      this.maybeSave();
+    }
     return Math.max(0, this._state.lastPushedRowTime - PUSH_CURSOR_MARGIN_MS);
   }
 
