@@ -1984,6 +1984,145 @@ test("H3: poison envelope is skipped past after PULL_POISON_THRESHOLD retries", 
   fs.rmSync(dbPath, { force: true });
 });
 
+test("H3: already-poisoned envelope is skipped on re-pull, not re-counted (bugbot regression)", async () => {
+  // Regression for the cursor-blocked re-poison bug bugbot caught:
+  //
+  // Scenario: a batch `[env_A_transient, env_B_poisonable]` where env_A
+  // is a transient error (FK ordering that persists) and env_B reaches
+  // threshold while env_A is still failing. When env_B hits threshold
+  // on cycle N, `firstErrorSeq` has already been set to env_A.seq. The
+  // poison-skip path tries `if (firstErrorSeq === null) lastGoodSeq =
+  // env_B.seq` — but firstErrorSeq is NOT null, so the cursor does
+  // NOT advance past env_B.
+  //
+  // Next pull re-delivers [env_A, env_B] at the same cursor. Without
+  // bugbot's fix, applyEnvelope is called on env_B, the counter
+  // increments from 1 (was cleared on poison), and env_B needs 10 MORE
+  // cycles to re-poison — producing a duplicate poisonedEnvelopes entry.
+  // With bugbot's fix, env_B is detected as already-poisoned at the
+  // top of the loop and skipped cleanly.
+  const dbPath = createDbPath();
+  initDb(dbPath);
+
+  const originalError = console.error;
+  console.error = () => {};
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  // env_A: FK violation (references a project that doesn't exist) →
+  // applyEnvelope returns "error" persistently.
+  const envA: SyncEnvelope = {
+    kind: "session",
+    id: "ses_orphan",
+    machine_id: "laptop",
+    time_updated: 5_000,
+    server_seq: 5,
+    deleted: false,
+    data: {
+      id: "ses_orphan",
+      project_id: "proj_missing",
+      parent_id: null,
+      slug: "o",
+      directory: "/tmp",
+      title: "O",
+      version: "1",
+      share_url: null,
+      summary_additions: null,
+      summary_deletions: null,
+      summary_files: null,
+      summary_diffs: null,
+      revert: null,
+      permission: null,
+      time_created: 1,
+      time_updated: 5_000,
+      time_compacting: null,
+      time_archived: null,
+      workspace_id: null,
+    },
+  };
+  // env_B: poison (unknown kind).
+  const envB = {
+    kind: "workspace" as SyncKind,
+    id: "ws_1",
+    machine_id: "laptop",
+    time_updated: 9_000,
+    server_seq: 10,
+    deleted: false,
+    data: {},
+  };
+
+  // Cycles 1-9: only env_B in the batch. It fails every cycle → counter=9.
+  for (let i = 0; i < 9; i++) {
+    client.pullResponses.push({
+      server_seq: 10,
+      more: false,
+      envelopes: [{ ...envB } as unknown as SyncEnvelope],
+    });
+    await sync.pull();
+  }
+  expect(stateManager.state.pullErrorCounts["workspace:ws_1:10"]).toBe(9);
+  expect(stateManager.state.poisonedEnvelopes.length).toBe(0);
+
+  // Cycle 10: env_A appears BEFORE env_B in the batch. env_A fails
+  // first (transient, counter=1, firstErrorSeq set). env_B then fails
+  // and reaches threshold (counter=10 → POISON). At poison time,
+  // firstErrorSeq is already set to env_A.seq, so the cursor CANNOT
+  // advance past env_B.
+  client.pullResponses.push({
+    server_seq: 10,
+    more: false,
+    envelopes: [envA, { ...envB } as unknown as SyncEnvelope],
+  });
+  await sync.pull();
+
+  // env_B poisoned exactly once.
+  expect(stateManager.state.poisonedEnvelopes.length).toBe(1);
+  expect(stateManager.state.poisonedEnvelopes[0]?.id).toBe("ws_1");
+  const firstPoisonedAt = stateManager.state.poisonedEnvelopes[0]?.skippedAt;
+  // env_B counter cleared at poison time.
+  expect(stateManager.state.pullErrorCounts["workspace:ws_1:10"]).toBeUndefined();
+  // env_A counter = 1 (it's transient).
+  expect(stateManager.state.pullErrorCounts["session:ses_orphan:5"]).toBe(1);
+  // Cursor stayed at 0 (couldn't advance past env_B because env_A was
+  // the first error in the batch).
+  expect(stateManager.state.lastPulledSeq).toBe(0);
+
+  // Cycle 11: re-deliver both envelopes. env_A still fails (transient),
+  // env_B is already poisoned → MUST be skipped at the top of the loop
+  // WITHOUT re-invoking applyEnvelope and WITHOUT re-incrementing the
+  // counter. Bugbot's fix is what makes this pass.
+  client.pullResponses.push({
+    server_seq: 10,
+    more: false,
+    envelopes: [envA, { ...envB } as unknown as SyncEnvelope],
+  });
+  await sync.pull();
+
+  // No duplicate poisonedEnvelopes entry for env_B.
+  expect(stateManager.state.poisonedEnvelopes.length).toBe(1);
+  expect(stateManager.state.poisonedEnvelopes[0]?.skippedAt).toBe(firstPoisonedAt);
+  // env_B counter is NOT re-incremented (stays undefined, not 1).
+  expect(stateManager.state.pullErrorCounts["workspace:ws_1:10"]).toBeUndefined();
+  // env_A counter continued to grow (2 now).
+  expect(stateManager.state.pullErrorCounts["session:ses_orphan:5"]).toBe(2);
+
+  console.error = originalError;
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
 test("H3: transient error clears counter on successful retry", async () => {
   // A truly transient error (FK-ordering inversion that resolves when
   // the parent arrives) should NOT accumulate toward the poison
