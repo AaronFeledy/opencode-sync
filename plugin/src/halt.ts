@@ -36,7 +36,18 @@ import { atomicWriteFileSync } from "./util.js";
 const HALT_DIR = path.join(os.homedir(), ".local", "share", "opencode", "opencode-sync");
 export const HALT_MARKER_PATH = path.join(HALT_DIR, "HALTED_SYNC");
 
+/**
+ * Schema version for halt-marker JSON. Bumped whenever `HaltDetails`
+ * gains or removes a field. `readHaltDetails` returns null (+ logs) for
+ * any version it doesn't recognise, preventing old markers from
+ * silently deserializing as a newer shape with `undefined` fields in
+ * fresh code paths. See FINDINGS.md L1.
+ */
+export const HALT_SCHEMA_VERSION = 1;
+
 export interface HaltDetails {
+  /** Schema version — see HALT_SCHEMA_VERSION. */
+  schema_version: number;
   /** When the halt was triggered (ms since epoch) */
   triggeredAt: number;
   /** Short machine-readable reason; see HALT_REASONS for known values */
@@ -86,7 +97,15 @@ export function readHaltDetails(): HaltDetails | null {
     // Find the JSON section by looking for the first `{` to the end.
     const jsonStart = raw.indexOf("{");
     if (jsonStart < 0) return null;
-    return JSON.parse(raw.slice(jsonStart)) as HaltDetails;
+    const parsed = JSON.parse(raw.slice(jsonStart));
+    if (!parsed || typeof parsed !== "object") return null;
+    const version = (parsed as Record<string, unknown>)["schema_version"];
+    // Accept our current version AND markers with no version (pre-L1
+    // migration). Unknown non-zero versions are rejected — better to
+    // surface "this marker is from a newer client" than to silently
+    // misinterpret a future shape.
+    if (version !== HALT_SCHEMA_VERSION && version !== undefined) return null;
+    return parsed as HaltDetails;
   } catch {
     return null;
   }
@@ -99,13 +118,18 @@ export function readHaltDetails(): HaltDetails | null {
  * should halt, and the freshest diagnostic context is more useful than
  * the original.
  */
-export function writeHaltMarker(details: HaltDetails): void {
+export function writeHaltMarker(details: Omit<HaltDetails, "schema_version"> & { schema_version?: number }): void {
   try {
     fs.mkdirSync(HALT_DIR, { recursive: true });
   } catch {
     // If the directory can't be made, the atomic write below will throw
     // and propagate — that's fine; halting hard is the whole point.
   }
+
+  const full: HaltDetails = {
+    ...details,
+    schema_version: details.schema_version ?? HALT_SCHEMA_VERSION,
+  };
 
   const header =
     "# opencode-sync HALTED\n" +
@@ -114,8 +138,8 @@ export function writeHaltMarker(details: HaltDetails): void {
     "# detected a condition that would otherwise have propagated mass\n" +
     "# row deletions to every peer connected to your sync server.\n" +
     "#\n" +
-    `# Triggered: ${new Date(details.triggeredAt).toISOString()}\n` +
-    `# Reason:    ${details.reason}\n` +
+    `# Triggered: ${new Date(full.triggeredAt).toISOString()}\n` +
+    `# Reason:    ${full.reason}\n` +
     "#\n" +
     "# To resume sync:\n" +
     "#   1. Read the JSON below and the plugin log at\n" +
@@ -131,7 +155,7 @@ export function writeHaltMarker(details: HaltDetails): void {
 
   atomicWriteFileSync(
     HALT_MARKER_PATH,
-    header + JSON.stringify(details, null, 2) + "\n",
+    header + JSON.stringify(full, null, 2) + "\n",
   );
 }
 

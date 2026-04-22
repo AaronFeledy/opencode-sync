@@ -23,6 +23,19 @@ interface PluginEvent {
   properties?: Record<string, unknown>;
 }
 
+/**
+ * Extract a non-empty string `sessionId` from an event's properties, or
+ * null if absent or the wrong type. Centralises the defensive type
+ * check every event handler would otherwise duplicate — a buggy
+ * opencode release that changed `sessionId` to an object or number
+ * would otherwise poison downstream state with a garbage rowKey.
+ * See FINDINGS.md L7.
+ */
+function asSessionId(props: Record<string, unknown>): string | null {
+  const v = props["sessionId"];
+  return typeof v === "string" && v.length > 0 ? v : null;
+}
+
 // ── Event handler factory ──────────────────────────────────────────
 
 export function createEventHandler(ctx: HookContext): (input: { event: any }) => Promise<void> {
@@ -73,13 +86,13 @@ export function createEventHandler(ctx: HookContext): (input: { event: any }) =>
       // ── Session events ──
 
       case "session.idle": {
-        const sessionId = props["sessionId"] as string | undefined;
+        const sessionId = asSessionId(props);
         if (sessionId) queueSessionPush(sessionId);
         break;
       }
 
       case "session.created": {
-        const sessionId = props["sessionId"] as string | undefined;
+        const sessionId = asSessionId(props);
         if (sessionId) {
           const sync = ctx.sessionSync;
           if (sync) {
@@ -94,13 +107,13 @@ export function createEventHandler(ctx: HookContext): (input: { event: any }) =>
       }
 
       case "session.updated": {
-        const sessionId = props["sessionId"] as string | undefined;
+        const sessionId = asSessionId(props);
         if (sessionId) queueSessionPush(sessionId);
         break;
       }
 
       case "session.deleted": {
-        const sessionId = props["sessionId"] as string | undefined;
+        const sessionId = asSessionId(props);
         if (sessionId) {
           const sync = ctx.sessionSync;
           if (sync) {
@@ -155,13 +168,13 @@ export function createEventHandler(ctx: HookContext): (input: { event: any }) =>
       // ── Message events ──
 
       case "message.updated": {
-        const sessionId = props["sessionId"] as string | undefined;
+        const sessionId = asSessionId(props);
         if (sessionId) queueSessionPush(sessionId);
         break;
       }
 
       case "message.part.updated": {
-        const sessionId = props["sessionId"] as string | undefined;
+        const sessionId = asSessionId(props);
         if (sessionId) queueSessionPush(sessionId);
         break;
       }
@@ -169,7 +182,7 @@ export function createEventHandler(ctx: HookContext): (input: { event: any }) =>
       // ── Todo events ──
 
       case "todo.updated": {
-        const sessionId = props["sessionId"] as string | undefined;
+        const sessionId = asSessionId(props);
         if (sessionId) queueSessionPush(sessionId);
         break;
       }

@@ -308,8 +308,11 @@ export function handleSyncPull(
     return Response.json({ error: "since must be a non-negative integer" }, { status: 400 });
   }
 
-  // Parse `exclude` — optional machine_id to filter out
-  const exclude = url.searchParams.get("exclude") ?? undefined;
+  // Parse `exclude` — optional machine_id to filter out. Treat empty
+  // string (`?exclude=`) as "no filter" so callers can set the query
+  // parameter unconditionally. See FINDINGS.md L5.
+  const excludeRaw = url.searchParams.get("exclude");
+  const exclude = excludeRaw && excludeRaw.length > 0 ? excludeRaw : undefined;
 
   // Parse `limit` — optional, defaults to 500
   const limitRaw = url.searchParams.get("limit");

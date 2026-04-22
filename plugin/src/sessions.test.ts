@@ -7,7 +7,7 @@ import type { HeadEntry, PullResponse, SyncEnvelope, SyncKind } from "@opencode-
 import { EndpointMissingError, type SyncClient } from "./client.js";
 import { DbReader } from "./db-read.js";
 import { DbWriter } from "./db-write.js";
-import { SessionSync } from "./sessions.js";
+import { SessionSync, parseRowStateKey } from "./sessions.js";
 import { StateManager } from "./state.js";
 import { isSyncHalted, clearHaltMarker, readHaltDetails, HALT_MARKER_PATH } from "./halt.js";
 
@@ -2148,4 +2148,28 @@ test("non-getHeads 404s surface as HttpError, not EndpointMissingError", async (
   } finally {
     server.stop(true);
   }
+});
+
+// ── M7: parseRowStateKey bounds ──
+
+test("M7: parseRowStateKey rejects an empty kind prefix", () => {
+  expect(parseRowStateKey(":foo")).toBeNull();
+});
+
+test("M7: parseRowStateKey rejects a rowKey with no separator", () => {
+  expect(parseRowStateKey("foo")).toBeNull();
+});
+
+test("M7: parseRowStateKey rejects an empty id", () => {
+  expect(parseRowStateKey("session:")).toBeNull();
+});
+
+test("M7: parseRowStateKey rejects an unknown kind not in SYNC_KINDS", () => {
+  expect(parseRowStateKey("workspace:x")).toBeNull();
+  expect(parseRowStateKey("nonsense:y")).toBeNull();
+});
+
+test("M7: parseRowStateKey accepts valid kind+id (including composite todo)", () => {
+  expect(parseRowStateKey("session:ses_1")).toEqual({ kind: "session", id: "ses_1" });
+  expect(parseRowStateKey("todo:ses_1:0")).toEqual({ kind: "todo", id: "ses_1:0" });
 });

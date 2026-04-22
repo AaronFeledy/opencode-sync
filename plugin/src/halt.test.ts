@@ -108,3 +108,53 @@ test("readHaltDetails returns null on a corrupted marker (best-effort)", () => {
   // But isSyncHalted is still true — the FILE exists, that's the signal.
   expect(isSyncHalted()).toBe(true);
 });
+
+test("L1: writeHaltMarker stamps schema_version", () => {
+  writeHaltMarker({
+    triggeredAt: 1,
+    reason: HALT_REASONS.TOMBSTONE_THRESHOLD,
+    message: "m",
+  });
+  const got = readHaltDetails();
+  expect(got).not.toBeNull();
+  expect(got?.schema_version).toBe(1);
+});
+
+test("L1: readHaltDetails rejects a marker with an unknown schema_version", () => {
+  fs.mkdirSync(require("node:path").dirname(HALT_MARKER_PATH), { recursive: true });
+  fs.writeFileSync(
+    HALT_MARKER_PATH,
+    "# header\n" +
+      JSON.stringify({
+        schema_version: 999,
+        triggeredAt: 1,
+        reason: "x",
+        message: "m",
+      }),
+  );
+  expect(readHaltDetails()).toBeNull();
+  // The file existing still means sync is halted — readHaltDetails
+  // returning null only means we can't decode the why, not that the
+  // halt is resolved.
+  expect(isSyncHalted()).toBe(true);
+});
+
+test("L1: readHaltDetails tolerates pre-L1 markers with no schema_version", () => {
+  // Backwards compat: a marker written before L1 landed has no
+  // schema_version field. Accept it rather than noisily rejecting —
+  // existing halted users would otherwise see "unknown version"
+  // instead of the original halt reason after upgrade.
+  fs.mkdirSync(require("node:path").dirname(HALT_MARKER_PATH), { recursive: true });
+  fs.writeFileSync(
+    HALT_MARKER_PATH,
+    "# header\n" +
+      JSON.stringify({
+        triggeredAt: 1,
+        reason: HALT_REASONS.TOMBSTONE_THRESHOLD,
+        message: "pre-L1 marker",
+      }),
+  );
+  const got = readHaltDetails();
+  expect(got).not.toBeNull();
+  expect(got?.message).toBe("pre-L1 marker");
+});

@@ -2,7 +2,7 @@
  * Session sync orchestration — push/pull/reconcile session data
  * between the local opencode DB and the remote sync server.
  */
-import type { SyncEnvelope, SyncKind } from "@opencode-sync/shared";
+import { SYNC_KINDS, type SyncEnvelope, type SyncKind } from "@opencode-sync/shared";
 import type { DbReader } from "./db-read.js";
 import type { ApplyResult, DbWriter } from "./db-write.js";
 import type { SyncClient } from "./client.js";
@@ -75,15 +75,23 @@ function rowStateKey(kind: SyncKind, id: string): string {
   return `${kind}:${id}`;
 }
 
-function parseRowStateKey(rowKey: string): { kind: SyncKind; id: string } | null {
+/** Exported for test access only. Parses rowKey back into kind+id. */
+export function parseRowStateKey(rowKey: string): { kind: SyncKind; id: string } | null {
   const separator = rowKey.indexOf(":");
-  if (separator === -1) return null;
+  // `separator === 0` means an empty kind ("" + ":id"); reject along with
+  // "no separator" so callers get a consistent null for any malformed key.
+  // See FINDINGS.md M7.
+  if (separator <= 0) return null;
 
-  const kind = rowKey.slice(0, separator) as SyncKind;
+  const kind = rowKey.slice(0, separator);
   const id = rowKey.slice(separator + 1);
 
   if (!id) return null;
-  return { kind, id };
+  // Validate kind against the runtime SYNC_KINDS set — the downstream
+  // cast-to-SyncKind would otherwise silently propagate unknown kinds
+  // into push/heads traffic where they'd be rejected server-side.
+  if (!(SYNC_KINDS as readonly string[]).includes(kind)) return null;
+  return { kind: kind as SyncKind, id };
 }
 
 // ── Sync orchestrator ──────────────────────────────────────────────
