@@ -47,7 +47,7 @@ export const HALT_SCHEMA_VERSION = 1;
 
 export interface HaltDetails {
   /** Schema version — see HALT_SCHEMA_VERSION. */
-  schema_version: number;
+  schema_version?: number;
   /** When the halt was triggered (ms since epoch) */
   triggeredAt: number;
   /** Short machine-readable reason; see HALT_REASONS for known values */
@@ -118,7 +118,7 @@ export function readHaltDetails(): HaltDetails | null {
  * should halt, and the freshest diagnostic context is more useful than
  * the original.
  */
-export function writeHaltMarker(details: Omit<HaltDetails, "schema_version"> & { schema_version?: number }): void {
+export function writeHaltMarker(details: HaltDetails): void {
   try {
     fs.mkdirSync(HALT_DIR, { recursive: true });
   } catch {
