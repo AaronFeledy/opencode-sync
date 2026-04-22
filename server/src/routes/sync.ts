@@ -111,10 +111,15 @@ export async function handleSyncPush(
     if (
       typeof envelope.time_updated !== "number" ||
       !Number.isFinite(envelope.time_updated) ||
-      envelope.time_updated < 0
+      envelope.time_updated <= 0
     ) {
+      // Reject 0 explicitly: `time_updated = 0` breaks LWW comparison
+      // on the plugin side (any freshly-zeroed local row would compare
+      // equal and silently skip content differences). Keep the server
+      // and plugin in lockstep so a stray 0 can't poison the ledger.
+      // See FINDINGS.md M8.
       return Response.json(
-        { error: "envelope.time_updated must be a non-negative finite number" },
+        { error: "envelope.time_updated must be a positive finite number" },
         { status: 400 },
       );
     }

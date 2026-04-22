@@ -188,6 +188,7 @@ test("C1: session UPDATE via applyEnvelope preserves message/part/todo/share chi
     kind: "session",
     id: "ses_1",
     machine_id: "remote-peer",
+    server_seq: 1,
     time_updated: 200,
     deleted: false,
     data: {
@@ -236,6 +237,7 @@ test("C1: project UPDATE preserves session children (and their grandchildren)", 
     kind: "project",
     id: "proj_1",
     machine_id: "remote-peer",
+    server_seq: 1,
     time_updated: 500,
     deleted: false,
     data: {
@@ -282,6 +284,7 @@ test("C1: composite-PK todo UPDATE does not disturb other rows", () => {
     kind: "todo",
     id: "ses_1:0",
     machine_id: "remote-peer",
+    server_seq: 1,
     time_updated: 300,
     deleted: false,
     data: {
@@ -324,6 +327,7 @@ test("C1: DELETE envelope still cascades (expected behaviour for real deletions)
     kind: "session",
     id: "ses_1",
     machine_id: "remote-peer",
+    server_seq: 1,
     time_updated: 200,
     deleted: true,
     data: null,
@@ -347,6 +351,7 @@ test("C1: equal time_updated is a skipped no-op (does not touch the row or child
     kind: "session",
     id: "ses_1",
     machine_id: "remote-peer",
+    server_seq: 1,
     time_updated: 100, // matches seed
     deleted: false,
     data: {

@@ -94,6 +94,26 @@ export class DbWriter {
       return "error";
     }
 
+    // Re-validate `time_updated` — the server also validates on push
+    // (routes/sync.ts), but an older/buggy/malicious server, direct
+    // ledger corruption, or a third-party client bypassing the server
+    // API could still emit pathological values. `0` and negatives
+    // break the LWW comparison semantics: `knownTimeUpdated = 0`
+    // compares equal to any freshly-zeroed local row, silently
+    // treating the envelope as skipped even when content differs; a
+    // negative `time_updated` on a tombstone would stamp an impossible
+    // pushed-rowtime on downstream peers. See FINDINGS.md M8.
+    if (
+      typeof envelope.time_updated !== "number" ||
+      !Number.isFinite(envelope.time_updated) ||
+      envelope.time_updated <= 0
+    ) {
+      logger.error(
+        `invalid envelope time_updated: ${envelope.time_updated} (kind=${kind}, id=${envelope.id})`,
+      );
+      return "error";
+    }
+
     if (deleted) {
       return this.deleteRow(kind, envelope);
     }

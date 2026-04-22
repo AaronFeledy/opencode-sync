@@ -1897,6 +1897,230 @@ test("H2: getHeads failure clears pendingTombstones to prevent instant-tombstone
   fs.rmSync(dbPath, { force: true });
 });
 
+test("H3: poison envelope is skipped past after PULL_POISON_THRESHOLD retries", async () => {
+  // Before the fix, a permanently-bad envelope (unknown kind, malformed
+  // data, FK-ordering inversion that never resolves) blocked all
+  // subsequent pulls forever because the pull loop broke on the first
+  // error without advancing the cursor. Now the envelope's error
+  // counter persists across cycles; once it exceeds the threshold, the
+  // envelope is recorded in poisonedEnvelopes, the cursor advances, and
+  // subsequent pulls proceed. See FINDINGS.md H3.
+  const dbPath = createDbPath();
+  initDb(dbPath);
+
+  const originalError = console.error;
+  console.error = () => {};
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  // A single envelope that will always fail to apply (unknown kind).
+  const poisonEnvelope = {
+    kind: "workspace" as SyncKind, // not in SYNC_KINDS — applyEnvelope returns "error"
+    id: "ws_1",
+    machine_id: "laptop",
+    time_updated: 9_000,
+    server_seq: 10,
+    deleted: false,
+    data: {},
+  };
+
+  // Simulate 10 pull cycles. Each cycle re-queues the same poison page.
+  // Before the 10th cycle, the cursor stays at 0 and poisonedEnvelopes
+  // is empty. On the 10th (threshold) the envelope is skipped past.
+  for (let i = 0; i < 10; i++) {
+    client.pullResponses.push({
+      server_seq: 10,
+      more: false,
+      envelopes: [{ ...poisonEnvelope }],
+    });
+  }
+
+  // Cycles 1-9: counter increments, cursor does NOT advance.
+  for (let i = 0; i < 9; i++) {
+    await sync.pull();
+    expect(stateManager.state.lastPulledSeq).toBe(0);
+    expect(stateManager.state.poisonedEnvelopes.length).toBe(0);
+    expect(stateManager.state.pullErrorCounts["workspace:ws_1:10"]).toBe(i + 1);
+  }
+
+  // Cycle 10: threshold hit. Envelope is recorded as poisoned and
+  // skipped past; the cursor advances so subsequent pulls work.
+  await sync.pull();
+  expect(stateManager.state.poisonedEnvelopes.length).toBe(1);
+  expect(stateManager.state.poisonedEnvelopes[0]?.kind).toBe("workspace");
+  expect(stateManager.state.poisonedEnvelopes[0]?.id).toBe("ws_1");
+  expect(stateManager.state.poisonedEnvelopes[0]?.server_seq).toBe(10);
+  expect(stateManager.state.pullErrorCounts["workspace:ws_1:10"]).toBeUndefined();
+  expect(stateManager.state.lastPulledSeq).toBe(10);
+
+  console.error = originalError;
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("H3: transient error clears counter on successful retry", async () => {
+  // A truly transient error (FK-ordering inversion that resolves when
+  // the parent arrives) should NOT accumulate toward the poison
+  // threshold. On successful apply, the counter is cleared.
+  const dbPath = createDbPath();
+  initDb(dbPath);
+
+  const originalError = console.error;
+  console.error = () => {};
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  // Cycle 1: envelope references a non-existent parent project → FK fails.
+  const sessionEnv = {
+    kind: "session" as SyncKind,
+    id: "ses_new",
+    machine_id: "laptop",
+    time_updated: 9_000,
+    server_seq: 5,
+    deleted: false,
+    data: {
+      id: "ses_new",
+      project_id: "proj_not_yet_synced",
+      parent_id: null,
+      slug: "s",
+      directory: "/tmp",
+      title: "New",
+      version: "1",
+      share_url: null,
+      summary_additions: null,
+      summary_deletions: null,
+      summary_files: null,
+      summary_diffs: null,
+      revert: null,
+      permission: null,
+      time_created: 1,
+      time_updated: 9_000,
+      time_compacting: null,
+      time_archived: null,
+      workspace_id: null,
+    },
+  };
+  client.pullResponses.push({ server_seq: 5, more: false, envelopes: [sessionEnv] });
+  await sync.pull();
+  expect(stateManager.state.pullErrorCounts["session:ses_new:5"]).toBe(1);
+  expect(stateManager.state.lastPulledSeq).toBe(0);
+
+  // Cycle 2: parent project arrives first in a separate pull, then session.
+  // After the project lands, a retry of the session succeeds.
+  {
+    const db = new Database(dbPath);
+    db.exec("PRAGMA foreign_keys = ON");
+    db.run(
+      `INSERT INTO project (id, worktree, vcs, name, icon_url, icon_color, time_created, time_updated, time_initialized, sandboxes, commands)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ["proj_not_yet_synced", "/tmp/p", "git", "P", null, null, 1, 1, 1, "[]", null],
+    );
+    db.close();
+  }
+  client.pullResponses.push({ server_seq: 5, more: false, envelopes: [sessionEnv] });
+  await sync.pull();
+  // Counter should be cleared, cursor advanced, no poison recorded.
+  expect(stateManager.state.pullErrorCounts["session:ses_new:5"]).toBeUndefined();
+  expect(stateManager.state.poisonedEnvelopes.length).toBe(0);
+  expect(stateManager.state.lastPulledSeq).toBe(5);
+
+  console.error = originalError;
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("M8: applyEnvelope rejects time_updated = 0", async () => {
+  // `time_updated = 0` poisons LWW comparisons (compares equal to any
+  // zero-stamped local row → skipped branch silently ignores content
+  // differences). Plugin rejects stricter than server. See FINDINGS.md M8.
+  const dbPath = createDbPath();
+  initDb(dbPath);
+
+  const originalError = console.error;
+  console.error = () => {};
+
+  const writer = new DbWriter(dbPath);
+  const result = writer.applyEnvelope({
+    kind: "session",
+    id: "ses_bad",
+    machine_id: "laptop",
+    time_updated: 0,
+    server_seq: 1,
+    deleted: false,
+    data: {
+      id: "ses_bad",
+      project_id: "proj_x",
+      parent_id: null,
+      slug: "s",
+      directory: "/tmp",
+      title: "Bad",
+      version: "1",
+      share_url: null,
+      summary_additions: null,
+      summary_deletions: null,
+      summary_files: null,
+      summary_diffs: null,
+      revert: null,
+      permission: null,
+      time_created: 1,
+      time_updated: 0,
+      time_compacting: null,
+      time_archived: null,
+      workspace_id: null,
+    },
+  });
+  expect(result).toBe("error");
+  writer.close();
+  console.error = originalError;
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("M8: applyEnvelope rejects negative time_updated", async () => {
+  const dbPath = createDbPath();
+  initDb(dbPath);
+  const originalError = console.error;
+  console.error = () => {};
+
+  const writer = new DbWriter(dbPath);
+  const result = writer.applyEnvelope({
+    kind: "session",
+    id: "ses_bad",
+    machine_id: "laptop",
+    time_updated: -1,
+    server_seq: 1,
+    deleted: false,
+    data: null,
+  });
+  expect(result).toBe("error");
+  writer.close();
+  console.error = originalError;
+  fs.rmSync(dbPath, { force: true });
+});
+
 test("non-getHeads 404s surface as HttpError, not EndpointMissingError", async () => {
   // Regression: previously any 404 anywhere (e.g. a missing blob)
   // would surface as `EndpointMissingError`, which mis-implies

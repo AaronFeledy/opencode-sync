@@ -7,7 +7,7 @@ import type { DbReader } from "./db-read.js";
 import type { ApplyResult, DbWriter } from "./db-write.js";
 import type { SyncClient } from "./client.js";
 import { EndpointMissingError } from "./client.js";
-import type { StateManager } from "./state.js";
+import { PULL_POISON_THRESHOLD, type StateManager } from "./state.js";
 import { writeHaltMarker, isSyncHalted, HALT_REASONS } from "./halt.js";
 
 // ── Constants ──────────────────────────────────────────────────────
@@ -441,25 +441,30 @@ export class SessionSync {
       // cursor. Transient errors (FK violation when parent hasn't
       // arrived yet, SQLITE_BUSY, etc.) became permanent data loss.
       //
-      // Trade-off: a permanently-bad envelope (e.g. unknown kind on an
-      // older client, malformed data) blocks all sync progress until
-      // resolved. A persisted attempt-counter would handle that
-      // gracefully — left as a follow-up.
+      // H3: to prevent a permanently-bad envelope from blocking all
+      // subsequent pulls forever, each failing envelope has a persisted
+      // retry counter keyed by `${kind}:${id}:${server_seq}`. After
+      // `PULL_POISON_THRESHOLD` retries, the envelope is recorded in
+      // `poisonedEnvelopes` and skipped past — the cursor advances so
+      // subsequent pulls can proceed. See FINDINGS.md H3.
       let lastGoodSeq = this.stateManager.state.lastPulledSeq;
       let firstErrorSeq: number | null = null;
 
       for (const envelope of res.envelopes) {
+        const envelopeKey = `${envelope.kind}:${envelope.id}:${envelope.server_seq}`;
         let result: ApplyResult;
+        let thrownError: string | null = null;
         try {
           result = this.dbWriter.applyEnvelope(envelope);
         } catch (err) {
           // Defensive: applyEnvelope is supposed to return "error" rather
           // than throw, but anything that does escape lands here.
           result = "error";
+          thrownError = String(err);
           this.log("envelope apply threw (will retry next cycle)", {
             kind: envelope.kind,
             id: envelope.id,
-            error: String(err),
+            error: thrownError,
           });
         }
 
@@ -471,23 +476,63 @@ export class SessionSync {
           } else {
             rememberedRows[rowKey] = envelope.time_updated;
           }
+          // Clear any prior error counter on success.
+          if (envelopeKey in this.stateManager.state.pullErrorCounts) {
+            this.stateManager.clearPullErrorCount(envelopeKey);
+          }
         } else if (result === "conflict") {
           // Local row is strictly newer than the remote — preserve local
           // and report as a real conflict (per SPEC §6.3 step 4).
           conflicts++;
-        } else if (result === "error") {
+          // Conflict is a successful LWW outcome — clear any counter.
+          if (envelopeKey in this.stateManager.state.pullErrorCounts) {
+            this.stateManager.clearPullErrorCount(envelopeKey);
+          }
+        } else if (result === "skipped") {
+          // Idempotent no-op — also counts as success for the counter.
+          if (envelopeKey in this.stateManager.state.pullErrorCounts) {
+            this.stateManager.clearPullErrorCount(envelopeKey);
+          }
+        } else {
+          // result === "error"
           errors++;
+          const attempts = this.stateManager.incrementPullErrorCount(envelopeKey);
+          if (attempts >= PULL_POISON_THRESHOLD) {
+            // Permanent skip: record for operator audit, clear the
+            // counter, treat as "applied-for-cursor-purposes" so the
+            // loop continues past it.
+            this.log("POISON ENVELOPE — skipping after N retries", {
+              kind: envelope.kind,
+              id: envelope.id,
+              server_seq: envelope.server_seq,
+              attempts,
+              lastError: thrownError ?? undefined,
+            });
+            this.stateManager.recordPoisonedEnvelope({
+              kind: envelope.kind,
+              id: envelope.id,
+              server_seq: envelope.server_seq,
+              ...(thrownError ? { lastError: thrownError } : {}),
+            });
+            this.stateManager.clearPullErrorCount(envelopeKey);
+            // Advance lastGoodSeq so the cursor crosses the poisoned
+            // envelope and subsequent pulls can proceed.
+            if (firstErrorSeq === null) {
+              lastGoodSeq = envelope.server_seq;
+            }
+            continue;
+          }
           if (firstErrorSeq === null) firstErrorSeq = envelope.server_seq;
           this.log("envelope apply failed (will retry next cycle)", {
             kind: envelope.kind,
             id: envelope.id,
             time_updated: envelope.time_updated,
             server_seq: envelope.server_seq,
+            attempts,
           });
           // Don't advance lastGoodSeq past the error.
           continue;
         }
-        // "skipped" is the normal idempotent no-op when local == remote.
 
         // Track the highest seq successfully processed up to (but not
         // including) the first error. After the first error, we still

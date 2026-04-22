@@ -5,8 +5,25 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { FileManifestEntry } from "@opencode-sync/shared";
+import type { FileManifestEntry, SyncKind } from "@opencode-sync/shared";
 import { atomicWriteFileSync } from "./util.js";
+
+/**
+ * Threshold beyond which a single `(kind, id, server_seq)` envelope is
+ * considered "poison" — malformed, unknown kind on an older client, or
+ * persistently SQL-incompatible — and skipped past so subsequent pulls
+ * can proceed. Before H3, a single bad envelope blocked ALL subsequent
+ * pulls forever.
+ *
+ * At the default 15s sync interval, 10 retries ≈ 2.5 min of transient
+ * error tolerance — long enough for FK-ordering inversions and
+ * SQLITE_BUSY squirms to resolve, short enough that genuine poison
+ * stops blocking progress within a few minutes.
+ */
+export const PULL_POISON_THRESHOLD = 10;
+
+/** Cap on `poisonedEnvelopes` to bound `state.json` growth under attack. */
+const POISONED_ENVELOPES_MAX = 500;
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -68,6 +85,30 @@ export interface SyncState {
    * plugin tombstones things on the very first cycle).
    */
   pendingTombstones: Record<string, { firstSeenAt: number; knownTimeUpdated: number }>;
+  /**
+   * Pull-apply attempt counters keyed by `${kind}:${id}:${server_seq}`.
+   * Incremented each time `applyEnvelope` returns `"error"` (or throws)
+   * for an envelope with this exact triple. When a counter exceeds
+   * `PULL_POISON_THRESHOLD`, the envelope is skipped permanently —
+   * its server_seq is crossed, a warning is logged, and the key is
+   * moved to `poisonedEnvelopes` for operator audit. A successful
+   * apply (or skipped/conflict) removes the counter. See FINDINGS.md H3.
+   */
+  pullErrorCounts: Record<string, number>;
+  /**
+   * Envelopes that exceeded `PULL_POISON_THRESHOLD` and were skipped.
+   * Kept as a diagnostic breadcrumb — operator can inspect the server
+   * ledger for these `server_seq`s. FIFO-capped at
+   * `POISONED_ENVELOPES_MAX` to bound state.json growth under attack
+   * scenarios.
+   */
+  poisonedEnvelopes: Array<{
+    kind: SyncKind;
+    id: string;
+    server_seq: number;
+    skippedAt: number;
+    lastError?: string;
+  }>;
 }
 
 /** JSON-serialisable representation of SyncState */
@@ -81,6 +122,14 @@ interface SyncStateJson {
   lastFileSyncTime: number;
   dbFingerprint?: { inode: number; mtime: number; size: number } | null;
   pendingTombstones?: Record<string, { firstSeenAt: number; knownTimeUpdated: number }>;
+  pullErrorCounts?: Record<string, number>;
+  poisonedEnvelopes?: Array<{
+    kind: string;
+    id: string;
+    server_seq: number;
+    skippedAt: number;
+    lastError?: string;
+  }>;
 }
 
 /**
@@ -115,6 +164,8 @@ export class StateManager {
       lastFileSyncTime: 0,
       dbFingerprint: null,
       pendingTombstones: {},
+      pullErrorCounts: {},
+      poisonedEnvelopes: [],
     };
   }
 
@@ -134,6 +185,8 @@ export class StateManager {
       this._state.lastFileSyncTime = json.lastFileSyncTime ?? 0;
       this._state.dbFingerprint = this.parseDbFingerprint(json.dbFingerprint);
       this._state.pendingTombstones = this.parsePendingTombstones(json.pendingTombstones);
+      this._state.pullErrorCounts = this.parsePullErrorCounts(json.pullErrorCounts);
+      this._state.poisonedEnvelopes = this.parsePoisonedEnvelopes(json.poisonedEnvelopes);
 
       // Preserve machineId from constructor — don't override with stale file
     } catch {
@@ -155,6 +208,8 @@ export class StateManager {
       lastFileSyncTime: this._state.lastFileSyncTime,
       dbFingerprint: this._state.dbFingerprint,
       pendingTombstones: this._state.pendingTombstones,
+      pullErrorCounts: this._state.pullErrorCounts,
+      poisonedEnvelopes: this._state.poisonedEnvelopes,
     };
 
     atomicWriteFileSync(STATE_FILE, JSON.stringify(json, null, 2));
@@ -333,6 +388,53 @@ export class StateManager {
     this.maybeSave();
   }
 
+  /**
+   * Increment the per-envelope error counter and return the new value.
+   * Keyed by `${kind}:${id}:${server_seq}`. See FINDINGS.md H3.
+   */
+  incrementPullErrorCount(envelopeKey: string): number {
+    const next = (this._state.pullErrorCounts[envelopeKey] ?? 0) + 1;
+    this._state.pullErrorCounts[envelopeKey] = next;
+    this.maybeSave();
+    return next;
+  }
+
+  /**
+   * Drop the counter for an envelope — called on successful apply OR
+   * when we decide to poison-skip (the durable record moves to
+   * `poisonedEnvelopes`).
+   */
+  clearPullErrorCount(envelopeKey: string): void {
+    if (!(envelopeKey in this._state.pullErrorCounts)) return;
+    delete this._state.pullErrorCounts[envelopeKey];
+    this.maybeSave();
+  }
+
+  /**
+   * Record an envelope as permanently skipped. FIFO-capped at
+   * `POISONED_ENVELOPES_MAX` to bound state.json growth under attack.
+   */
+  recordPoisonedEnvelope(entry: {
+    kind: SyncKind;
+    id: string;
+    server_seq: number;
+    lastError?: string;
+  }): void {
+    this._state.poisonedEnvelopes.push({
+      kind: entry.kind,
+      id: entry.id,
+      server_seq: entry.server_seq,
+      skippedAt: Date.now(),
+      lastError: entry.lastError,
+    });
+    if (this._state.poisonedEnvelopes.length > POISONED_ENVELOPES_MAX) {
+      this._state.poisonedEnvelopes = this._state.poisonedEnvelopes.slice(
+        this._state.poisonedEnvelopes.length - POISONED_ENVELOPES_MAX,
+      );
+    }
+    this.maybeSave();
+  }
+
   replaceKnownFiles(entries: FileManifestEntry[]): void {
     this._state.knownFiles = Object.fromEntries(
       entries.map((entry) => [
@@ -386,6 +488,51 @@ export class StateManager {
       if (typeof firstSeenAt !== "number" || !Number.isFinite(firstSeenAt)) continue;
       if (typeof knownTimeUpdated !== "number" || !Number.isFinite(knownTimeUpdated)) continue;
       out[key] = { firstSeenAt, knownTimeUpdated };
+    }
+    return out;
+  }
+
+  private parsePullErrorCounts(value: unknown): Record<string, number> {
+    if (!value || typeof value !== "object") return {};
+    const out: Record<string, number> = {};
+    for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+      if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
+        out[key] = raw;
+      }
+    }
+    return out;
+  }
+
+  private parsePoisonedEnvelopes(
+    value: unknown,
+  ): Array<{ kind: SyncKind; id: string; server_seq: number; skippedAt: number; lastError?: string }> {
+    if (!Array.isArray(value)) return [];
+    const out: Array<{
+      kind: SyncKind;
+      id: string;
+      server_seq: number;
+      skippedAt: number;
+      lastError?: string;
+    }> = [];
+    for (const raw of value) {
+      if (!raw || typeof raw !== "object") continue;
+      const v = raw as Record<string, unknown>;
+      const kind = v["kind"];
+      const id = v["id"];
+      const server_seq = v["server_seq"];
+      const skippedAt = v["skippedAt"];
+      const lastError = v["lastError"];
+      if (typeof kind !== "string") continue;
+      if (typeof id !== "string") continue;
+      if (typeof server_seq !== "number" || !Number.isFinite(server_seq)) continue;
+      if (typeof skippedAt !== "number" || !Number.isFinite(skippedAt)) continue;
+      out.push({
+        kind: kind as SyncKind,
+        id,
+        server_seq,
+        skippedAt,
+        ...(typeof lastError === "string" ? { lastError } : {}),
+      });
     }
     return out;
   }
