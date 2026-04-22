@@ -730,12 +730,19 @@ export class SessionSync {
           this.log("server lacks /sync/heads endpoint, skipping cross-check");
         } else {
           // Network error — be conservative and SKIP this cycle's
-          // unexpected tombstones rather than emit blind. The pending
-          // buffer is left intact so subsequent cycles can resume once
-          // the network recovers; expected deletions still proceed.
+          // unexpected tombstones rather than emit blind. Also clear
+          // the pending-confirmation buffer: if we left it intact, a
+          // long outage would drift `firstSeenAt` far past the 30s
+          // confirmation window and the first recovered cycle would
+          // emit tombstones without any post-recovery re-check. The
+          // detection itself is re-derived cheaply from knownRows vs
+          // live DB on every cycle, so clearing only costs us at most
+          // one cycle of progress through the confirmation window.
+          // Expected deletions still proceed below. See FINDINGS.md H2.
           this.log("getHeads failed, deferring unexpected tombstones this cycle", {
             error: String(err),
           });
+          this.stateManager.clearPendingTombstones();
           return this.formatTombstones(expectedCandidates);
         }
       }

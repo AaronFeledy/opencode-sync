@@ -1833,6 +1833,70 @@ test("getHeads still throws EndpointMissingError on a 404 from /sync/heads", asy
   }
 });
 
+test("H2: getHeads failure clears pendingTombstones to prevent instant-tombstone on long recovery", async () => {
+  // Before the fix, a multi-minute network outage would park pending
+  // entries with a stale firstSeenAt; the first recovered cycle saw
+  // `now - firstSeenAt >> 30s` and emitted tombstones without any
+  // post-recovery confirmation. See FINDINGS.md H2.
+  const dbPath = createDbPath();
+  initDb(dbPath);
+  seedSessionTree(dbPath);
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  // Cycle 1: establish knownRows.
+  await sync.pushAll();
+
+  // Delete a row (not expected) to create an unexpected candidate.
+  const db = new Database(dbPath);
+  db.exec("PRAGMA foreign_keys = ON");
+  db.run("DELETE FROM message WHERE id = ?", ["msg_1"]);
+  db.close();
+
+  // Cycle 2: first observation while getHeads is WORKING → pending
+  // entry is created.
+  client.pushes = [];
+  await sync.pushAll();
+  expect(stateManager.state.pendingTombstones["message:msg_1"]).toBeDefined();
+
+  // Cycle 3: getHeads now fails (simulate a network outage starting).
+  // Pending entry must be cleared so a long outage doesn't drift its
+  // firstSeenAt past the confirmation window.
+  client.headsThrowError = true;
+  client.pushes = [];
+  await sync.pushAll();
+  expect(stateManager.state.pendingTombstones["message:msg_1"]).toBeUndefined();
+  // And we did NOT emit a tombstone for the unexpected candidate.
+  expect(
+    client.pushes.flat().find((e) => e.deleted && e.id === "msg_1"),
+  ).toBeUndefined();
+
+  // Cycle 4: network recovers. Row is still gone. First recovered
+  // cycle should create a FRESH pending entry, not instant-tombstone.
+  client.headsThrowError = false;
+  client.pushes = [];
+  await sync.pushAll();
+  expect(stateManager.state.pendingTombstones["message:msg_1"]).toBeDefined();
+  expect(
+    client.pushes.flat().find((e) => e.deleted && e.id === "msg_1"),
+  ).toBeUndefined();
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
 test("non-getHeads 404s surface as HttpError, not EndpointMissingError", async () => {
   // Regression: previously any 404 anywhere (e.g. a missing blob)
   // would surface as `EndpointMissingError`, which mis-implies
