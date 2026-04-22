@@ -166,3 +166,162 @@ test("upsertBatch preserves per-envelope accepted/stale results in order", () =>
 
   db.close();
 });
+
+// ── H5: blob GC on manifest upsert ─────────────────────────────────
+
+import { writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+
+function writeBlob(db: LedgerDB, content: string): string {
+  const sha = createHash("sha256").update(content).digest("hex");
+  const blobPath = db.getBlobPath(sha);
+  fs.mkdirSync(path.dirname(blobPath), { recursive: true });
+  writeFileSync(blobPath, content);
+  return sha;
+}
+
+test("H5: overwriting a file GCs the old blob", () => {
+  const dir = createDataDir();
+  const db = new LedgerDB(dir, silentLogger);
+
+  const v1 = writeBlob(db, "hello\n");
+  db.upsertManifestEntry({
+    relpath: "a.md",
+    sha256: v1,
+    size: 6,
+    mtime: 1000,
+    machine_id: "m1",
+    deleted: false,
+  });
+  expect(db.hasBlobFile(v1)).toBe(true);
+
+  const v2 = writeBlob(db, "world\n");
+  db.upsertManifestEntry({
+    relpath: "a.md",
+    sha256: v2,
+    size: 6,
+    mtime: 2000,
+    machine_id: "m1",
+    deleted: false,
+  });
+
+  // v2 is kept, v1 is GC'd because no live row points at it anymore.
+  expect(db.hasBlobFile(v2)).toBe(true);
+  expect(db.hasBlobFile(v1)).toBe(false);
+
+  db.close();
+});
+
+test("H5: deleting a file GCs the blob and clears the tombstone sha", () => {
+  const dir = createDataDir();
+  const db = new LedgerDB(dir, silentLogger);
+
+  const sha = writeBlob(db, "secret token\n");
+  db.upsertManifestEntry({
+    relpath: "auth.json",
+    sha256: sha,
+    size: 13,
+    mtime: 1000,
+    machine_id: "m1",
+    deleted: false,
+  });
+  expect(db.hasBlobFile(sha)).toBe(true);
+
+  // Tombstone — older tombstones used to preserve the sha, keeping
+  // the blob fetchable by anyone with the token forever. The GC now
+  // unlinks it and clears the tombstone's sha.
+  db.upsertManifestEntry({
+    relpath: "auth.json",
+    sha256: "",
+    size: 0,
+    mtime: 2000,
+    machine_id: "m1",
+    deleted: true,
+  });
+
+  expect(db.hasBlobFile(sha)).toBe(false);
+  const entry = db.getManifestEntry("auth.json");
+  expect(entry?.deleted).toBe(true);
+  expect(entry?.sha256).toBe("");
+});
+
+test("H5: two paths sharing a sha don't orphan each other", () => {
+  const dir = createDataDir();
+  const db = new LedgerDB(dir, silentLogger);
+
+  const sha = writeBlob(db, "shared content\n");
+  db.upsertManifestEntry({
+    relpath: "a.md",
+    sha256: sha,
+    size: 15,
+    mtime: 1000,
+    machine_id: "m1",
+    deleted: false,
+  });
+  db.upsertManifestEntry({
+    relpath: "b.md",
+    sha256: sha,
+    size: 15,
+    mtime: 1000,
+    machine_id: "m1",
+    deleted: false,
+  });
+  expect(db.hasBlobFile(sha)).toBe(true);
+
+  // Delete a.md — b.md still references the sha, so the blob survives.
+  db.upsertManifestEntry({
+    relpath: "a.md",
+    sha256: "",
+    size: 0,
+    mtime: 2000,
+    machine_id: "m1",
+    deleted: true,
+  });
+  expect(db.hasBlobFile(sha)).toBe(true);
+
+  // Delete b.md — now the blob is orphaned and GC'd.
+  db.upsertManifestEntry({
+    relpath: "b.md",
+    sha256: "",
+    size: 0,
+    mtime: 2000,
+    machine_id: "m1",
+    deleted: true,
+  });
+  expect(db.hasBlobFile(sha)).toBe(false);
+
+  db.close();
+});
+
+test("H5: GC is tolerant of an already-missing blob (idempotent)", () => {
+  const dir = createDataDir();
+  const db = new LedgerDB(dir, silentLogger);
+
+  const sha = writeBlob(db, "test\n");
+  db.upsertManifestEntry({
+    relpath: "a.md",
+    sha256: sha,
+    size: 5,
+    mtime: 1000,
+    machine_id: "m1",
+    deleted: false,
+  });
+
+  // Manually unlink the blob — simulates an out-of-band delete or a
+  // prior failed GC that left state inconsistent.
+  fs.unlinkSync(db.getBlobPath(sha));
+
+  // Overwriting must still succeed (no throw).
+  const v2 = writeBlob(db, "test 2\n");
+  db.upsertManifestEntry({
+    relpath: "a.md",
+    sha256: v2,
+    size: 7,
+    mtime: 2000,
+    machine_id: "m1",
+    deleted: false,
+  });
+  expect(db.hasBlobFile(v2)).toBe(true);
+
+  db.close();
+});

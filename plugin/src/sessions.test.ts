@@ -1942,7 +1942,7 @@ test("H3: poison envelope is skipped past after PULL_POISON_THRESHOLD retries", 
     client.pullResponses.push({
       server_seq: 10,
       more: false,
-      envelopes: [{ ...poisonEnvelope }],
+      envelopes: [{ ...poisonEnvelope } as unknown as SyncEnvelope],
     });
   }
 
@@ -1958,7 +1958,7 @@ test("H3: poison envelope is skipped past after PULL_POISON_THRESHOLD retries", 
   // skipped past; the cursor advances so subsequent pulls work.
   await sync.pull();
   expect(stateManager.state.poisonedEnvelopes.length).toBe(1);
-  expect(stateManager.state.poisonedEnvelopes[0]?.kind).toBe("workspace");
+  expect(stateManager.state.poisonedEnvelopes[0]?.kind as string).toBe("workspace");
   expect(stateManager.state.poisonedEnvelopes[0]?.id).toBe("ws_1");
   expect(stateManager.state.poisonedEnvelopes[0]?.server_seq).toBe(10);
   expect(stateManager.state.pullErrorCounts["workspace:ws_1:10"]).toBeUndefined();
