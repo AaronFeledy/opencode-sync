@@ -109,6 +109,28 @@ export interface SyncState {
     skippedAt: number;
     lastError?: string;
   }>;
+  /**
+   * Secondary index: child rowKey -> parent session id. Used by
+   * `markExpectedDeletion` to cascade-expand a deleted session's
+   * rowKey into all of its children (messages, parts, todos,
+   * session_share), so the deletion-safety threshold doesn't halt on
+   * a routine "delete my biggest session" action.
+   *
+   * Without this index, only todos (prefix-scannable via
+   * `todo:<sessionId>:*`) and `session_share` (keyed directly by
+   * session id) could be cascade-expanded. Messages and parts are
+   * keyed by their own ids (`message:<msgid>`, `part:<partid>`), so
+   * they couldn't be discovered from a session delete alone — leaving
+   * them in `unexpectedCandidates` where they'd trip the 95%
+   * threshold on users whose session tree dominated knownRows.
+   *
+   * Populated in `rememberRows` by parsing `session_id` out of
+   * envelope data for `message`, `part`, `todo`, and `session_share`.
+   * Cleared in `forgetRows`. Persists across restarts. Entries for
+   * kinds with no parent (project, session, permission) are not
+   * stored. See FINDINGS.md M1.
+   */
+  rowParents: Record<string, string>;
 }
 
 /** JSON-serialisable representation of SyncState */
@@ -130,6 +152,7 @@ interface SyncStateJson {
     skippedAt: number;
     lastError?: string;
   }>;
+  rowParents?: Record<string, string>;
 }
 
 /**
@@ -166,6 +189,7 @@ export class StateManager {
       pendingTombstones: {},
       pullErrorCounts: {},
       poisonedEnvelopes: [],
+      rowParents: {},
     };
   }
 
@@ -187,6 +211,7 @@ export class StateManager {
       this._state.pendingTombstones = this.parsePendingTombstones(json.pendingTombstones);
       this._state.pullErrorCounts = this.parsePullErrorCounts(json.pullErrorCounts);
       this._state.poisonedEnvelopes = this.parsePoisonedEnvelopes(json.poisonedEnvelopes);
+      this._state.rowParents = this.parseRowParents(json.rowParents);
 
       // Preserve machineId from constructor — don't override with stale file
     } catch {
@@ -210,6 +235,7 @@ export class StateManager {
       pendingTombstones: this._state.pendingTombstones,
       pullErrorCounts: this._state.pullErrorCounts,
       poisonedEnvelopes: this._state.poisonedEnvelopes,
+      rowParents: this._state.rowParents,
     };
 
     atomicWriteFileSync(STATE_FILE, JSON.stringify(json, null, 2));
@@ -299,13 +325,29 @@ export class StateManager {
     this.maybeSave();
   }
 
-  rememberRows(rows: Record<string, number>): void {
+  /**
+   * Record that a set of rows are known to the server. The `rows` map
+   * values can be either a plain `time_updated` number (legacy shape)
+   * or an object carrying the row's `time_updated` plus an optional
+   * `parent` session id for cascade-expansion via M1's rowParents
+   * index. Mixing shapes in one call is allowed.
+   */
+  rememberRows(rows: Record<string, number | { time_updated: number; parent?: string }>): void {
     let changed = false;
 
-    for (const [rowKey, timeUpdated] of Object.entries(rows)) {
-      if (this._state.knownRows[rowKey] === timeUpdated) continue;
-      this._state.knownRows[rowKey] = timeUpdated;
-      changed = true;
+    for (const [rowKey, entry] of Object.entries(rows)) {
+      const timeUpdated = typeof entry === "number" ? entry : entry.time_updated;
+      const parent = typeof entry === "number" ? undefined : entry.parent;
+
+      if (this._state.knownRows[rowKey] !== timeUpdated) {
+        this._state.knownRows[rowKey] = timeUpdated;
+        changed = true;
+      }
+
+      if (parent !== undefined && this._state.rowParents[rowKey] !== parent) {
+        this._state.rowParents[rowKey] = parent;
+        changed = true;
+      }
     }
 
     if (changed) this.maybeSave();
@@ -315,9 +357,14 @@ export class StateManager {
     let changed = false;
 
     for (const rowKey of rowKeys) {
-      if (!(rowKey in this._state.knownRows)) continue;
-      delete this._state.knownRows[rowKey];
-      changed = true;
+      if (rowKey in this._state.knownRows) {
+        delete this._state.knownRows[rowKey];
+        changed = true;
+      }
+      if (rowKey in this._state.rowParents) {
+        delete this._state.rowParents[rowKey];
+        changed = true;
+      }
     }
 
     if (changed) this.maybeSave();
@@ -533,6 +580,17 @@ export class StateManager {
         skippedAt,
         ...(typeof lastError === "string" ? { lastError } : {}),
       });
+    }
+    return out;
+  }
+
+  private parseRowParents(value: unknown): Record<string, string> {
+    if (!value || typeof value !== "object") return {};
+    const out: Record<string, string> = {};
+    for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+      if (typeof raw === "string" && raw.length > 0) {
+        out[key] = raw;
+      }
     }
     return out;
   }

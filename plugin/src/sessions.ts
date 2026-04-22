@@ -75,6 +75,34 @@ function rowStateKey(kind: SyncKind, id: string): string {
   return `${kind}:${id}`;
 }
 
+/**
+ * Extract the parent session id for child row kinds. Used by M1's
+ * `rowParents` secondary index so `markExpectedDeletion` can cascade-
+ * expand a deleted session into its messages/parts/todos/shares
+ * rather than leaving them in unexpectedCandidates and tripping the
+ * deletion-safety threshold.
+ *
+ * Returns undefined for kinds with no session parent (project,
+ * session, permission) or if the envelope's data lacks a session_id.
+ */
+function envelopeParentSession(envelope: SyncEnvelope): string | undefined {
+  if (
+    envelope.kind !== "message" &&
+    envelope.kind !== "part" &&
+    envelope.kind !== "todo" &&
+    envelope.kind !== "session_share"
+  ) {
+    return undefined;
+  }
+  const data = envelope.data as Record<string, unknown> | null | undefined;
+  if (!data || typeof data !== "object") return undefined;
+  // session_share's rowPrimaryKey is the session id itself, but the
+  // data also carries it via `session_id` in the schema. Prefer the
+  // data field for consistency.
+  const sid = data["session_id"];
+  return typeof sid === "string" && sid.length > 0 ? sid : undefined;
+}
+
 /** Exported for test access only. Parses rowKey back into kind+id. */
 export function parseRowStateKey(rowKey: string): { kind: SyncKind; id: string } | null {
   const separator = rowKey.indexOf(":");
@@ -163,19 +191,33 @@ export class SessionSync {
   markExpectedDeletion(rowKey: string): void {
     this.expectedDeletions.add(rowKey);
 
-    // Auto-expand: if a whole session is being deleted, we know its
-    // todos share the same sessionId prefix in their rowKey. Cascade
-    // them without requiring the caller to enumerate.
+    // Auto-expand: if a whole session is being deleted, every row
+    // whose `rowParents` entry points at this session should also be
+    // marked expected. Without this (M1), users who delete their
+    // biggest session would see messages/parts cascade through the
+    // FK and land in unexpectedCandidates, tripping the 95% threshold
+    // halt on a routine action.
     const parsed = parseRowStateKey(rowKey);
     if (parsed?.kind === "session") {
-      const prefix = `todo:${parsed.id}:`;
+      const sessionId = parsed.id;
+      for (const [childKey, parentSessionId] of Object.entries(
+        this.stateManager.state.rowParents,
+      )) {
+        if (parentSessionId === sessionId) {
+          this.expectedDeletions.add(childKey);
+        }
+      }
+      // Belt-and-braces for the transition window before `rowParents`
+      // is populated (e.g. first sync after upgrade): the legacy
+      // todo-prefix scan + the directly-keyed session_share entry
+      // still fire even if rowParents is empty for this session.
+      const todoPrefix = `todo:${sessionId}:`;
       for (const knownKey of Object.keys(this.stateManager.state.knownRows)) {
-        if (knownKey.startsWith(prefix)) {
+        if (knownKey.startsWith(todoPrefix)) {
           this.expectedDeletions.add(knownKey);
         }
       }
-      // Also the session_share (if any) — the rowKey is just "session_share:<sessionId>"
-      this.expectedDeletions.add(`session_share:${parsed.id}`);
+      this.expectedDeletions.add(`session_share:${sessionId}`);
     }
   }
 
@@ -435,7 +477,7 @@ export class SessionSync {
         this.machineId,
       );
 
-      const rememberedRows: Record<string, number> = {};
+      const rememberedRows: Record<string, { time_updated: number; parent?: string }> = {};
       const forgottenRows = new Set<string>();
 
       // Track the last server_seq we successfully processed BEFORE the
@@ -482,7 +524,10 @@ export class SessionSync {
           if (envelope.deleted) {
             forgottenRows.add(rowKey);
           } else {
-            rememberedRows[rowKey] = envelope.time_updated;
+            const parent = envelopeParentSession(envelope);
+            rememberedRows[rowKey] = parent !== undefined
+              ? { time_updated: envelope.time_updated, parent }
+              : { time_updated: envelope.time_updated };
           }
           // Clear any prior error counter on success.
           if (envelopeKey in this.stateManager.state.pullErrorCounts) {
@@ -893,12 +938,16 @@ export class SessionSync {
     stale: Array<{ kind: SyncKind; id: string }>,
   ): void {
     const staleKeys = new Set(stale.map((entry) => rowStateKey(entry.kind, entry.id)));
-    const rememberedRows = Object.fromEntries(
-      envelopes
-        .filter((envelope) => !envelope.deleted)
-        .filter((envelope) => !staleKeys.has(rowStateKey(envelope.kind, envelope.id)))
-        .map((envelope) => [rowStateKey(envelope.kind, envelope.id), envelope.time_updated]),
-    );
+    const rememberedRows: Record<string, { time_updated: number; parent?: string }> = {};
+    for (const envelope of envelopes) {
+      if (envelope.deleted) continue;
+      const rowKey = rowStateKey(envelope.kind, envelope.id);
+      if (staleKeys.has(rowKey)) continue;
+      const parent = envelopeParentSession(envelope);
+      rememberedRows[rowKey] = parent !== undefined
+        ? { time_updated: envelope.time_updated, parent }
+        : { time_updated: envelope.time_updated };
+    }
 
     if (Object.keys(rememberedRows).length > 0) {
       this.stateManager.rememberRows(rememberedRows);

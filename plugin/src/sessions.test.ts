@@ -362,19 +362,26 @@ test("pushAll fast-paths tombstones when the row is marked as an expected deleti
   db.close();
   sync.markExpectedDeletion("session:ses_1");
 
-  // Cycle 2: session+todo go through immediately; message+part still
-  // need confirmation (they don't share a session-id prefix in their
-  // rowKey, so the cascade auto-expansion can't catch them).
+  // Cycle 2: every cascade child of the deleted session should fast-
+  // path through the tombstone pipeline. After M1 added the rowParents
+  // secondary index, messages/parts/todos are all discovered via their
+  // parent session and flow through on the same cycle as the session
+  // itself (session_share isn't seeded by seedSessionTree so it's not
+  // in this list). Before M1, messages and parts were stuck in
+  // pendingTombstones awaiting two-cycle confirmation.
   client.pushes = [];
   await sync.pushAll();
   const fastPath = (client.pushes[0] ?? []).map((e) => `${e.kind}:${e.id}`).sort();
-  expect(fastPath).toEqual(["session:ses_1", "todo:ses_1:0"]);
-
-  // message and part are still pending confirmation.
-  expect(Object.keys(stateManager.state.pendingTombstones).sort()).toEqual([
+  expect(fastPath).toEqual([
     "message:msg_1",
     "part:part_1",
+    "session:ses_1",
+    "todo:ses_1:0",
   ]);
+
+  // With full cascade-expansion there should be NO pending entries
+  // left for this session's descendants.
+  expect(Object.keys(stateManager.state.pendingTombstones)).toEqual([]);
 
   reader.close();
   writer.close();
@@ -549,12 +556,20 @@ test("threshold is permissive (95%) when at least one expected deletion is prese
 
   await sync.pushAll();
 
-  // PERMISSIVE branch fired → no halt, candidates flow through (session
-  // is expected → fast-path tombstone; msg/part are unexpected → pending).
+  // After M1 (rowParents cascade): every descendant of ses_a is marked
+  // expected at deletion time, so there are zero unexpectedCandidates
+  // from ses_a and the permissive-branch check never even needs to
+  // fire. No halt, no pending entries for ses_a children, and all
+  // cascade rows fast-path straight to tombstones.
   expect(isSyncHalted()).toBe(false);
   expect(sync.isHalted()).toBe(false);
-  // Pending buffer holds the cascade msg/part (they didn't fast-path).
-  expect(Object.keys(stateManager.state.pendingTombstones).length).toBeGreaterThan(50);
+  // With cascade expansion working, the pending buffer is empty for
+  // ses_a's descendants — they all fast-path.
+  for (const k of Object.keys(stateManager.state.pendingTombstones)) {
+    // If anything landed in pending, it must NOT be from ses_a.
+    const parent = stateManager.state.rowParents[k];
+    expect(parent).not.toBe("ses_a");
+  }
 
   reader.close();
   writer.close();
@@ -748,23 +763,22 @@ test("server cross-check defers tombstones on transient network failure", async 
 
   await sync.pushAll();
 
+  // Delete a message directly without marking expected — this creates
+  // a genuine unexpectedCandidate that exercises the getHeads-failure
+  // defer path. (After M1, deleting a whole session would cascade
+  // every descendant into expectedDeletions via rowParents, leaving
+  // nothing unexpected to defer.)
   const db = new Database(dbPath);
   db.exec("PRAGMA foreign_keys = ON");
-  db.run("DELETE FROM session WHERE id = ?", ["ses_1"]);
+  db.run("DELETE FROM message WHERE id = ?", ["msg_1"]);
   db.close();
-
-  // Mark only the session as expected (cascade rows are unexpected).
-  sync.markExpectedDeletion("session:ses_1");
 
   client.pushes = [];
   await sync.pushAll();
-  // Expected tombstones (session + todo via cascade) flowed.
-  // Unexpected ones (message + part) deferred.
+  // The unexpected message tombstone was deferred by the getHeads
+  // failure — NOT emitted this cycle.
   const emitted = client.pushes.flat().map((e) => `${e.kind}:${e.id}`).sort();
-  expect(emitted).toContain("session:ses_1");
-  expect(emitted).toContain("todo:ses_1:0");
   expect(emitted).not.toContain("message:msg_1");
-  expect(emitted).not.toContain("part:part_1");
 
   reader.close();
   writer.close();
@@ -2172,4 +2186,148 @@ test("M7: parseRowStateKey rejects an unknown kind not in SYNC_KINDS", () => {
 test("M7: parseRowStateKey accepts valid kind+id (including composite todo)", () => {
   expect(parseRowStateKey("session:ses_1")).toEqual({ kind: "session", id: "ses_1" });
   expect(parseRowStateKey("todo:ses_1:0")).toEqual({ kind: "todo", id: "ses_1:0" });
+});
+
+// ── M1: rowParents secondary index enables cascade-expansion ──
+
+test("M1: rowParents is populated for message/part/todo/session_share on push", async () => {
+  const dbPath = createDbPath();
+  initDb(dbPath);
+  seedSessionTree(dbPath);
+
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    new MockClient() as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  await sync.pushAll();
+
+  // message, part, todo should all point at ses_1 in rowParents.
+  expect(stateManager.state.rowParents["message:msg_1"]).toBe("ses_1");
+  expect(stateManager.state.rowParents["part:part_1"]).toBe("ses_1");
+  expect(stateManager.state.rowParents["todo:ses_1:0"]).toBe("ses_1");
+
+  // session / project should NOT have parent entries (they're roots).
+  expect(stateManager.state.rowParents["session:ses_1"]).toBeUndefined();
+  expect(stateManager.state.rowParents["project:proj_1"]).toBeUndefined();
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("M1: session deletion of a large session does not halt (cascade marked expected)", async () => {
+  // The motivating scenario: a user with one session dominating
+  // knownRows deletes it. 100+ messages+parts cascade via FK. Before
+  // M1, only session/todo/share were auto-expanded as expected →
+  // msgs+parts landed in unexpectedCandidates → 95% threshold trips →
+  // HALT on a routine user action.
+  //
+  // After M1, rowParents maps each child to its session at remember-
+  // time, so markExpectedDeletion walks the index and marks them all
+  // expected. No halt, no pending entries for the cascade.
+  const dbPath = createDbPath();
+  initDb(dbPath);
+
+  const seed = new Database(dbPath);
+  seed.exec("PRAGMA foreign_keys = ON");
+  seed.run(
+    `INSERT INTO project (id, worktree, vcs, name, icon_url, icon_color, time_created, time_updated, time_initialized, sandboxes, commands)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ["proj_m1", "/tmp/m1", "git", "M1", null, null, 1, 1, 1, "[]", null],
+  );
+  seed.run(
+    `INSERT INTO session (id, project_id, parent_id, slug, directory, title, version, share_url, summary_additions, summary_deletions, summary_files, summary_diffs, revert, permission, time_created, time_updated, time_compacting, time_archived, workspace_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ["ses_big", "proj_m1", null, "big", "/tmp/m1", "Big", "1", null, null, null, null, null, null, null, 1, 1_000, null, null, null],
+  );
+  for (let i = 0; i < 80; i++) {
+    seed.run(
+      "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
+      [`bm_${i}`, "ses_big", 1, 1_000, '{}'],
+    );
+    seed.run(
+      "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)",
+      [`bp_${i}`, `bm_${i}`, "ses_big", 1, 1_000, '{}'],
+    );
+  }
+  seed.close();
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  // Cycle 1: populate knownRows and rowParents.
+  await sync.pushAll();
+  const knownBefore = Object.keys(stateManager.state.knownRows).length;
+  expect(knownBefore).toBeGreaterThan(TOMBSTONE_MIN_KNOWN_FOR_TEST);
+
+  // Delete the big session — FK cascades to all 160 children.
+  const db = new Database(dbPath);
+  db.exec("PRAGMA foreign_keys = ON");
+  db.run("DELETE FROM session WHERE id = ?", ["ses_big"]);
+  db.close();
+
+  sync.markExpectedDeletion("session:ses_big");
+
+  client.pushes = [];
+  await sync.pushAll();
+
+  // No halt — this is the whole point of M1.
+  expect(isSyncHalted()).toBe(false);
+  expect(sync.isHalted()).toBe(false);
+
+  // All descendants fast-pathed to tombstones.
+  const emitted = client.pushes.flat().filter((e) => e.deleted).map((e) => `${e.kind}:${e.id}`).sort();
+  expect(emitted).toContain("session:ses_big");
+  expect(emitted.filter((k) => k.startsWith("message:")).length).toBe(80);
+  expect(emitted.filter((k) => k.startsWith("part:")).length).toBe(80);
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("M1: rowParents is forgotten when the row is forgotten", async () => {
+  const dbPath = createDbPath();
+  initDb(dbPath);
+  seedSessionTree(dbPath);
+
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    new MockClient() as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  await sync.pushAll();
+  expect(stateManager.state.rowParents["message:msg_1"]).toBe("ses_1");
+
+  stateManager.forgetRows(["message:msg_1"]);
+  expect(stateManager.state.rowParents["message:msg_1"]).toBeUndefined();
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
 });
