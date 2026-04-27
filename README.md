@@ -45,9 +45,9 @@ opencode-sync/
 
 ## Installation
 
-> **Not on npm.** This is a personal project — both the plugin and the server are installed by cloning this repo on each machine and using `bun link` for the plugin and a `bun build` + systemd unit for the server.
+> **Not on npm.** This is a personal project — both the plugin and the server are installed by cloning this repo on each machine. The plugin loads from the clone directory directly (no build step); the server compiles to a single binary deployed via systemd.
 
-The order matters: **set up the server first**, then link the plugin on every machine that runs opencode (including the VPS itself, since it runs `opencode serve`).
+The order matters: **set up the server first**, then add the plugin entry on every machine that runs opencode (including the VPS itself, since it runs `opencode serve`).
 
 ### 1. VPS — server + plugin
 
@@ -55,10 +55,10 @@ The order matters: **set up the server first**, then link the plugin on every ma
 git clone https://github.com/AaronFeledy/opencode-sync.git ~/opencode-sync
 cd ~/opencode-sync
 bun install
-bun run build
+bun run --cwd server build
 ```
 
-Then follow [`server/README.md`](./server/README.md) to install the systemd unit, and [`plugin/README.md`](./plugin/README.md) to link the plugin into the VPS's own opencode.
+Then follow [`server/README.md`](./server/README.md) to install the systemd unit, and [`plugin/README.md`](./plugin/README.md) to register the plugin in the VPS's own `opencode.json`.
 
 Save the `OPENCODE_SYNC_TOKEN` you generate during server setup — desktop and laptop both need it.
 
@@ -70,28 +70,31 @@ On each machine:
 git clone https://github.com/AaronFeledy/opencode-sync.git ~/projects/opencode-sync
 cd ~/projects/opencode-sync
 bun install
-bun run --cwd plugin build
-
-# Drop a symlink into opencode's auto-load plugin directory
-mkdir -p ~/.config/opencode/plugins
-ln -s ~/projects/opencode-sync/plugin/dist/index.js \
-      ~/.config/opencode/plugins/opencode-sync-plugin.js
 ```
 
-Then create `~/.config/opencode/opencode-sync.jsonc` per [`plugin/README.md`](./plugin/README.md). Use a unique `machine_id` on each machine (e.g. `desktop`, `laptop`, `vps`). No `opencode.json` change is needed — opencode auto-loads everything in `~/.config/opencode/plugins/`.
+Then add the clone path to `~/.config/opencode/opencode.json`'s `plugin` array:
+
+```jsonc
+{
+  "plugin": [
+    "/home/you/projects/opencode-sync"
+  ]
+}
+```
+
+And create `~/.config/opencode/opencode-sync.jsonc` per [`plugin/README.md`](./plugin/README.md). Use a unique `machine_id` on each machine (e.g. `desktop`, `laptop`, `vps`).
 
 ### 3. Updating
 
-On every machine:
+On plugin-only machines:
 
 ```bash
-cd ~/opencode-sync   # or wherever you cloned
+cd ~/projects/opencode-sync
 git pull
 bun install
-bun run build        # or `bun run --cwd plugin build` on client-only machines
 ```
 
-On the VPS, also redeploy the server binary and restart the unit (see [`server/README.md`](./server/README.md#updating)).
+On the VPS, also rebuild the server binary and restart the unit (see [`server/README.md`](./server/README.md#updating)).
 
 ## License
 

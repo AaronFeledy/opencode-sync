@@ -3,6 +3,7 @@
   "version": "0.0.1",
   "private": true,
   "description": "Cross-machine session + config sync for opencode, coordinated through a self-hosted server on your VPS.",
+  "main": "./plugin/src/index.ts",
   "workspaces": [
     "shared",
     "server",
