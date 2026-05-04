@@ -326,6 +326,22 @@ export class LedgerDB {
     // they arrive from a different machine. Without this guard, a peer that
     // pulls rows and then accidentally push-scans them back can churn
     // `machine_id` and allocate fresh `server_seq`s for unchanged data.
+    //
+    // Note: this is a byte-exact JSON string compare (not deep equality). It
+    // relies on every peer producing identical key ordering for the same
+    // logical row — which holds because (a) all peers run the same opencode
+    // binary against the same SQLite schema, (b) `SELECT *` returns columns in
+    // DDL order, (c) `JSON.stringify` preserves insertion order, and (d) the
+    // server's JSON.parse → JSON.stringify roundtrip preserves order too. If
+    // any of those ever changes (schema migration with reordered columns,
+    // building envelopes from a typed object instead of a SQL row, switching
+    // SQLite drivers), this fast path silently turns into the machine_id
+    // tie-break below — that's still correct (no data loss), just one extra
+    // server_seq allocation per echoed row. Deep / sorted-key equality would
+    // remove the assumption but doubles the per-push CPU cost on a hot path
+    // whose entire purpose is to *save* server work, so we accept the
+    // assumption and rely on the plugin-side `lastPushedRowIds` dedup as the
+    // primary defense (this server check is a fallback for state-reset peers).
     if (existing.deleted === incomingDeleted && existing.data === incomingData) {
       return { accepted: true };
     }

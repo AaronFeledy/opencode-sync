@@ -337,176 +337,176 @@ export class SessionSync {
     // Persist state as each batch completes. Startup pushes can be long, and
     // an interrupted process should resume from the last confirmed batch
     // instead of replaying everything from the beginning.
-      const since = this.stateManager.pushReadSince();
-      options.progress?.(`scanning local changes since ${since}`);
+    const since = this.stateManager.pushReadSince();
+    options.progress?.(`scanning local changes since ${since}`);
 
-      let totalSeen = 0;
-      let totalAccepted = 0;
-      let totalStale = 0;
-      let totalTombstones = 0;
-      let totalAlreadySynced = 0;
-      let maxPushedTime = 0;
-      let maxCheckedLiveTime = 0;
-      let pendingBatch: SyncEnvelope[] = [];
+    let totalSeen = 0;
+    let totalAccepted = 0;
+    let totalStale = 0;
+    let totalTombstones = 0;
+    let totalAlreadySynced = 0;
+    let maxPushedTime = 0;
+    let maxCheckedLiveTime = 0;
+    let pendingBatch: SyncEnvelope[] = [];
 
-      const flushBatch = async (): Promise<void> => {
-        if (pendingBatch.length === 0) return;
-        const batch = pendingBatch;
-        pendingBatch = [];
-        let batchMaxLiveTime = 0;
+    const flushBatch = async (): Promise<void> => {
+      if (pendingBatch.length === 0) return;
+      const batch = pendingBatch;
+      pendingBatch = [];
+      let batchMaxLiveTime = 0;
 
-        // Filter already-pushed inside the flush so the streaming loop
-        // doesn't have to know about the dedup set. Most batches will
-        // pass through unchanged on a steady-state sync; on a re-sync
-        // after a crash the dedup avoids re-pushing rows we already
-        // confirmed.
-        const toPush: SyncEnvelope[] = [];
-        for (const e of batch) {
-          if (!e.deleted && e.time_updated > batchMaxLiveTime) {
-            batchMaxLiveTime = e.time_updated;
-          }
-
-          const pushedKey = `${e.kind}:${e.id}:${e.time_updated}`;
-          if (this.stateManager.state.lastPushedRowIds.has(pushedKey)) {
-            totalAlreadySynced++;
-            continue;
-          }
-
-          const knownTime = this.stateManager.state.knownRows[rowStateKey(e.kind, e.id)];
-          if (knownTime !== undefined && knownTime >= e.time_updated) {
-            totalAlreadySynced++;
-            continue;
-          }
-
-          toPush.push(e);
+      // Filter already-pushed inside the flush so the streaming loop
+      // doesn't have to know about the dedup set. Most batches will
+      // pass through unchanged on a steady-state sync; on a re-sync
+      // after a crash the dedup avoids re-pushing rows we already
+      // confirmed.
+      const toPush: SyncEnvelope[] = [];
+      for (const e of batch) {
+        if (!e.deleted && e.time_updated > batchMaxLiveTime) {
+          batchMaxLiveTime = e.time_updated;
         }
 
-        if (toPush.length === 0) {
-          if (batchMaxLiveTime > 0) {
-            this.stateManager.advancePushedRowTime(batchMaxLiveTime);
-          }
-          return;
+        const pushedKey = `${e.kind}:${e.id}:${e.time_updated}`;
+        if (this.stateManager.state.lastPushedRowIds.has(pushedKey)) {
+          totalAlreadySynced++;
+          continue;
         }
 
-        const res = await this.client.push(this.machineId, toPush);
-
-        await this.stateManager.withBatch(async () => {
-          this.stateManager.markPushed(
-            toPush.map((e) => `${e.kind}:${e.id}:${e.time_updated}`),
-          );
-
-          this.rememberAcceptedRows(toPush, res.stale);
-          this.forgetAcceptedTombstones(toPush, res.stale);
-
-          if (batchMaxLiveTime > 0) {
-            this.stateManager.advancePushedRowTime(batchMaxLiveTime);
-          }
-        });
-
-        totalAccepted += res.accepted.length;
-        totalStale += res.stale.length;
-
-        for (const env of toPush) {
-          if (env.time_updated > maxPushedTime) maxPushedTime = env.time_updated;
+        const knownTime = this.stateManager.state.knownRows[rowStateKey(e.kind, e.id)];
+        if (knownTime !== undefined && knownTime >= e.time_updated) {
+          totalAlreadySynced++;
+          continue;
         }
 
-        options.progress?.(
-          `push: accepted ${totalAccepted}/${totalSeen} checked` +
-            (totalStale > 0 ? `, ${totalStale} stale` : "") +
-            (totalAlreadySynced > 0 ? `, ${totalAlreadySynced} already synced` : ""),
-        );
-      };
-
-      // Stream rows from every kind. Generator yields one envelope at a
-      // time, so peak memory is roughly PUSH_BATCH_SIZE envelopes plus
-      // whatever bun:sqlite buffers internally for the active statement.
-      for (const env of this.dbReader.iterateAllEnvelopes(since, this.machineId)) {
-        pendingBatch.push(env);
-        totalSeen++;
-        if (env.time_updated > maxCheckedLiveTime) maxCheckedLiveTime = env.time_updated;
-        if (pendingBatch.length >= PUSH_BATCH_SIZE) {
-          await flushBatch();
-        }
+        toPush.push(e);
       }
 
-      // Compute deletion envelopes through the safety-guarded async path.
-      // Returns null when the guard halted the cycle (threshold tripped,
-      // fingerprint mismatch, etc.) — see buildDeletionEnvelopes for the
-      // full ordering. We still flush the live-row batches above so the
-      // user's actual data keeps making it to the server.
-      options.progress?.("checking for deleted rows");
-      const tombstones = await this.buildDeletionEnvelopes();
-      if (tombstones === null) {
-        // Halted. Flush any pending live rows, then return.
-        await flushBatch();
-        if (totalSeen > 0) {
-          const maxSyncedTime = Math.max(maxPushedTime, maxCheckedLiveTime);
-          if (maxSyncedTime > 0) {
-            this.stateManager.advancePushedRowTime(maxSyncedTime);
-          }
-          this.log("pushAll partial — live rows pushed, deletions halted", {
-            total: totalSeen,
-            accepted: totalAccepted,
-            stale: totalStale,
-          });
+      if (toPush.length === 0) {
+        if (batchMaxLiveTime > 0) {
+          this.stateManager.advancePushedRowTime(batchMaxLiveTime);
         }
-        options.progress?.(
-          `push: accepted ${totalAccepted}/${totalSeen} checked; deletions halted`,
-        );
         return;
       }
 
-      options.progress?.(`queued ${tombstones.length} deleted rows`);
+      const res = await this.client.push(this.machineId, toPush);
 
-      // Tombstones come from comparing knownRows to live PKs — bounded by
-      // the size of knownRows (PKs only, no row data), so loading them
-      // all is fine.
-      for (const env of tombstones) {
-        pendingBatch.push(env);
-        totalSeen++;
-        totalTombstones++;
-        if (pendingBatch.length >= PUSH_BATCH_SIZE) {
-          await flushBatch();
+      await this.stateManager.withBatch(async () => {
+        this.stateManager.markPushed(
+          toPush.map((e) => `${e.kind}:${e.id}:${e.time_updated}`),
+        );
+
+        this.rememberAcceptedRows(toPush, res.stale);
+        this.forgetAcceptedTombstones(toPush, res.stale);
+
+        if (batchMaxLiveTime > 0) {
+          this.stateManager.advancePushedRowTime(batchMaxLiveTime);
         }
-      }
-
-      // Final partial batch.
-      await flushBatch();
-
-      // Successful tombstone emission means the candidates won't recur
-      // next cycle (server has them, knownRows lost them via
-      // forgetAcceptedTombstones). Drain expectedDeletions to avoid
-      // unbounded growth from accumulated session.deleted events.
-      if (totalTombstones > 0) {
-        this.expectedDeletions.clear();
-      }
-
-      if (totalSeen === 0) {
-        this.log("pushAll: nothing new to push");
-        options.progress?.("push: already up to date");
-        return;
-      }
-
-      // Advance the push cursor so the next pushAll's delta-read can skip
-      // everything older than this batch (with a safety margin for clock
-      // skew). See StateManager.pushReadSince for details.
-      const maxSyncedTime = Math.max(maxPushedTime, maxCheckedLiveTime);
-      if (maxSyncedTime > 0) {
-        this.stateManager.advancePushedRowTime(maxSyncedTime);
-      }
-
-      this.log("pushAll complete", {
-        total: totalSeen,
-        accepted: totalAccepted,
-        stale: totalStale,
-        tombstones: totalTombstones,
       });
+
+      totalAccepted += res.accepted.length;
+      totalStale += res.stale.length;
+
+      for (const env of toPush) {
+        if (env.time_updated > maxPushedTime) maxPushedTime = env.time_updated;
+      }
+
       options.progress?.(
         `push: accepted ${totalAccepted}/${totalSeen} checked` +
-          (totalTombstones > 0 ? `, ${totalTombstones} deleted` : "") +
           (totalStale > 0 ? `, ${totalStale} stale` : "") +
           (totalAlreadySynced > 0 ? `, ${totalAlreadySynced} already synced` : ""),
       );
+    };
+
+    // Stream rows from every kind. Generator yields one envelope at a
+    // time, so peak memory is roughly PUSH_BATCH_SIZE envelopes plus
+    // whatever bun:sqlite buffers internally for the active statement.
+    for (const env of this.dbReader.iterateAllEnvelopes(since, this.machineId)) {
+      pendingBatch.push(env);
+      totalSeen++;
+      if (env.time_updated > maxCheckedLiveTime) maxCheckedLiveTime = env.time_updated;
+      if (pendingBatch.length >= PUSH_BATCH_SIZE) {
+        await flushBatch();
+      }
+    }
+
+    // Compute deletion envelopes through the safety-guarded async path.
+    // Returns null when the guard halted the cycle (threshold tripped,
+    // fingerprint mismatch, etc.) — see buildDeletionEnvelopes for the
+    // full ordering. We still flush the live-row batches above so the
+    // user's actual data keeps making it to the server.
+    options.progress?.("checking for deleted rows");
+    const tombstones = await this.buildDeletionEnvelopes();
+    if (tombstones === null) {
+      // Halted. Flush any pending live rows, then return.
+      await flushBatch();
+      if (totalSeen > 0) {
+        const maxSyncedTime = Math.max(maxPushedTime, maxCheckedLiveTime);
+        if (maxSyncedTime > 0) {
+          this.stateManager.advancePushedRowTime(maxSyncedTime);
+        }
+        this.log("pushAll partial — live rows pushed, deletions halted", {
+          total: totalSeen,
+          accepted: totalAccepted,
+          stale: totalStale,
+        });
+      }
+      options.progress?.(
+        `push: accepted ${totalAccepted}/${totalSeen} checked; deletions halted`,
+      );
+      return;
+    }
+
+    options.progress?.(`queued ${tombstones.length} deleted rows`);
+
+    // Tombstones come from comparing knownRows to live PKs — bounded by
+    // the size of knownRows (PKs only, no row data), so loading them
+    // all is fine.
+    for (const env of tombstones) {
+      pendingBatch.push(env);
+      totalSeen++;
+      totalTombstones++;
+      if (pendingBatch.length >= PUSH_BATCH_SIZE) {
+        await flushBatch();
+      }
+    }
+
+    // Final partial batch.
+    await flushBatch();
+
+    // Successful tombstone emission means the candidates won't recur
+    // next cycle (server has them, knownRows lost them via
+    // forgetAcceptedTombstones). Drain expectedDeletions to avoid
+    // unbounded growth from accumulated session.deleted events.
+    if (totalTombstones > 0) {
+      this.expectedDeletions.clear();
+    }
+
+    if (totalSeen === 0) {
+      this.log("pushAll: nothing new to push");
+      options.progress?.("push: already up to date");
+      return;
+    }
+
+    // Advance the push cursor so the next pushAll's delta-read can skip
+    // everything older than this batch (with a safety margin for clock
+    // skew). See StateManager.pushReadSince for details.
+    const maxSyncedTime = Math.max(maxPushedTime, maxCheckedLiveTime);
+    if (maxSyncedTime > 0) {
+      this.stateManager.advancePushedRowTime(maxSyncedTime);
+    }
+
+    this.log("pushAll complete", {
+      total: totalSeen,
+      accepted: totalAccepted,
+      stale: totalStale,
+      tombstones: totalTombstones,
+    });
+    options.progress?.(
+      `push: accepted ${totalAccepted}/${totalSeen} checked` +
+        (totalTombstones > 0 ? `, ${totalTombstones} deleted` : "") +
+        (totalStale > 0 ? `, ${totalStale} stale` : "") +
+        (totalAlreadySynced > 0 ? `, ${totalAlreadySynced} already synced` : ""),
+    );
   }
 
   /**
@@ -540,7 +540,6 @@ export class SessionSync {
       const rememberedRows: Record<string, { time_updated: number; parent?: string }> = {};
       const forgottenRows = new Set<string>();
       const convergedPushedIds: string[] = [];
-      let maxConvergedTime = 0;
 
       // Track the last server_seq we successfully processed BEFORE the
       // first error in this page. If anything errors, we advance the
@@ -599,9 +598,6 @@ export class SessionSync {
         if (result === "applied" || result === "skipped") {
           const rowKey = rowStateKey(envelope.kind, envelope.id);
           convergedPushedIds.push(`${envelope.kind}:${envelope.id}:${envelope.time_updated}`);
-          if (!envelope.deleted && envelope.time_updated > maxConvergedTime) {
-            maxConvergedTime = envelope.time_updated;
-          }
 
           if (envelope.deleted) {
             forgottenRows.add(rowKey);
@@ -687,9 +683,13 @@ export class SessionSync {
       if (convergedPushedIds.length > 0) {
         this.stateManager.markPushed(convergedPushedIds);
       }
-      if (maxConvergedTime > 0) {
-        this.stateManager.advancePushedRowTime(maxConvergedTime);
-      }
+
+      // Note: do NOT advance lastPushedRowTime here based on remote envelope
+      // timestamps. Doing so clamps to Date.now() (via advancePushedRowTime)
+      // and causes pushReadSince(cursor - 60_000) to skip local-only rows
+      // older than ~60s on a fresh-state machine. The dedup checks in
+      // flushBatch (lastPushedRowIds + knownRows[knownTime] >= e.time_updated)
+      // are sufficient to suppress echoes without advancing the push cursor.
 
       if (firstErrorSeq !== null) {
         // Advance only past the prefix of cleanly-applied envelopes (if

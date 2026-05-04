@@ -1234,6 +1234,91 @@ test("pull marks idempotent skipped rows so state-reset peers do not echo them",
   fs.rmSync(dbPath, { force: true });
 });
 
+// Regression for: pull() advancing the push cursor based on remote
+// envelope time_updated would clamp to Date.now() and shift
+// pushReadSince() up by minutes/hours, silently filtering older
+// local-only rows out of the next push scan. Realistic timestamps
+// (Date.now()-style) are required to expose the bug — the older
+// uniform `5_000` constants in sibling tests stay below the clamp.
+test("pull does not skip older local-only rows when remote envelopes carry recent timestamps", async () => {
+  const dbPath = createDbPath();
+  initDb(dbPath);
+
+  const now = Date.now();
+  // Local-only project written ~10 minutes ago — well outside the 60s
+  // pushReadSince margin.
+  const localOldTime = now - 10 * 60_000;
+  const db = new Database(dbPath);
+  db.run(
+    `INSERT INTO project (id, worktree, vcs, name, icon_url, icon_color, time_created, time_updated, time_initialized, sandboxes, commands)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ["proj_local_old", "/tmp/local", "git", "Local", null, null, 1, localOldTime, 1, "[]", null],
+  );
+  db.close();
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  // Remote project the peer pushed "just now" — its time_updated
+  // matches realistic production traffic.
+  const remoteTime = now - 1_000;
+  client.pullResponses = [{
+    server_seq: 1,
+    more: false,
+    envelopes: [{
+      kind: "project",
+      id: "proj_remote",
+      machine_id: "laptop",
+      time_updated: remoteTime,
+      server_seq: 1,
+      deleted: false,
+      data: {
+        id: "proj_remote",
+        worktree: "/tmp/remote",
+        vcs: "git",
+        name: "Remote",
+        icon_url: null,
+        icon_color: null,
+        time_created: 1,
+        time_updated: remoteTime,
+        time_initialized: 1,
+        sandboxes: "[]",
+        commands: null,
+      },
+    }],
+  }];
+
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  await sync.pull();
+  // The pre-fix code would advance lastPushedRowTime to ~Date.now() here,
+  // so pushReadSince() would return ~now - 60_000, filtering proj_local_old
+  // (10 minutes old) out of iterateAllEnvelopes.
+  await sync.pushAll();
+
+  const pushedLocal = client.pushes.flat().find(
+    (env) => env.kind === "project" && env.id === "proj_local_old",
+  );
+  expect(pushedLocal).toBeDefined();
+  // And the remote echo must NOT be re-pushed (dedup still works).
+  const pushedEcho = client.pushes.flat().find(
+    (env) => env.kind === "project" && env.id === "proj_remote",
+  );
+  expect(pushedEcho).toBeUndefined();
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
 test("pull conflicts remain pushable on the next pushAll", async () => {
   const dbPath = createDbPath();
   initDb(dbPath);
@@ -1298,6 +1383,19 @@ test("pull conflicts remain pushable on the next pushAll", async () => {
   fs.rmSync(dbPath, { force: true });
 });
 
+// Note on the expected count `54`: seedSessionTree writes 5 rows (project,
+// session, msg_1, part, todo); the loop below adds 149 more messages. Total
+// 154 rows, minus PUSH_BATCH_SIZE = 100 pushed in batch 1, leaves 54. If
+// PUSH_BATCH_SIZE changes, update this assertion.
+//
+// Note on timestamps: every row uses time_updated = 1_000, well below the
+// 60s PUSH_CURSOR_MARGIN_MS. After batch 1, lastPushedRowTime = 1_000 and
+// pushReadSince() = max(0, 1_000 - 60_000) = 0, so on resume
+// iterateAllEnvelopes rescans every row and the lastPushedRowIds dedup set
+// does the actual work of skipping the already-pushed batch. Realistic
+// Date.now()-style timestamps would behave identically (rows are written
+// sub-millisecond apart, so all 154 stay within the 60s margin). This test
+// exercises persistence-across-crash, not cursor filtering.
 test("pushAll persists completed batches so an interrupted push can resume", async () => {
   const dbPath = createDbPath();
   initDb(dbPath);
