@@ -130,17 +130,19 @@ export const server: Plugin = async (_input, _options) => {
   const client = new SyncClient(config.serverUrl, config.token);
 
   // 3. Verify server connectivity
-  boot.step("checking sync server");
+  boot.step("connecting to sync server");
   try {
     const health = await client.health();
     log("connected to server", {
       version: health.version,
       serverTime: health.time,
     });
+    boot.step(`connected to sync server (${health.version})`);
   } catch (err) {
     log("warning: server unreachable at startup, will retry", {
       error: String(err),
     });
+    boot.step("sync server unreachable; will retry in background");
   }
 
   // 4. Create state manager
@@ -236,9 +238,12 @@ export const server: Plugin = async (_input, _options) => {
    * different blast radius, has its own less-catastrophic safety
    * properties (per-file SHA cross-check in files.ts).
    */
-  const runRowSync = async (label: string): Promise<void> => {
+  const runRowSync = async (label: string, progress?: (message: string) => void): Promise<void> => {
     const sync = ensureDb();
-    if (!sync) return;
+    if (!sync) {
+      progress?.("opencode database not available yet");
+      return;
+    }
 
     if (isSyncHalted()) {
       if (!haltLogged) {
@@ -250,6 +255,7 @@ export const server: Plugin = async (_input, _options) => {
         });
         haltLogged = true;
       }
+      progress?.("halted by deletion-safety guard");
       return;
     }
 
@@ -302,10 +308,11 @@ export const server: Plugin = async (_input, _options) => {
       // recovery instructions, which is useful diagnostic context that
       // the trip log above doesn't include. After that, `haltLogged`
       // latches normally and stays quiet until the marker is cleared.
+      progress?.("halted after database safety check");
       return;
     }
 
-    await sync.sync();
+    await sync.sync({ progress });
 
     // Capture fingerprint AFTER a successful sync. Doing this on every
     // sync (instead of only on first observation) keeps us tracking
@@ -323,8 +330,9 @@ export const server: Plugin = async (_input, _options) => {
     syncInProgress = true;
 
     try {
-      if (label === "initial sync") boot.step("syncing session rows");
-      await runRowSync(label);
+      const progress = label === "initial sync" ? (message: string) => boot.step(message) : undefined;
+      if (progress) progress("checking database");
+      await runRowSync(label, progress);
 
       if (label === "initial sync") boot.step("syncing config files");
       await fileSync.sync();

@@ -1113,6 +1113,264 @@ test("pushAll uses the time-based cursor on the second run", async () => {
   fs.rmSync(dbPath, { force: true });
 });
 
+test("pull marks converged remote rows so pushAll does not echo them back", async () => {
+  const dbPath = createDbPath();
+  initDb(dbPath);
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  client.pullResponses = [{
+    server_seq: 1,
+    more: false,
+    envelopes: [{
+      kind: "project",
+      id: "proj_remote",
+      machine_id: "laptop",
+      time_updated: 5_000,
+      server_seq: 1,
+      deleted: false,
+      data: {
+        id: "proj_remote",
+        worktree: "/tmp/remote",
+        vcs: "git",
+        name: "Remote",
+        icon_url: null,
+        icon_color: null,
+        time_created: 1,
+        time_updated: 5_000,
+        time_initialized: 1,
+        sandboxes: "[]",
+        commands: null,
+      },
+    }],
+  }];
+
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  await sync.pull();
+  expect(stateManager.state.knownRows["project:proj_remote"]).toBe(5_000);
+  expect(stateManager.state.lastPushedRowIds.has("project:proj_remote:5000")).toBe(true);
+
+  client.pushes = [];
+  await sync.pushAll();
+  expect(client.pushes).toEqual([]);
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("pull marks idempotent skipped rows so state-reset peers do not echo them", async () => {
+  const dbPath = createDbPath();
+  initDb(dbPath);
+  seedSessionTree(dbPath, 5_000);
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  client.pullResponses = [{
+    server_seq: 1,
+    more: false,
+    envelopes: [{
+      kind: "session",
+      id: "ses_1",
+      machine_id: "laptop",
+      time_updated: 5_000,
+      server_seq: 1,
+      deleted: false,
+      data: {
+        id: "ses_1",
+        project_id: "proj_1",
+        parent_id: null,
+        slug: "session-1",
+        directory: "/tmp/project",
+        title: "Session 1",
+        version: "1",
+        share_url: null,
+        summary_additions: null,
+        summary_deletions: null,
+        summary_files: null,
+        summary_diffs: null,
+        revert: null,
+        permission: null,
+        time_created: 1,
+        time_updated: 5_000,
+        time_compacting: null,
+        time_archived: null,
+        workspace_id: null,
+      },
+    }],
+  }];
+
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  await sync.pull();
+  expect(stateManager.state.knownRows["session:ses_1"]).toBe(5_000);
+  expect(stateManager.state.lastPushedRowIds.has("session:ses_1:5000")).toBe(true);
+
+  client.pushes = [];
+  await sync.pushAll();
+  expect(client.pushes.flat().find((env) => env.kind === "session" && env.id === "ses_1")).toBeUndefined();
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("pull conflicts remain pushable on the next pushAll", async () => {
+  const dbPath = createDbPath();
+  initDb(dbPath);
+  seedSessionTree(dbPath, 5_000);
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  client.pullResponses = [{
+    server_seq: 1,
+    more: false,
+    envelopes: [{
+      kind: "session",
+      id: "ses_1",
+      machine_id: "laptop",
+      time_updated: 4_000,
+      server_seq: 1,
+      deleted: false,
+      data: {
+        id: "ses_1",
+        project_id: "proj_1",
+        parent_id: null,
+        slug: "session-1",
+        directory: "/tmp/project",
+        title: "Older Remote",
+        version: "1",
+        share_url: null,
+        summary_additions: null,
+        summary_deletions: null,
+        summary_files: null,
+        summary_diffs: null,
+        revert: null,
+        permission: null,
+        time_created: 1,
+        time_updated: 4_000,
+        time_compacting: null,
+        time_archived: null,
+        workspace_id: null,
+      },
+    }],
+  }];
+
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  const result = await sync.pull();
+  expect(result.conflicts).toBe(1);
+  expect(stateManager.state.lastPushedRowIds.has("session:ses_1:4000")).toBe(false);
+
+  await sync.pushAll();
+  expect(client.pushes.flat().find((env) => env.kind === "session" && env.id === "ses_1")).toBeDefined();
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("pushAll persists completed batches so an interrupted push can resume", async () => {
+  const dbPath = createDbPath();
+  initDb(dbPath);
+  seedSessionTree(dbPath, 1_000);
+
+  const db = new Database(dbPath);
+  for (let i = 2; i <= 150; i++) {
+    db.run(
+      "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
+      [`msg_${i}`, "ses_1", 1, 1_000, '{"role":"user"}'],
+    );
+  }
+  db.close();
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  let pushCalls = 0;
+  client.push = async (_machineId: string, envelopes: SyncEnvelope[]) => {
+    pushCalls++;
+    if (pushCalls === 2) throw new Error("simulated abort after first batch");
+    client.pushes.push(envelopes.map((envelope) => ({ ...envelope })));
+    return {
+      server_seq: pushCalls,
+      accepted: envelopes.map((envelope) => envelope.id),
+      stale: [],
+    };
+  };
+
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  await expect(sync.pushAll()).rejects.toThrow("simulated abort after first batch");
+
+  const reloaded = new StateManager("desktop");
+  reloaded.load();
+  expect(reloaded.state.lastPushedRowIds.size).toBe(100);
+  expect(Object.keys(reloaded.state.knownRows).length).toBe(100);
+
+  client.pushes = [];
+  client.push = async (_machineId: string, envelopes: SyncEnvelope[]) => {
+    client.pushes.push(envelopes.map((envelope) => ({ ...envelope })));
+    return {
+      server_seq: client.pushes.length,
+      accepted: envelopes.map((envelope) => envelope.id),
+      stale: [],
+    };
+  };
+
+  const resumedSync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    reloaded,
+    "desktop",
+    () => {},
+  );
+  await resumedSync.pushAll();
+
+  expect(client.pushes.flat().length).toBe(54);
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
 test("pull persists state once per call rather than per-page", async () => {
   // Regression test for #10: with withBatch wrapping pull, paginated pulls
   // must call save() exactly once at the end, regardless of how many pages

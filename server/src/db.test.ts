@@ -167,6 +167,29 @@ test("upsertBatch preserves per-envelope accepted/stale results in order", () =>
   db.close();
 });
 
+test("equal-timestamp identical echo from another machine is accepted without server_seq churn", () => {
+  const dir = createDataDir();
+  const db = new LedgerDB(dir, silentLogger);
+
+  const seed = makeEnvelope("ses_echo", "aaa-laptop", 5_000);
+  const seedResult = db.upsertBatch([seed]);
+  expect(seedResult[0]!.accepted).toBe(true);
+
+  const before = db.pullRows(0, undefined, 100).envelopes[0]!;
+  const nextSeqBeforeEcho = db.getNextSeq();
+
+  const echo = makeEnvelope("ses_echo", "zzz-desktop", 5_000);
+  const echoResult = db.upsertBatch([echo]);
+  expect(echoResult[0]!.accepted).toBe(true);
+
+  const after = db.pullRows(0, undefined, 100).envelopes[0]!;
+  expect(db.getNextSeq()).toBe(nextSeqBeforeEcho);
+  expect(after.server_seq).toBe(before.server_seq);
+  expect(after.machine_id).toBe("aaa-laptop");
+
+  db.close();
+});
+
 // ── H5: blob GC on manifest upsert ─────────────────────────────────
 
 import { writeFileSync } from "node:fs";

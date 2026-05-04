@@ -280,6 +280,8 @@ export class LedgerDB {
   ): { accepted: boolean; stale?: { server_time_updated: number } } {
     const { kind, id, machine_id, time_updated, deleted, data } = envelope;
     const now = Date.now();
+    const incomingDeleted = deleted ? 1 : 0;
+    const incomingData = data != null ? JSON.stringify(data) : null;
 
     const existing = this.stmtGetRow.get(kind, id);
 
@@ -292,8 +294,8 @@ export class LedgerDB {
         machine_id,
         time_updated,
         seq,
-        deleted ? 1 : 0,
-        data != null ? JSON.stringify(data) : null,
+        incomingDeleted,
+        incomingData,
         now,
       );
       return { accepted: true };
@@ -306,8 +308,8 @@ export class LedgerDB {
         machine_id,
         time_updated,
         seq,
-        deleted ? 1 : 0,
-        data != null ? JSON.stringify(data) : null,
+        incomingDeleted,
+        incomingData,
         now,
         kind,
         id,
@@ -320,7 +322,15 @@ export class LedgerDB {
       return { accepted: false, stale: { server_time_updated: existing.time_updated } };
     }
 
-    // Case 4: Equal timestamps — tie-break by machine_id
+    // Case 4: Equal timestamps. Exact content echoes are idempotent even when
+    // they arrive from a different machine. Without this guard, a peer that
+    // pulls rows and then accidentally push-scans them back can churn
+    // `machine_id` and allocate fresh `server_seq`s for unchanged data.
+    if (existing.deleted === incomingDeleted && existing.data === incomingData) {
+      return { accepted: true };
+    }
+
+    // Different content at the same timestamp — tie-break by machine_id.
     if (machine_id >= existing.machine_id) {
       // Incoming wins or is same (idempotent)
       if (machine_id === existing.machine_id) {
@@ -332,8 +342,8 @@ export class LedgerDB {
         machine_id,
         time_updated,
         seq,
-        deleted ? 1 : 0,
-        data != null ? JSON.stringify(data) : null,
+        incomingDeleted,
+        incomingData,
         now,
         kind,
         id,
