@@ -1113,6 +1113,362 @@ test("pushAll uses the time-based cursor on the second run", async () => {
   fs.rmSync(dbPath, { force: true });
 });
 
+test("pull marks converged remote rows so pushAll does not echo them back", async () => {
+  const dbPath = createDbPath();
+  initDb(dbPath);
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  client.pullResponses = [{
+    server_seq: 1,
+    more: false,
+    envelopes: [{
+      kind: "project",
+      id: "proj_remote",
+      machine_id: "laptop",
+      time_updated: 5_000,
+      server_seq: 1,
+      deleted: false,
+      data: {
+        id: "proj_remote",
+        worktree: "/tmp/remote",
+        vcs: "git",
+        name: "Remote",
+        icon_url: null,
+        icon_color: null,
+        time_created: 1,
+        time_updated: 5_000,
+        time_initialized: 1,
+        sandboxes: "[]",
+        commands: null,
+      },
+    }],
+  }];
+
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  await sync.pull();
+  expect(stateManager.state.knownRows["project:proj_remote"]).toBe(5_000);
+  expect(stateManager.state.lastPushedRowIds.has("project:proj_remote:5000")).toBe(true);
+
+  client.pushes = [];
+  await sync.pushAll();
+  expect(client.pushes).toEqual([]);
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("pull marks idempotent skipped rows so state-reset peers do not echo them", async () => {
+  const dbPath = createDbPath();
+  initDb(dbPath);
+  seedSessionTree(dbPath, 5_000);
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  client.pullResponses = [{
+    server_seq: 1,
+    more: false,
+    envelopes: [{
+      kind: "session",
+      id: "ses_1",
+      machine_id: "laptop",
+      time_updated: 5_000,
+      server_seq: 1,
+      deleted: false,
+      data: {
+        id: "ses_1",
+        project_id: "proj_1",
+        parent_id: null,
+        slug: "session-1",
+        directory: "/tmp/project",
+        title: "Session 1",
+        version: "1",
+        share_url: null,
+        summary_additions: null,
+        summary_deletions: null,
+        summary_files: null,
+        summary_diffs: null,
+        revert: null,
+        permission: null,
+        time_created: 1,
+        time_updated: 5_000,
+        time_compacting: null,
+        time_archived: null,
+        workspace_id: null,
+      },
+    }],
+  }];
+
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  await sync.pull();
+  expect(stateManager.state.knownRows["session:ses_1"]).toBe(5_000);
+  expect(stateManager.state.lastPushedRowIds.has("session:ses_1:5000")).toBe(true);
+
+  client.pushes = [];
+  await sync.pushAll();
+  expect(client.pushes.flat().find((env) => env.kind === "session" && env.id === "ses_1")).toBeUndefined();
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+// Regression for: pull() advancing the push cursor based on remote
+// envelope time_updated would clamp to Date.now() and shift
+// pushReadSince() up by minutes/hours, silently filtering older
+// local-only rows out of the next push scan. Realistic timestamps
+// (Date.now()-style) are required to expose the bug — the older
+// uniform `5_000` constants in sibling tests stay below the clamp.
+test("pull does not skip older local-only rows when remote envelopes carry recent timestamps", async () => {
+  const dbPath = createDbPath();
+  initDb(dbPath);
+
+  const now = Date.now();
+  // Local-only project written ~10 minutes ago — well outside the 60s
+  // pushReadSince margin.
+  const localOldTime = now - 10 * 60_000;
+  const db = new Database(dbPath);
+  db.run(
+    `INSERT INTO project (id, worktree, vcs, name, icon_url, icon_color, time_created, time_updated, time_initialized, sandboxes, commands)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ["proj_local_old", "/tmp/local", "git", "Local", null, null, 1, localOldTime, 1, "[]", null],
+  );
+  db.close();
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  // Remote project the peer pushed "just now" — its time_updated
+  // matches realistic production traffic.
+  const remoteTime = now - 1_000;
+  client.pullResponses = [{
+    server_seq: 1,
+    more: false,
+    envelopes: [{
+      kind: "project",
+      id: "proj_remote",
+      machine_id: "laptop",
+      time_updated: remoteTime,
+      server_seq: 1,
+      deleted: false,
+      data: {
+        id: "proj_remote",
+        worktree: "/tmp/remote",
+        vcs: "git",
+        name: "Remote",
+        icon_url: null,
+        icon_color: null,
+        time_created: 1,
+        time_updated: remoteTime,
+        time_initialized: 1,
+        sandboxes: "[]",
+        commands: null,
+      },
+    }],
+  }];
+
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  await sync.pull();
+  // The pre-fix code would advance lastPushedRowTime to ~Date.now() here,
+  // so pushReadSince() would return ~now - 60_000, filtering proj_local_old
+  // (10 minutes old) out of iterateAllEnvelopes.
+  await sync.pushAll();
+
+  const pushedLocal = client.pushes.flat().find(
+    (env) => env.kind === "project" && env.id === "proj_local_old",
+  );
+  expect(pushedLocal).toBeDefined();
+  // And the remote echo must NOT be re-pushed (dedup still works).
+  const pushedEcho = client.pushes.flat().find(
+    (env) => env.kind === "project" && env.id === "proj_remote",
+  );
+  expect(pushedEcho).toBeUndefined();
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("pull conflicts remain pushable on the next pushAll", async () => {
+  const dbPath = createDbPath();
+  initDb(dbPath);
+  seedSessionTree(dbPath, 5_000);
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  client.pullResponses = [{
+    server_seq: 1,
+    more: false,
+    envelopes: [{
+      kind: "session",
+      id: "ses_1",
+      machine_id: "laptop",
+      time_updated: 4_000,
+      server_seq: 1,
+      deleted: false,
+      data: {
+        id: "ses_1",
+        project_id: "proj_1",
+        parent_id: null,
+        slug: "session-1",
+        directory: "/tmp/project",
+        title: "Older Remote",
+        version: "1",
+        share_url: null,
+        summary_additions: null,
+        summary_deletions: null,
+        summary_files: null,
+        summary_diffs: null,
+        revert: null,
+        permission: null,
+        time_created: 1,
+        time_updated: 4_000,
+        time_compacting: null,
+        time_archived: null,
+        workspace_id: null,
+      },
+    }],
+  }];
+
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  const result = await sync.pull();
+  expect(result.conflicts).toBe(1);
+  expect(stateManager.state.lastPushedRowIds.has("session:ses_1:4000")).toBe(false);
+
+  await sync.pushAll();
+  expect(client.pushes.flat().find((env) => env.kind === "session" && env.id === "ses_1")).toBeDefined();
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+// Note on the expected count `54`: seedSessionTree writes 5 rows (project,
+// session, msg_1, part, todo); the loop below adds 149 more messages. Total
+// 154 rows, minus PUSH_BATCH_SIZE = 100 pushed in batch 1, leaves 54. If
+// PUSH_BATCH_SIZE changes, update this assertion.
+//
+// Note on timestamps: every row uses time_updated = 1_000, well below the
+// 60s PUSH_CURSOR_MARGIN_MS. After batch 1, lastPushedRowTime = 1_000 and
+// pushReadSince() = max(0, 1_000 - 60_000) = 0, so on resume
+// iterateAllEnvelopes rescans every row and the lastPushedRowIds dedup set
+// does the actual work of skipping the already-pushed batch. Realistic
+// Date.now()-style timestamps would behave identically (rows are written
+// sub-millisecond apart, so all 154 stay within the 60s margin). This test
+// exercises persistence-across-crash, not cursor filtering.
+test("pushAll persists completed batches so an interrupted push can resume", async () => {
+  const dbPath = createDbPath();
+  initDb(dbPath);
+  seedSessionTree(dbPath, 1_000);
+
+  const db = new Database(dbPath);
+  for (let i = 2; i <= 150; i++) {
+    db.run(
+      "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
+      [`msg_${i}`, "ses_1", 1, 1_000, '{"role":"user"}'],
+    );
+  }
+  db.close();
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  let pushCalls = 0;
+  client.push = async (_machineId: string, envelopes: SyncEnvelope[]) => {
+    pushCalls++;
+    if (pushCalls === 2) throw new Error("simulated abort after first batch");
+    client.pushes.push(envelopes.map((envelope) => ({ ...envelope })));
+    return {
+      server_seq: pushCalls,
+      accepted: envelopes.map((envelope) => envelope.id),
+      stale: [],
+    };
+  };
+
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  await expect(sync.pushAll()).rejects.toThrow("simulated abort after first batch");
+
+  const reloaded = new StateManager("desktop");
+  reloaded.load();
+  expect(reloaded.state.lastPushedRowIds.size).toBe(100);
+  expect(Object.keys(reloaded.state.knownRows).length).toBe(100);
+
+  client.pushes = [];
+  client.push = async (_machineId: string, envelopes: SyncEnvelope[]) => {
+    client.pushes.push(envelopes.map((envelope) => ({ ...envelope })));
+    return {
+      server_seq: client.pushes.length,
+      accepted: envelopes.map((envelope) => envelope.id),
+      stale: [],
+    };
+  };
+
+  const resumedSync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    reloaded,
+    "desktop",
+    () => {},
+  );
+  await resumedSync.pushAll();
+
+  expect(client.pushes.flat().length).toBe(54);
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
 test("pull persists state once per call rather than per-page", async () => {
   // Regression test for #10: with withBatch wrapping pull, paginated pulls
   // must call save() exactly once at the end, regardless of how many pages
