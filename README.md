@@ -51,16 +51,17 @@ The order matters: **set up the server first**, then add the plugin entry on eve
 
 ### 1. VPS — server + plugin
 
+The server is meant to run as a systemd unit. A helper script does the full install:
+
 ```bash
 git clone https://github.com/AaronFeledy/opencode-sync.git ~/opencode-sync
 cd ~/opencode-sync
-bun install
-bun run --cwd server build
+bun run install-server
 ```
 
-Then follow [`server/README.md`](./server/README.md) to install the systemd unit, and [`plugin/README.md`](./plugin/README.md) to register the plugin in the VPS's own `opencode.json`.
+The script (`scripts/install-server.sh`) builds the binary, creates the service user, generates the bearer token, writes `/etc/opencode-sync/env`, installs the unit, and verifies `/health`. It's idempotent — re-run it after `git pull` to redeploy. Save the token it prints; desktop and laptop both need it.
 
-Save the `OPENCODE_SYNC_TOKEN` you generate during server setup — desktop and laptop both need it.
+For a guided/manual walkthrough of the same steps, see [`server/README.md`](./server/README.md). Then follow [`plugin/README.md`](./plugin/README.md) to register the plugin in the VPS's own `opencode.json` (the VPS is also a sync client of itself).
 
 ### 2. Desktop and laptop — plugin only
 
@@ -94,7 +95,11 @@ git pull
 bun install
 ```
 
-On the VPS, also rebuild the server binary and restart the unit (see [`server/README.md`](./server/README.md#updating)).
+On the VPS, re-run the installer instead — it rebuilds the binary, replaces the file at `/usr/local/bin/opencode-sync-server`, and restarts the unit:
+
+```bash
+cd ~/opencode-sync && git pull && bun run install-server
+```
 
 ## License
 
