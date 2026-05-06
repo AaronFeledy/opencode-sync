@@ -77,6 +77,22 @@ const TOMBSTONE_THRESHOLD_FRACTION_PERMISSIVE = 0.95;
  */
 const TOMBSTONE_CONFIRMATION_DELAY_MS = 30_000;
 
+// Retry transient pull-order inversions parent-first within the same page.
+// This mirrors the natural dependency graph in opencode.db:
+// project -> session -> message -> part, with permission/todo/session_share
+// hanging off project/session. If a peer pushed rows out of order, a pulled
+// child can fail its FK check even though the parent is later in the same
+// batch; one in-page retry after parents land is enough to recover.
+const PULL_RETRY_ORDER: Record<SyncKind, number> = {
+  project: 0,
+  session: 1,
+  permission: 2,
+  message: 3,
+  part: 4,
+  todo: 5,
+  session_share: 6,
+};
+
 function rowStateKey(kind: SyncKind, id: string): string {
   return `${kind}:${id}`;
 }
@@ -561,9 +577,22 @@ export class SessionSync {
       let lastGoodSeq = this.stateManager.state.lastPulledSeq;
       let firstErrorSeq: number | null = null;
 
-      for (const envelope of res.envelopes) {
-        const envelopeKey = `${envelope.kind}:${envelope.id}:${envelope.server_seq}`;
-        
+      const applyOnce = (envelope: SyncEnvelope): { result: ApplyResult; thrownError: string | null } => {
+        try {
+          return { result: this.dbWriter.applyEnvelope(envelope), thrownError: null };
+        } catch (err) {
+          // Defensive: applyEnvelope is supposed to return "error" rather
+          // than throw. Treat throws the same way as other retryable apply
+          // failures so a later parent in the same page still gets a chance
+          // to unblock the row before we increment the poison counter.
+          return { result: "error", thrownError: String(err) };
+        }
+      };
+
+      const outcomes: Array<{ result: ApplyResult | "poisoned-skip"; thrownError: string | null } | undefined> = [];
+      const deferred: Array<{ index: number; envelope: SyncEnvelope }> = [];
+
+      for (const [index, envelope] of res.envelopes.entries()) {
         // Skip already-poisoned envelopes to avoid re-applying and duplicate
         // entries. Advance cursor if no prior error blocked us.
         const alreadyPoisoned = this.stateManager.state.poisonedEnvelopes.some(
@@ -573,27 +602,45 @@ export class SessionSync {
             p.server_seq === envelope.server_seq,
         );
         if (alreadyPoisoned) {
+          outcomes[index] = { result: "poisoned-skip", thrownError: null };
+          continue;
+        }
+
+        const outcome = applyOnce(envelope);
+        if (outcome.result === "error") {
+          deferred.push({ index, envelope });
+          continue;
+        }
+
+        outcomes[index] = outcome;
+      }
+
+      // Retry once after the whole page has had a chance to land, ordered by
+      // parent-before-child dependencies. This repairs child-before-parent
+      // batches inside a single page instead of poisoning them across cycles.
+      deferred.sort((a, b) => {
+        const orderDiff = PULL_RETRY_ORDER[a.envelope.kind] - PULL_RETRY_ORDER[b.envelope.kind];
+        if (orderDiff !== 0) return orderDiff;
+        return a.envelope.server_seq - b.envelope.server_seq;
+      });
+
+      for (const { index, envelope } of deferred) {
+        outcomes[index] = applyOnce(envelope);
+      }
+
+      for (const [index, envelope] of res.envelopes.entries()) {
+        const envelopeKey = `${envelope.kind}:${envelope.id}:${envelope.server_seq}`;
+        const outcome = outcomes[index];
+        if (!outcome) continue;
+
+        if (outcome.result === "poisoned-skip") {
           if (firstErrorSeq === null) {
             lastGoodSeq = envelope.server_seq;
           }
           continue;
         }
-        
-        let result: ApplyResult;
-        let thrownError: string | null = null;
-        try {
-          result = this.dbWriter.applyEnvelope(envelope);
-        } catch (err) {
-          // Defensive: applyEnvelope is supposed to return "error" rather
-          // than throw, but anything that does escape lands here.
-          result = "error";
-          thrownError = String(err);
-          this.log("envelope apply threw (will retry next cycle)", {
-            kind: envelope.kind,
-            id: envelope.id,
-            error: thrownError,
-          });
-        }
+
+        const { result, thrownError } = outcome;
 
         if (result === "applied" || result === "skipped") {
           const rowKey = rowStateKey(envelope.kind, envelope.id);

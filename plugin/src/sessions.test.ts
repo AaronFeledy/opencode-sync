@@ -2479,6 +2479,115 @@ test("H3: already-poisoned envelope is skipped on re-pull, not re-counted (bugbo
   fs.rmSync(dbPath, { force: true });
 });
 
+test("H3: child-before-parent envelopes recover within the same pull page", async () => {
+  const dbPath = createDbPath();
+  initDb(dbPath);
+
+  const originalError = console.error;
+  console.error = () => {};
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  client.pullResponses.push({
+    server_seq: 3,
+    more: false,
+    envelopes: [
+      {
+        kind: "message",
+        id: "msg_early",
+        machine_id: "laptop",
+        time_updated: 3_000,
+        server_seq: 1,
+        deleted: false,
+        data: {
+          id: "msg_early",
+          session_id: "ses_early",
+          time_created: 1,
+          time_updated: 3_000,
+          data: '{"role":"user"}',
+        },
+      },
+      {
+        kind: "session",
+        id: "ses_early",
+        machine_id: "laptop",
+        time_updated: 2_000,
+        server_seq: 2,
+        deleted: false,
+        data: {
+          id: "ses_early",
+          project_id: "proj_early",
+          parent_id: null,
+          slug: "early",
+          directory: "/tmp",
+          title: "Early",
+          version: "1",
+          share_url: null,
+          summary_additions: null,
+          summary_deletions: null,
+          summary_files: null,
+          summary_diffs: null,
+          revert: null,
+          permission: null,
+          time_created: 1,
+          time_updated: 2_000,
+          time_compacting: null,
+          time_archived: null,
+          workspace_id: null,
+        },
+      },
+      {
+        kind: "project",
+        id: "proj_early",
+        machine_id: "laptop",
+        time_updated: 1_000,
+        server_seq: 3,
+        deleted: false,
+        data: {
+          id: "proj_early",
+          worktree: "/tmp/project",
+          vcs: "git",
+          name: "Early",
+          icon_url: null,
+          icon_color: null,
+          time_created: 1,
+          time_updated: 1_000,
+          time_initialized: 1,
+          sandboxes: "[]",
+          commands: null,
+        },
+      },
+    ],
+  });
+
+  const result = await sync.pull();
+
+  expect(result).toEqual({ applied: 3, conflicts: 0, errors: 0 });
+  expect(stateManager.state.lastPulledSeq).toBe(3);
+  expect(stateManager.state.pullErrorCounts["message:msg_early:1"]).toBeUndefined();
+  expect(stateManager.state.pullErrorCounts["session:ses_early:2"]).toBeUndefined();
+  expect(stateManager.state.poisonedEnvelopes.length).toBe(0);
+  expect(countRows(dbPath, "project")).toBe(1);
+  expect(countRows(dbPath, "session")).toBe(1);
+  expect(countRows(dbPath, "message")).toBe(1);
+
+  console.error = originalError;
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
 test("H3: transient error clears counter on successful retry", async () => {
   // A truly transient error (FK-ordering inversion that resolves when
   // the parent arrives) should NOT accumulate toward the poison
