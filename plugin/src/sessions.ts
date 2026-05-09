@@ -552,6 +552,10 @@ export class SessionSync {
         this.machineId,
       );
       pulled += res.envelopes.length;
+      const pageCursorSeq = res.cursor_seq ??
+        (res.envelopes.length > 0
+          ? res.envelopes[res.envelopes.length - 1]!.server_seq
+          : this.stateManager.state.lastPulledSeq);
 
       const rememberedRows: Record<string, { time_updated: number; parent?: string }> = {};
       const forgottenRows = new Set<string>();
@@ -635,7 +639,7 @@ export class SessionSync {
 
         if (outcome.result === "poisoned-skip") {
           if (firstErrorSeq === null) {
-            lastGoodSeq = envelope.server_seq;
+            lastGoodSeq = Math.max(lastGoodSeq, Math.min(envelope.server_seq, pageCursorSeq));
           }
           continue;
         }
@@ -673,6 +677,30 @@ export class SessionSync {
           }
         } else {
           // result === "error"
+          if (res.dependency_closure === true) {
+            const missing = this.dbWriter.missingDependencies(envelope);
+            if (missing.length > 0) {
+              errors++;
+              this.log("orphan envelope skipped after dependency-closure pull", {
+                kind: envelope.kind,
+                id: envelope.id,
+                server_seq: envelope.server_seq,
+                missing,
+              });
+              this.stateManager.recordPoisonedEnvelope({
+                kind: envelope.kind,
+                id: envelope.id,
+                server_seq: envelope.server_seq,
+                lastError: `missing dependencies: ${missing.map((d) => `${d.kind}:${d.id}`).join(", ")}`,
+              });
+              this.stateManager.clearPullErrorCount(envelopeKey);
+              if (firstErrorSeq === null) {
+                lastGoodSeq = Math.max(lastGoodSeq, Math.min(envelope.server_seq, pageCursorSeq));
+              }
+              continue;
+            }
+          }
+
           errors++;
           const attempts = this.stateManager.incrementPullErrorCount(envelopeKey);
           if (attempts >= PULL_POISON_THRESHOLD) {
@@ -696,7 +724,7 @@ export class SessionSync {
             // Advance lastGoodSeq so the cursor crosses the poisoned
             // envelope and subsequent pulls can proceed.
             if (firstErrorSeq === null) {
-              lastGoodSeq = envelope.server_seq;
+              lastGoodSeq = Math.max(lastGoodSeq, Math.min(envelope.server_seq, pageCursorSeq));
             }
             continue;
           }
@@ -717,7 +745,7 @@ export class SessionSync {
         // process the rest of the page so error counts are accurate, but
         // we don't extend lastGoodSeq.
         if (firstErrorSeq === null) {
-          lastGoodSeq = envelope.server_seq;
+          lastGoodSeq = Math.max(lastGoodSeq, Math.min(envelope.server_seq, pageCursorSeq));
         }
       }
 
@@ -757,8 +785,7 @@ export class SessionSync {
         // to the global max would skip every row between the batch tail and
         // the global max on the next pagination request.
         // pullRows() guarantees ascending server_seq order.
-        const batchMaxSeq = res.envelopes[res.envelopes.length - 1]!.server_seq;
-        this.stateManager.updateSeq(batchMaxSeq);
+        this.stateManager.updateSeq(pageCursorSeq);
       } else if (res.more) {
         // Defensive: the current server can't produce {envelopes:[], more:true}
         // (its `more` flag is `rows.length > limit`, so empty rows implies

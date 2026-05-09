@@ -338,6 +338,8 @@ export function handleSyncPull(
 
   const response: PullResponse = {
     server_seq: result.server_seq,
+    cursor_seq: result.cursor_seq,
+    dependency_closure: result.dependency_closure,
     envelopes: result.envelopes,
     more: result.more,
   };
