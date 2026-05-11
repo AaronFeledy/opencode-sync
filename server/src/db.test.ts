@@ -64,6 +64,53 @@ function makeEnvelope(id: string, machineId: string, timeUpdated: number): SyncE
   };
 }
 
+function makeProjectEnvelope(id: string, machineId: string, timeUpdated: number): SyncEnvelope {
+  return {
+    kind: "project",
+    id,
+    machine_id: machineId,
+    time_updated: timeUpdated,
+    server_seq: 0,
+    deleted: false,
+    data: {
+      id,
+      worktree: "/tmp",
+      vcs: null,
+      name: id,
+      icon_url: null,
+      icon_color: null,
+      time_created: 1,
+      time_updated: timeUpdated,
+      time_initialized: null,
+      sandboxes: "[]",
+      commands: null,
+    },
+  };
+}
+
+function makeMessageEnvelope(
+  id: string,
+  sessionId: string,
+  machineId: string,
+  timeUpdated: number,
+): SyncEnvelope {
+  return {
+    kind: "message",
+    id,
+    machine_id: machineId,
+    time_updated: timeUpdated,
+    server_seq: 0,
+    deleted: false,
+    data: {
+      id,
+      session_id: sessionId,
+      time_created: 1,
+      time_updated: timeUpdated,
+      data: "{}",
+    },
+  };
+}
+
 test("upsertBatch assigns strictly monotonic, unique server_seq values", () => {
   const dir = createDataDir();
   const db = new LedgerDB(dir, silentLogger);
@@ -186,6 +233,23 @@ test("equal-timestamp identical echo from another machine is accepted without se
   expect(db.getNextSeq()).toBe(nextSeqBeforeEcho);
   expect(after.server_seq).toBe(before.server_seq);
   expect(after.machine_id).toBe("aaa-laptop");
+
+  db.close();
+});
+
+test("dependency closure preserves exclude machine filter", () => {
+  const dir = createDataDir();
+  const db = new LedgerDB(dir, silentLogger);
+
+  db.upsertBatch([
+    makeProjectEnvelope("proj_1", "laptop", 1_000),
+    makeEnvelope("ses_1", "laptop", 1_100),
+    makeMessageEnvelope("msg_1", "ses_1", "desktop", 1_200),
+  ]);
+
+  const pulled = db.pullRows(2, "laptop", 100);
+
+  expect(pulled.envelopes.map((e) => `${e.kind}:${e.id}`)).toEqual(["message:msg_1"]);
 
   db.close();
 });

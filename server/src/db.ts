@@ -54,6 +54,7 @@ export class LedgerDB {
   private stmtGetNextSeq;
   private stmtSetNextSeq;
   private stmtGetRow;
+  private stmtGetRowExclude;
   private stmtInsertRow;
   private stmtUpdateRow;
   private stmtPullRows;
@@ -105,6 +106,11 @@ export class LedgerDB {
       { kind: string; id: string; machine_id: string; time_updated: number; server_seq: number; deleted: number; data: string | null; received_at: number },
       [string, string]
     >("SELECT * FROM sync_row WHERE kind = ? AND id = ?");
+
+    this.stmtGetRowExclude = this.db.prepare<
+      { kind: string; id: string; machine_id: string; time_updated: number; server_seq: number; deleted: number; data: string | null; received_at: number },
+      [string, string, string]
+    >("SELECT * FROM sync_row WHERE kind = ? AND id = ? AND machine_id != ?");
 
     this.stmtInsertRow = this.db.prepare(
       `INSERT INTO sync_row (kind, id, machine_id, time_updated, server_seq, deleted, data, received_at)
@@ -380,7 +386,7 @@ export class LedgerDB {
     since: number,
     exclude?: string,
     limit: number = 500,
-  ): { envelopes: SyncEnvelope[]; more: boolean; server_seq: number } {
+  ): { envelopes: SyncEnvelope[]; more: boolean; server_seq: number; cursor_seq: number; dependency_closure: boolean } {
     // Fetch limit+1 to detect whether there are more
     const fetchLimit = limit + 1;
 
@@ -405,6 +411,8 @@ export class LedgerDB {
     if (more) {
       rows = rows.slice(0, limit);
     }
+    const cursorSeq = rows.length > 0 ? rows[rows.length - 1]!.server_seq : since;
+    rows = this.withDependencyClosure(rows, exclude);
 
     const envelopes: SyncEnvelope[] = rows.map((row) => ({
       kind: row.kind as SyncEnvelope["kind"],
@@ -419,7 +427,88 @@ export class LedgerDB {
     // server_seq is the max seq we've seen, which is next_seq - 1
     const serverSeq = this.getNextSeq() - 1;
 
-    return { envelopes, more, server_seq: serverSeq };
+    return {
+      envelopes,
+      more,
+      server_seq: serverSeq,
+      cursor_seq: cursorSeq,
+      dependency_closure: true,
+    };
+  }
+
+  private withDependencyClosure(
+    rows: Array<{
+      kind: string;
+      id: string;
+      machine_id: string;
+      time_updated: number;
+      server_seq: number;
+      deleted: number;
+      data: string | null;
+      received_at: number;
+    }>,
+    exclude?: string,
+  ): Array<{
+    kind: string;
+    id: string;
+    machine_id: string;
+    time_updated: number;
+    server_seq: number;
+    deleted: number;
+    data: string | null;
+    received_at: number;
+  }> {
+    const byKey = new Map(rows.map((row) => [`${row.kind}:${row.id}`, row]));
+    const queue = [...rows];
+
+    for (let index = 0; index < queue.length; index++) {
+      const row = queue[index]!;
+      if (row.deleted === 1 || row.data === null) continue;
+
+      for (const dep of this.rowDependencies(row)) {
+        const key = `${dep.kind}:${dep.id}`;
+        if (byKey.has(key)) continue;
+
+        const depRow = exclude
+          ? this.stmtGetRowExclude.get(dep.kind, dep.id, exclude)
+          : this.stmtGetRow.get(dep.kind, dep.id);
+        if (!depRow || depRow.deleted === 1) continue;
+
+        byKey.set(key, depRow);
+        queue.push(depRow);
+      }
+    }
+
+    return [...byKey.values()].sort((a, b) => a.server_seq - b.server_seq);
+  }
+
+  private rowDependencies(row: { kind: string; data: string | null }): Array<{ kind: SyncKind; id: string }> {
+    if (row.data === null) return [];
+    let data: Record<string, unknown>;
+    try {
+      data = JSON.parse(row.data) as Record<string, unknown>;
+    } catch {
+      return [];
+    }
+
+    const dep = (kind: SyncKind, id: unknown): Array<{ kind: SyncKind; id: string }> =>
+      typeof id === "string" && id.length > 0 ? [{ kind, id }] : [];
+
+    switch (row.kind) {
+      case "session":
+        return dep("project", data["project_id"]);
+      case "message":
+        return dep("session", data["session_id"]);
+      case "part":
+        return dep("message", data["message_id"]);
+      case "todo":
+      case "session_share":
+        return dep("session", data["session_id"]);
+      case "permission":
+        return dep("project", data["project_id"]);
+      default:
+        return [];
+    }
   }
 
   /**

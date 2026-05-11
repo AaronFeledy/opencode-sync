@@ -18,6 +18,7 @@ import { FileSync } from "./files.js";
 import { createEventHandler } from "./hooks.js";
 import { applyLoadedOverrides } from "./overrides.js";
 import { logger, LOG_FILE_PATH } from "./logger.js";
+import { tryAcquireSyncEngineLock } from "./instance-lock.js";
 import { isSyncHalted, readHaltDetails, writeHaltMarker, HALT_REASONS, HALT_MARKER_PATH } from "./halt.js";
 import { captureDbFingerprint, compareFingerprints } from "./db-fingerprint.js";
 
@@ -25,6 +26,52 @@ type BootStatus = {
   step: (message: string) => void;
   finish: (message: string) => void;
 };
+
+const OPENCODE_COMMANDS = new Set([
+  "acp",
+  "agent",
+  "attach",
+  "completion",
+  "debug",
+  "db",
+  "export",
+  "generate",
+  "github",
+  "import",
+  "mcp",
+  "models",
+  "plug",
+  "pr",
+  "providers",
+  "run",
+  "serve",
+  "session",
+  "stats",
+  "uninstall",
+  "upgrade",
+  "web",
+]);
+
+function isOpencodeTuiMainProcess(): boolean {
+  if (process.env.OPENCODE_PROCESS_ROLE !== "main") return false;
+
+  const firstPositional = process.argv.slice(2).find((arg) => !arg.startsWith("-"));
+  // The default TUI command is `$0 [project]`, so no positional or an unknown
+  // positional means the main process is only hosting the TUI. Backend sync
+  // should be owned by the worker/server instance instead.
+  return firstPositional === undefined || !OPENCODE_COMMANDS.has(firstPositional);
+}
+
+function configOnlyHooks(log: (msg: string, data?: Record<string, unknown>) => void) {
+  return {
+    config: async (input: unknown) => {
+      if (applyLoadedOverrides(input as Record<string, unknown>)) {
+        log("applied local config overrides");
+      }
+    },
+    event: async () => {},
+  };
+}
 
 function createBootStatus(name: string): BootStatus {
   const stream = process.stderr;
@@ -124,7 +171,25 @@ export const server: Plugin = async (_input, _options) => {
     machine: config.machineId,
     syncInterval: config.syncIntervalSec,
     logFile: LOG_FILE_PATH,
+    pid: process.pid,
+    processRole: process.env.OPENCODE_PROCESS_ROLE ?? null,
   });
+
+  if (isOpencodeTuiMainProcess()) {
+    log("sync engine disabled — opencode main TUI process", {
+      pid: process.pid,
+      processRole: process.env.OPENCODE_PROCESS_ROLE,
+      argv: process.argv.slice(2),
+    });
+    boot.finish("sync engine owned by opencode worker");
+    return configOnlyHooks(log);
+  }
+
+  const syncEngineLock = tryAcquireSyncEngineLock(log);
+  if (!syncEngineLock) {
+    boot.finish("sync engine already active in another opencode process");
+    return configOnlyHooks(log);
+  }
 
   // 2. Create HTTP client
   const client = new SyncClient(config.serverUrl, config.token);
@@ -358,6 +423,7 @@ export const server: Plugin = async (_input, _options) => {
     } catch {
       // ignore close errors during shutdown
     }
+    syncEngineLock.release();
     log("shutdown");
   };
 

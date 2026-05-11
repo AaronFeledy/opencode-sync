@@ -5,7 +5,7 @@ import * as path from "node:path";
 import type { SyncEnvelope } from "@opencode-sync/shared";
 import { LedgerDB } from "../db.js";
 import type { Logger } from "../log.js";
-import { handleSyncPush, handleSyncHeads } from "./sync.js";
+import { handleSyncPush, handleSyncHeads, handleSyncPull } from "./sync.js";
 
 const silentLogger: Logger = {
   debug: () => {},
@@ -43,6 +43,13 @@ function headsRequest(body: unknown): Request {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+}
+
+function pullRequest(since: number, limit?: number): Request {
+  const url = new URL("http://localhost/sync/pull");
+  url.searchParams.set("since", String(since));
+  if (limit !== undefined) url.searchParams.set("limit", String(limit));
+  return new Request(url.toString());
 }
 
 /**
@@ -184,6 +191,142 @@ test("handleSyncPush rejects envelopes with non-boolean deleted flag", async () 
   expect(res.status).toBe(400);
   const body = (await res.json()) as { error: string };
   expect(body.error).toMatch(/deleted/);
+
+  db.close();
+});
+
+test("handleSyncPull includes later parent dependencies without advancing cursor past the page", async () => {
+  const db = new LedgerDB(createDataDir(), silentLogger);
+
+  await seedRows(db, [
+    {
+      kind: "project",
+      id: "proj_1",
+      machine_id: "m1",
+      time_updated: 1_000,
+      server_seq: 0,
+      deleted: false,
+      data: {
+        id: "proj_1",
+        worktree: "/tmp/project",
+        vcs: "git",
+        name: "Project",
+        icon_url: null,
+        icon_color: null,
+        time_created: 1,
+        time_updated: 1_000,
+        time_initialized: 1,
+        sandboxes: "[]",
+        commands: null,
+      } as SyncEnvelope["data"],
+    },
+    {
+      kind: "session",
+      id: "ses_1",
+      machine_id: "m1",
+      time_updated: 2_000,
+      server_seq: 0,
+      deleted: false,
+      data: {
+        id: "ses_1",
+        project_id: "proj_1",
+        parent_id: null,
+        slug: "s",
+        directory: "/tmp/project",
+        title: "Session",
+        version: "1",
+        share_url: null,
+        summary_additions: null,
+        summary_deletions: null,
+        summary_files: null,
+        summary_diffs: null,
+        revert: null,
+        permission: null,
+        time_created: 1,
+        time_updated: 2_000,
+        time_compacting: null,
+        time_archived: null,
+        workspace_id: null,
+      } as SyncEnvelope["data"],
+    },
+    {
+      kind: "message",
+      id: "msg_1",
+      machine_id: "m1",
+      time_updated: 3_000,
+      server_seq: 0,
+      deleted: false,
+      data: {
+        id: "msg_1",
+        session_id: "ses_1",
+        time_created: 1,
+        time_updated: 3_000,
+        data: "{}",
+      } as SyncEnvelope["data"],
+    },
+    {
+      kind: "part",
+      id: "prt_1",
+      machine_id: "m1",
+      time_updated: 4_000,
+      server_seq: 0,
+      deleted: false,
+      data: {
+        id: "prt_1",
+        message_id: "msg_1",
+        session_id: "ses_1",
+        time_created: 1,
+        time_updated: 4_000,
+        data: "{}",
+      } as SyncEnvelope["data"],
+    },
+  ]);
+
+  await seedRows(db, [
+    {
+      kind: "session",
+      id: "ses_1",
+      machine_id: "m2",
+      time_updated: 5_000,
+      server_seq: 0,
+      deleted: false,
+      data: {
+        id: "ses_1",
+        project_id: "proj_1",
+        parent_id: null,
+        slug: "s",
+        directory: "/tmp/project",
+        title: "Session renamed",
+        version: "1",
+        share_url: null,
+        summary_additions: null,
+        summary_deletions: null,
+        summary_files: null,
+        summary_diffs: null,
+        revert: null,
+        permission: null,
+        time_created: 1,
+        time_updated: 5_000,
+        time_compacting: null,
+        time_archived: null,
+        workspace_id: null,
+      } as SyncEnvelope["data"],
+    },
+  ]);
+
+  const res = handleSyncPull(pullRequest(3, 1), db, silentLogger);
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { cursor_seq: number; dependency_closure: boolean; envelopes: SyncEnvelope[]; more: boolean };
+
+  expect(body.cursor_seq).toBe(4);
+  expect(body.dependency_closure).toBe(true);
+  expect(body.more).toBe(true);
+  expect(body.envelopes.map((e) => `${e.kind}:${e.id}`)).toEqual([
+    "project:proj_1",
+    "message:msg_1",
+    "part:prt_1",
+    "session:ses_1",
+  ]);
 
   db.close();
 });

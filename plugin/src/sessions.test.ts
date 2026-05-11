@@ -1319,6 +1319,131 @@ test("pull does not skip older local-only rows when remote envelopes carry recen
   fs.rmSync(dbPath, { force: true });
 });
 
+test("pull uses cursor_seq when dependency closure includes later parent rows", async () => {
+  const dbPath = createDbPath();
+  initDb(dbPath);
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  client.pullResponses = [
+    {
+      server_seq: 5,
+      cursor_seq: 4,
+      dependency_closure: true,
+      more: true,
+      envelopes: [
+        {
+          kind: "project",
+          id: "proj_1",
+          machine_id: "laptop",
+          time_updated: 1_000,
+          server_seq: 1,
+          deleted: false,
+          data: {
+            id: "proj_1",
+            worktree: "/tmp/project",
+            vcs: "git",
+            name: "Project",
+            icon_url: null,
+            icon_color: null,
+            time_created: 1,
+            time_updated: 1_000,
+            time_initialized: 1,
+            sandboxes: "[]",
+            commands: null,
+          },
+        },
+        {
+          kind: "message",
+          id: "msg_1",
+          machine_id: "laptop",
+          time_updated: 3_000,
+          server_seq: 3,
+          deleted: false,
+          data: {
+            id: "msg_1",
+            session_id: "ses_1",
+            time_created: 1,
+            time_updated: 3_000,
+            data: "{}",
+          },
+        },
+        {
+          kind: "part",
+          id: "prt_1",
+          machine_id: "laptop",
+          time_updated: 4_000,
+          server_seq: 4,
+          deleted: false,
+          data: {
+            id: "prt_1",
+            message_id: "msg_1",
+            session_id: "ses_1",
+            time_created: 1,
+            time_updated: 4_000,
+            data: "{}",
+          },
+        },
+        {
+          kind: "session",
+          id: "ses_1",
+          machine_id: "laptop",
+          time_updated: 5_000,
+          server_seq: 5,
+          deleted: false,
+          data: {
+            id: "ses_1",
+            project_id: "proj_1",
+            parent_id: null,
+            slug: "s",
+            directory: "/tmp/project",
+            title: "Session",
+            version: "1",
+            share_url: null,
+            summary_additions: null,
+            summary_deletions: null,
+            summary_files: null,
+            summary_diffs: null,
+            revert: null,
+            permission: null,
+            time_created: 1,
+            time_updated: 5_000,
+            time_compacting: null,
+            time_archived: null,
+            workspace_id: null,
+          },
+        },
+      ],
+    },
+    { server_seq: 5, more: false, envelopes: [] },
+  ];
+
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  const result = await sync.pull();
+
+  expect(result).toEqual({ applied: 4, conflicts: 0, errors: 0 });
+  expect(client.pullCalls[1]!.since).toBe(4);
+  expect(stateManager.state.lastPulledSeq).toBe(5);
+  expect(countRows(dbPath, "project")).toBe(1);
+  expect(countRows(dbPath, "session")).toBe(1);
+  expect(countRows(dbPath, "message")).toBe(1);
+  expect(countRows(dbPath, "part")).toBe(1);
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
 test("pull conflicts remain pushable on the next pushAll", async () => {
   const dbPath = createDbPath();
   initDb(dbPath);
@@ -2472,6 +2597,115 @@ test("H3: already-poisoned envelope is skipped on re-pull, not re-counted (bugbo
   expect(stateManager.state.pullErrorCounts["workspace:ws_1:10"]).toBeUndefined();
   // env_A counter continued to grow (2 now).
   expect(stateManager.state.pullErrorCounts["session:ses_orphan:5"]).toBe(2);
+
+  console.error = originalError;
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("H3: child-before-parent envelopes recover within the same pull page", async () => {
+  const dbPath = createDbPath();
+  initDb(dbPath);
+
+  const originalError = console.error;
+  console.error = () => {};
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+  );
+
+  client.pullResponses.push({
+    server_seq: 3,
+    more: false,
+    envelopes: [
+      {
+        kind: "message",
+        id: "msg_early",
+        machine_id: "laptop",
+        time_updated: 3_000,
+        server_seq: 1,
+        deleted: false,
+        data: {
+          id: "msg_early",
+          session_id: "ses_early",
+          time_created: 1,
+          time_updated: 3_000,
+          data: '{"role":"user"}',
+        },
+      },
+      {
+        kind: "session",
+        id: "ses_early",
+        machine_id: "laptop",
+        time_updated: 2_000,
+        server_seq: 2,
+        deleted: false,
+        data: {
+          id: "ses_early",
+          project_id: "proj_early",
+          parent_id: null,
+          slug: "early",
+          directory: "/tmp",
+          title: "Early",
+          version: "1",
+          share_url: null,
+          summary_additions: null,
+          summary_deletions: null,
+          summary_files: null,
+          summary_diffs: null,
+          revert: null,
+          permission: null,
+          time_created: 1,
+          time_updated: 2_000,
+          time_compacting: null,
+          time_archived: null,
+          workspace_id: null,
+        },
+      },
+      {
+        kind: "project",
+        id: "proj_early",
+        machine_id: "laptop",
+        time_updated: 1_000,
+        server_seq: 3,
+        deleted: false,
+        data: {
+          id: "proj_early",
+          worktree: "/tmp/project",
+          vcs: "git",
+          name: "Early",
+          icon_url: null,
+          icon_color: null,
+          time_created: 1,
+          time_updated: 1_000,
+          time_initialized: 1,
+          sandboxes: "[]",
+          commands: null,
+        },
+      },
+    ],
+  });
+
+  const result = await sync.pull();
+
+  expect(result).toEqual({ applied: 3, conflicts: 0, errors: 0 });
+  expect(stateManager.state.lastPulledSeq).toBe(3);
+  expect(stateManager.state.pullErrorCounts["message:msg_early:1"]).toBeUndefined();
+  expect(stateManager.state.pullErrorCounts["session:ses_early:2"]).toBeUndefined();
+  expect(stateManager.state.poisonedEnvelopes.length).toBe(0);
+  expect(countRows(dbPath, "project")).toBe(1);
+  expect(countRows(dbPath, "session")).toBe(1);
+  expect(countRows(dbPath, "message")).toBe(1);
 
   console.error = originalError;
   reader.close();

@@ -77,6 +77,22 @@ const TOMBSTONE_THRESHOLD_FRACTION_PERMISSIVE = 0.95;
  */
 const TOMBSTONE_CONFIRMATION_DELAY_MS = 30_000;
 
+// Retry transient pull-order inversions parent-first within the same page.
+// This mirrors the natural dependency graph in opencode.db:
+// project -> session -> message -> part, with permission/todo/session_share
+// hanging off project/session. If a peer pushed rows out of order, a pulled
+// child can fail its FK check even though the parent is later in the same
+// batch; one in-page retry after parents land is enough to recover.
+const PULL_RETRY_ORDER: Record<SyncKind, number> = {
+  project: 0,
+  session: 1,
+  permission: 2,
+  message: 3,
+  part: 4,
+  todo: 5,
+  session_share: 6,
+};
+
 function rowStateKey(kind: SyncKind, id: string): string {
   return `${kind}:${id}`;
 }
@@ -536,6 +552,10 @@ export class SessionSync {
         this.machineId,
       );
       pulled += res.envelopes.length;
+      const pageCursorSeq = res.cursor_seq ??
+        (res.envelopes.length > 0
+          ? res.envelopes[res.envelopes.length - 1]!.server_seq
+          : this.stateManager.state.lastPulledSeq);
 
       const rememberedRows: Record<string, { time_updated: number; parent?: string }> = {};
       const forgottenRows = new Set<string>();
@@ -561,9 +581,32 @@ export class SessionSync {
       let lastGoodSeq = this.stateManager.state.lastPulledSeq;
       let firstErrorSeq: number | null = null;
 
-      for (const envelope of res.envelopes) {
-        const envelopeKey = `${envelope.kind}:${envelope.id}:${envelope.server_seq}`;
-        
+      const applyOnce = (envelope: SyncEnvelope): { result: ApplyResult; thrownError: string | null } => {
+        try {
+          return { result: this.dbWriter.applyEnvelope(envelope), thrownError: null };
+        } catch (err) {
+          // Defensive: applyEnvelope is supposed to return "error" rather
+          // than throw. Treat throws the same way as other retryable apply
+          // failures so a later parent in the same page still gets a chance
+          // to unblock the row before we increment the poison counter.
+          return { result: "error", thrownError: String(err) };
+        }
+      };
+
+      type PullOutcome = {
+        result: ApplyResult | "poisoned-skip";
+        thrownError: string | null;
+        firstAttemptError?: string;
+      };
+
+      const outcomes: Array<PullOutcome | undefined> = [];
+      const deferred: Array<{
+        index: number;
+        envelope: SyncEnvelope;
+        firstOutcome: { result: ApplyResult; thrownError: string | null };
+      }> = [];
+
+      for (const [index, envelope] of res.envelopes.entries()) {
         // Skip already-poisoned envelopes to avoid re-applying and duplicate
         // entries. Advance cursor if no prior error blocked us.
         const alreadyPoisoned = this.stateManager.state.poisonedEnvelopes.some(
@@ -573,27 +616,48 @@ export class SessionSync {
             p.server_seq === envelope.server_seq,
         );
         if (alreadyPoisoned) {
+          outcomes[index] = { result: "poisoned-skip", thrownError: null };
+          continue;
+        }
+
+        const outcome = applyOnce(envelope);
+        if (outcome.result === "error") {
+          deferred.push({ index, envelope, firstOutcome: outcome });
+          continue;
+        }
+
+        outcomes[index] = outcome;
+      }
+
+      // Retry once after the whole page has had a chance to land, ordered by
+      // parent-before-child dependencies. This repairs child-before-parent
+      // batches inside a single page instead of poisoning them across cycles.
+      deferred.sort((a, b) => {
+        const orderDiff = PULL_RETRY_ORDER[a.envelope.kind] - PULL_RETRY_ORDER[b.envelope.kind];
+        if (orderDiff !== 0) return orderDiff;
+        return a.envelope.server_seq - b.envelope.server_seq;
+      });
+
+      for (const { index, envelope, firstOutcome } of deferred) {
+        const retryOutcome = applyOnce(envelope);
+        outcomes[index] = firstOutcome.thrownError
+          ? { ...retryOutcome, firstAttemptError: firstOutcome.thrownError }
+          : retryOutcome;
+      }
+
+      for (const [index, envelope] of res.envelopes.entries()) {
+        const envelopeKey = `${envelope.kind}:${envelope.id}:${envelope.server_seq}`;
+        const outcome = outcomes[index];
+        if (!outcome) continue;
+
+        if (outcome.result === "poisoned-skip") {
           if (firstErrorSeq === null) {
-            lastGoodSeq = envelope.server_seq;
+            lastGoodSeq = Math.max(lastGoodSeq, Math.min(envelope.server_seq, pageCursorSeq));
           }
           continue;
         }
-        
-        let result: ApplyResult;
-        let thrownError: string | null = null;
-        try {
-          result = this.dbWriter.applyEnvelope(envelope);
-        } catch (err) {
-          // Defensive: applyEnvelope is supposed to return "error" rather
-          // than throw, but anything that does escape lands here.
-          result = "error";
-          thrownError = String(err);
-          this.log("envelope apply threw (will retry next cycle)", {
-            kind: envelope.kind,
-            id: envelope.id,
-            error: thrownError,
-          });
-        }
+
+        const { result, thrownError, firstAttemptError } = outcome;
 
         if (result === "applied" || result === "skipped") {
           const rowKey = rowStateKey(envelope.kind, envelope.id);
@@ -626,6 +690,30 @@ export class SessionSync {
           }
         } else {
           // result === "error"
+          if (res.dependency_closure === true) {
+            const missing = this.dbWriter.missingDependencies(envelope);
+            if (missing.length > 0) {
+              errors++;
+              this.log("orphan envelope skipped after dependency-closure pull", {
+                kind: envelope.kind,
+                id: envelope.id,
+                server_seq: envelope.server_seq,
+                missing,
+              });
+              this.stateManager.recordPoisonedEnvelope({
+                kind: envelope.kind,
+                id: envelope.id,
+                server_seq: envelope.server_seq,
+                lastError: `missing dependencies: ${missing.map((d) => `${d.kind}:${d.id}`).join(", ")}`,
+              });
+              this.stateManager.clearPullErrorCount(envelopeKey);
+              if (firstErrorSeq === null) {
+                lastGoodSeq = Math.max(lastGoodSeq, Math.min(envelope.server_seq, pageCursorSeq));
+              }
+              continue;
+            }
+          }
+
           errors++;
           const attempts = this.stateManager.incrementPullErrorCount(envelopeKey);
           if (attempts >= PULL_POISON_THRESHOLD) {
@@ -637,19 +725,24 @@ export class SessionSync {
               id: envelope.id,
               server_seq: envelope.server_seq,
               attempts,
-              lastError: thrownError ?? undefined,
+              lastError: thrownError ?? firstAttemptError ?? undefined,
+              ...(firstAttemptError && firstAttemptError !== thrownError
+                ? { firstAttemptError }
+                : {}),
             });
             this.stateManager.recordPoisonedEnvelope({
               kind: envelope.kind,
               id: envelope.id,
               server_seq: envelope.server_seq,
-              ...(thrownError ? { lastError: thrownError } : {}),
+              ...(thrownError || firstAttemptError
+                ? { lastError: thrownError ?? firstAttemptError }
+                : {}),
             });
             this.stateManager.clearPullErrorCount(envelopeKey);
             // Advance lastGoodSeq so the cursor crosses the poisoned
             // envelope and subsequent pulls can proceed.
             if (firstErrorSeq === null) {
-              lastGoodSeq = envelope.server_seq;
+              lastGoodSeq = Math.max(lastGoodSeq, Math.min(envelope.server_seq, pageCursorSeq));
             }
             continue;
           }
@@ -660,6 +753,10 @@ export class SessionSync {
             time_updated: envelope.time_updated,
             server_seq: envelope.server_seq,
             attempts,
+            ...(thrownError ? { lastError: thrownError } : {}),
+            ...(firstAttemptError && firstAttemptError !== thrownError
+              ? { firstAttemptError }
+              : {}),
           });
           // Don't advance lastGoodSeq past the error.
           continue;
@@ -670,7 +767,7 @@ export class SessionSync {
         // process the rest of the page so error counts are accurate, but
         // we don't extend lastGoodSeq.
         if (firstErrorSeq === null) {
-          lastGoodSeq = envelope.server_seq;
+          lastGoodSeq = Math.max(lastGoodSeq, Math.min(envelope.server_seq, pageCursorSeq));
         }
       }
 
@@ -710,8 +807,7 @@ export class SessionSync {
         // to the global max would skip every row between the batch tail and
         // the global max on the next pagination request.
         // pullRows() guarantees ascending server_seq order.
-        const batchMaxSeq = res.envelopes[res.envelopes.length - 1]!.server_seq;
-        this.stateManager.updateSeq(batchMaxSeq);
+        this.stateManager.updateSeq(pageCursorSeq);
       } else if (res.more) {
         // Defensive: the current server can't produce {envelopes:[], more:true}
         // (its `more` flag is `rows.length > limit`, so empty rows implies
