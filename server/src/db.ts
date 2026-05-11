@@ -54,6 +54,7 @@ export class LedgerDB {
   private stmtGetNextSeq;
   private stmtSetNextSeq;
   private stmtGetRow;
+  private stmtGetRowExclude;
   private stmtInsertRow;
   private stmtUpdateRow;
   private stmtPullRows;
@@ -105,6 +106,11 @@ export class LedgerDB {
       { kind: string; id: string; machine_id: string; time_updated: number; server_seq: number; deleted: number; data: string | null; received_at: number },
       [string, string]
     >("SELECT * FROM sync_row WHERE kind = ? AND id = ?");
+
+    this.stmtGetRowExclude = this.db.prepare<
+      { kind: string; id: string; machine_id: string; time_updated: number; server_seq: number; deleted: number; data: string | null; received_at: number },
+      [string, string, string]
+    >("SELECT * FROM sync_row WHERE kind = ? AND id = ? AND machine_id != ?");
 
     this.stmtInsertRow = this.db.prepare(
       `INSERT INTO sync_row (kind, id, machine_id, time_updated, server_seq, deleted, data, received_at)
@@ -406,7 +412,7 @@ export class LedgerDB {
       rows = rows.slice(0, limit);
     }
     const cursorSeq = rows.length > 0 ? rows[rows.length - 1]!.server_seq : since;
-    rows = this.withDependencyClosure(rows);
+    rows = this.withDependencyClosure(rows, exclude);
 
     const envelopes: SyncEnvelope[] = rows.map((row) => ({
       kind: row.kind as SyncEnvelope["kind"],
@@ -441,6 +447,7 @@ export class LedgerDB {
       data: string | null;
       received_at: number;
     }>,
+    exclude?: string,
   ): Array<{
     kind: string;
     id: string;
@@ -462,7 +469,9 @@ export class LedgerDB {
         const key = `${dep.kind}:${dep.id}`;
         if (byKey.has(key)) continue;
 
-        const depRow = this.stmtGetRow.get(dep.kind, dep.id);
+        const depRow = exclude
+          ? this.stmtGetRowExclude.get(dep.kind, dep.id, exclude)
+          : this.stmtGetRow.get(dep.kind, dep.id);
         if (!depRow || depRow.deleted === 1) continue;
 
         byKey.set(key, depRow);
