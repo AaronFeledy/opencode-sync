@@ -8,7 +8,7 @@ Cross-machine session and config sync for [opencode](https://opencode.ai), coord
 
 - **Sessions, messages, parts, todos, projects** — synced at the SQLite row level between machines (not as a giant whole-DB blob). Per-session conflicts resolve last-writer-wins by `time_updated`, with a TUI toast when a conflict was auto-resolved.
 - **Custom agents, commands, skills, modes, `AGENTS.md`** — synced as files with per-file SHA-256 manifest.
-- **`opencode.json` / `tui.json`** — synced, with a local-only `opencode-sync.overrides.jsonc` for per-machine tweaks.
+- **`opencode.json`, `oh-my-openagent.json`, and `tui.json`** — synced (including `.jsonc` variants), with a local-only `opencode-sync.overrides.jsonc` for per-machine tweaks.
 - **`auth.json`** — optional; synced over your private network if you enable it.
 
 ## Architecture
