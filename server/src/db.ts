@@ -406,7 +406,7 @@ export class LedgerDB {
       rows = rows.slice(0, limit);
     }
     const cursorSeq = rows.length > 0 ? rows[rows.length - 1]!.server_seq : since;
-    rows = this.withDependencyClosure(rows);
+    rows = this.withDependencyClosure(rows, exclude);
 
     const envelopes: SyncEnvelope[] = rows.map((row) => ({
       kind: row.kind as SyncEnvelope["kind"],
@@ -441,6 +441,7 @@ export class LedgerDB {
       data: string | null;
       received_at: number;
     }>,
+    exclude?: string,
   ): Array<{
     kind: string;
     id: string;
@@ -464,6 +465,7 @@ export class LedgerDB {
 
         const depRow = this.stmtGetRow.get(dep.kind, dep.id);
         if (!depRow || depRow.deleted === 1) continue;
+        if (exclude && depRow.machine_id === exclude) continue;
 
         byKey.set(key, depRow);
         queue.push(depRow);

@@ -611,12 +611,11 @@ export class SessionSync {
         }
 
         const outcome = applyOnce(envelope);
+        outcomes[index] = outcome;
         if (outcome.result === "error") {
           deferred.push({ index, envelope });
           continue;
         }
-
-        outcomes[index] = outcome;
       }
 
       // Retry once after the whole page has had a chance to land, ordered by
@@ -629,7 +628,18 @@ export class SessionSync {
       });
 
       for (const { index, envelope } of deferred) {
-        outcomes[index] = applyOnce(envelope);
+        const firstAttempt = outcomes[index];
+        const retryOutcome = applyOnce(envelope);
+        // Preserve first-attempt diagnostic when both attempts fail
+        if (
+          retryOutcome.result === "error" &&
+          firstAttempt?.result === "error" &&
+          firstAttempt.thrownError &&
+          retryOutcome.thrownError !== firstAttempt.thrownError
+        ) {
+          retryOutcome.thrownError = `${retryOutcome.thrownError} (first attempt: ${firstAttempt.thrownError})`;
+        }
+        outcomes[index] = retryOutcome;
       }
 
       for (const [index, envelope] of res.envelopes.entries()) {
