@@ -593,8 +593,18 @@ export class SessionSync {
         }
       };
 
-      const outcomes: Array<{ result: ApplyResult | "poisoned-skip"; thrownError: string | null } | undefined> = [];
-      const deferred: Array<{ index: number; envelope: SyncEnvelope }> = [];
+      type PullOutcome = {
+        result: ApplyResult | "poisoned-skip";
+        thrownError: string | null;
+        firstAttemptError?: string;
+      };
+
+      const outcomes: Array<PullOutcome | undefined> = [];
+      const deferred: Array<{
+        index: number;
+        envelope: SyncEnvelope;
+        firstOutcome: { result: ApplyResult; thrownError: string | null };
+      }> = [];
 
       for (const [index, envelope] of res.envelopes.entries()) {
         // Skip already-poisoned envelopes to avoid re-applying and duplicate
@@ -612,7 +622,7 @@ export class SessionSync {
 
         const outcome = applyOnce(envelope);
         if (outcome.result === "error") {
-          deferred.push({ index, envelope });
+          deferred.push({ index, envelope, firstOutcome: outcome });
           continue;
         }
 
@@ -628,8 +638,11 @@ export class SessionSync {
         return a.envelope.server_seq - b.envelope.server_seq;
       });
 
-      for (const { index, envelope } of deferred) {
-        outcomes[index] = applyOnce(envelope);
+      for (const { index, envelope, firstOutcome } of deferred) {
+        const retryOutcome = applyOnce(envelope);
+        outcomes[index] = firstOutcome.thrownError
+          ? { ...retryOutcome, firstAttemptError: firstOutcome.thrownError }
+          : retryOutcome;
       }
 
       for (const [index, envelope] of res.envelopes.entries()) {
@@ -644,7 +657,7 @@ export class SessionSync {
           continue;
         }
 
-        const { result, thrownError } = outcome;
+        const { result, thrownError, firstAttemptError } = outcome;
 
         if (result === "applied" || result === "skipped") {
           const rowKey = rowStateKey(envelope.kind, envelope.id);
@@ -712,13 +725,18 @@ export class SessionSync {
               id: envelope.id,
               server_seq: envelope.server_seq,
               attempts,
-              lastError: thrownError ?? undefined,
+              lastError: thrownError ?? firstAttemptError ?? undefined,
+              ...(firstAttemptError && firstAttemptError !== thrownError
+                ? { firstAttemptError }
+                : {}),
             });
             this.stateManager.recordPoisonedEnvelope({
               kind: envelope.kind,
               id: envelope.id,
               server_seq: envelope.server_seq,
-              ...(thrownError ? { lastError: thrownError } : {}),
+              ...(thrownError || firstAttemptError
+                ? { lastError: thrownError ?? firstAttemptError }
+                : {}),
             });
             this.stateManager.clearPullErrorCount(envelopeKey);
             // Advance lastGoodSeq so the cursor crosses the poisoned
@@ -735,6 +753,10 @@ export class SessionSync {
             time_updated: envelope.time_updated,
             server_seq: envelope.server_seq,
             attempts,
+            ...(thrownError ? { lastError: thrownError } : {}),
+            ...(firstAttemptError && firstAttemptError !== thrownError
+              ? { firstAttemptError }
+              : {}),
           });
           // Don't advance lastGoodSeq past the error.
           continue;
