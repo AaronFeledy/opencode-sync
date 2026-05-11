@@ -7,7 +7,7 @@ import { FileSync } from "./files.js";
 import { StateManager } from "./state.js";
 import { sha256Hex } from "./util.js";
 import type { FileManifestEntry, FileSyncConfig } from "@opencode-sync/shared";
-import { AUTH_SYNC_PATH } from "@opencode-sync/shared";
+import { AUTH_SYNC_PATH, HOME_AGENTS_SYNC_PATH } from "@opencode-sync/shared";
 
 const HOME = os.homedir();
 
@@ -36,6 +36,7 @@ const BASE_CONFIG: FileSyncConfig = {
   opencode_json: false,
   tui_json: false,
   auth_json: false,
+  home_agents: false,
 };
 
 class MockClient {
@@ -117,6 +118,26 @@ beforeEach(() => {
 
   fs.rmSync(CONFIG_BASE, { recursive: true, force: true });
   fs.rmSync(DATA_BASE, { recursive: true, force: true });
+});
+
+test("includes oh-my-openagent config files with opencode_json sync", async () => {
+  writeTrackedFile(path.join(CONFIG_BASE, "oh-my-openagent.json"), "{}\n", 1_000);
+  writeTrackedFile(path.join(CONFIG_BASE, "oh-my-openagent.jsonc"), "// config\n{}\n", 2_000);
+
+  const fileSync = new FileSync(
+    new MockClient() as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, opencode_json: true },
+    new StateManager("desktop"),
+    () => {},
+  );
+
+  const manifest = await fileSync.computeLocalManifest();
+
+  expect(manifest.map((entry) => entry.relpath).sort()).toEqual([
+    "oh-my-openagent.json",
+    "oh-my-openagent.jsonc",
+  ]);
 });
 
 test("applies remote tombstones without re-uploading the deleted file", async () => {
@@ -229,6 +250,134 @@ test("maps auth.json to a server-safe relpath", async () => {
 
   expect(client.uploads).toHaveLength(1);
   expect(client.uploads[0]?.relpath).toBe(AUTH_SYNC_PATH);
+});
+
+// Regression: the `skills` flag previously pointed at the wrong directory
+// (~/.config/opencode/skills/ — plural), so no skills ever synced even with
+// the flag enabled. Opencode actually stores them under ~/.config/opencode/skill/
+// (singular).
+test("syncs skills from ~/.config/opencode/skill/ (singular)", async () => {
+  writeTrackedFile(
+    path.join(CONFIG_BASE, "skill", "my-skill", "SKILL.md"),
+    "# My Skill\n",
+    1_000,
+  );
+
+  const fileSync = new FileSync(
+    new MockClient() as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, skills: true },
+    new StateManager("desktop"),
+    () => {},
+  );
+
+  const manifest = await fileSync.computeLocalManifest();
+
+  expect(manifest.map((entry) => entry.relpath)).toEqual([
+    path.join("skill", "my-skill", "SKILL.md"),
+  ]);
+});
+
+test("ignores ~/.config/opencode/skills/ (plural — wrong path)", async () => {
+  writeTrackedFile(
+    path.join(CONFIG_BASE, "skills", "stale.md"),
+    "should not be synced\n",
+    1_000,
+  );
+
+  const fileSync = new FileSync(
+    new MockClient() as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, skills: true },
+    new StateManager("desktop"),
+    () => {},
+  );
+
+  const manifest = await fileSync.computeLocalManifest();
+
+  expect(manifest).toEqual([]);
+});
+
+test("syncs ~/.agents/ when home_agents is enabled, with .agents/* relpaths", async () => {
+  const homeAgentsAbs = path.join(HOME, HOME_AGENTS_SYNC_PATH);
+  writeTrackedFile(
+    path.join(homeAgentsAbs, "skills", "brief", "SKILL.md"),
+    "# Brief\n",
+    1_000,
+  );
+  writeTrackedFile(
+    path.join(homeAgentsAbs, "skills", "topic", "SKILL.md"),
+    "# Topic\n",
+    2_000,
+  );
+
+  const client = new MockClient();
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, home_agents: true },
+    new StateManager("desktop"),
+    () => {},
+  );
+
+  const manifest = await fileSync.computeLocalManifest();
+
+  expect(manifest.map((entry) => entry.relpath).sort()).toEqual([
+    path.join(".agents", "skills", "brief", "SKILL.md"),
+    path.join(".agents", "skills", "topic", "SKILL.md"),
+  ]);
+
+  await fileSync.sync();
+
+  const uploadedRelpaths = client.uploads.map((u) => u.relpath).sort();
+  expect(uploadedRelpaths).toEqual([
+    path.join(".agents", "skills", "brief", "SKILL.md"),
+    path.join(".agents", "skills", "topic", "SKILL.md"),
+  ]);
+});
+
+test("home_agents off (default) does NOT sync ~/.agents/", async () => {
+  writeTrackedFile(
+    path.join(HOME, HOME_AGENTS_SYNC_PATH, "skills", "brief", "SKILL.md"),
+    "# Brief\n",
+    1_000,
+  );
+
+  const fileSync = new FileSync(
+    new MockClient() as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG },
+    new StateManager("desktop"),
+    () => {},
+  );
+
+  const manifest = await fileSync.computeLocalManifest();
+
+  expect(manifest).toEqual([]);
+});
+
+test("downloads a remote .agents/* file into ~/.agents/", async () => {
+  const relpath = path.join(".agents", "skills", "incoming", "SKILL.md");
+  const content = "# Incoming\n";
+
+  const client = new MockClient();
+  const remoteEntry = toManifestEntry(relpath, content, 5_000, "laptop");
+  client.manifest = [remoteEntry];
+  client.blobs.set(remoteEntry.sha256, new TextEncoder().encode(content));
+
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, home_agents: true },
+    new StateManager("desktop"),
+    () => {},
+  );
+
+  await fileSync.sync();
+
+  const localPath = path.join(HOME, relpath);
+  expect(fs.existsSync(localPath)).toBe(true);
+  expect(fs.readFileSync(localPath, "utf-8")).toBe(content);
 });
 
 // ── H1 regression: transient delete failure must retain knownFiles entry ──
