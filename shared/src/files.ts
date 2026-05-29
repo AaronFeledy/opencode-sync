@@ -32,9 +32,40 @@ export interface FileSyncConfig {
   opencode_json: boolean;
   tui_json: boolean;
   auth_json: boolean;
+  /**
+   * Sync `~/.agents/` (the cross-tool agent home directory used by
+   * Claude Code and other agent runners — typically holds shared
+   * skills under `~/.agents/skills/`). Off by default because it
+   * lives outside opencode's config root.
+   */
+  home_agents: boolean;
 }
 
 export const AUTH_SYNC_PATH = ".local/share/opencode/auth.json";
+
+/**
+ * Sync prefix for `~/.agents/` — manifest paths look like
+ * `.agents/skills/<skill-name>/SKILL.md`. Treated as a "home-rooted"
+ * path: resolved relative to `$HOME` rather than `~/.config/opencode/`.
+ */
+export const HOME_AGENTS_SYNC_PATH = ".agents";
+
+/**
+ * Manifest-path prefixes that are resolved relative to `$HOME` instead
+ * of the opencode config base. The plugin uses this to map manifest
+ * relpaths back to filesystem paths and to choose the right `baseDir`
+ * when walking an external sync root.
+ */
+export const HOME_ROOTED_PATH_PREFIXES: readonly string[] = [
+  AUTH_SYNC_PATH,
+  HOME_AGENTS_SYNC_PATH,
+];
+
+export function isHomeRootedRelpath(relpath: string): boolean {
+  return HOME_ROOTED_PATH_PREFIXES.some(
+    (prefix) => relpath === prefix || relpath.startsWith(prefix + "/"),
+  );
+}
 
 export const DEFAULT_FILE_SYNC_CONFIG: FileSyncConfig = {
   agents: true,
@@ -45,21 +76,31 @@ export const DEFAULT_FILE_SYNC_CONFIG: FileSyncConfig = {
   opencode_json: true,
   tui_json: true,
   auth_json: false, // off by default — contains API keys
+  home_agents: false, // off by default — opt-in cross-tool agent home
 };
 
 /**
  * Directories and files to sync, keyed by config flag.
- * Paths are relative to ~/.config/opencode/
+ *
+ * Most paths are relative to `~/.config/opencode/`. Entries listed in
+ * `HOME_ROOTED_PATH_PREFIXES` (currently `auth_json` and `home_agents`)
+ * are resolved relative to `$HOME` instead.
  */
 export const FILE_SYNC_PATHS: Record<keyof FileSyncConfig, string[]> = {
   agents: ["agents"],
   commands: ["commands"],
-  skills: ["skills"],
+  skills: ["skill"],
   modes: ["modes"],
   agents_md: ["AGENTS.md"],
-  opencode_json: ["opencode.json", "opencode.jsonc"],
+  opencode_json: [
+    "opencode.json",
+    "opencode.jsonc",
+    "oh-my-openagent.json",
+    "oh-my-openagent.jsonc",
+  ],
   tui_json: ["tui.json", "tui.jsonc"],
   auth_json: [AUTH_SYNC_PATH],
+  home_agents: [HOME_AGENTS_SYNC_PATH],
 };
 
 /**

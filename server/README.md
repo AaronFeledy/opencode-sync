@@ -38,6 +38,18 @@ The server writes its ledger DB and blob store into `OPENCODE_SYNC_DATA_DIR` (de
 
 ## Production deployment (systemd)
 
+This is the supported way to run the server — `bun run dev` / `bun run start` are for hacking on the server itself, not for serving your peers. The unit ships with sandboxing (`ProtectHome=true`, `ProtectSystem=strict`, dedicated `opencode-sync` user) that the dev commands don't apply.
+
+### Quick install
+
+After cloning the repo on the VPS, run:
+
+```bash
+bun run install-server
+```
+
+It builds the binary, creates the service user, generates the bearer token (preserved on re-runs), writes `/etc/opencode-sync/env`, installs the unit, and verifies `/health`. Idempotent — re-run it after `git pull` to redeploy. The script lives at `scripts/install-server.sh`; the manual steps below document what it does.
+
 ### 1. Clone and build on the VPS
 
 ```bash
@@ -46,8 +58,10 @@ cd ~/opencode-sync
 bun install
 bun run --cwd server build
 # Produces server/dist/opencode-sync-server
-sudo cp server/dist/opencode-sync-server /usr/local/bin/opencode-sync-server
+sudo install -m 0755 server/dist/opencode-sync-server /usr/local/bin/opencode-sync-server
 ```
+
+> Use `install` (or `cp`), **not `ln -s`**. The unit ships with `ProtectHome=true`, so a symlink into your home directory will resolve to nothing inside the service's namespace and the unit will crash-loop with `status=203/EXEC`.
 
 > The VPS also runs the [opencode-sync plugin](../plugin/README.md) inside its own `opencode serve` instance — link it from the same clone after the server is up.
 
@@ -91,13 +105,21 @@ curl http://100.x.x.x:4455/health
 ### Updating
 
 ```bash
+cd ~/opencode-sync && git pull && bun run install-server
+```
+
+The installer is idempotent: it re-uses the existing token, rebuilds the binary, atomically replaces `/usr/local/bin/opencode-sync-server`, reloads the unit, and verifies `/health`. The equivalent manual sequence is:
+
+```bash
 cd ~/opencode-sync
 git pull
 bun install
 bun run --cwd server build
-sudo cp server/dist/opencode-sync-server /usr/local/bin/opencode-sync-server
+sudo install -m 0755 server/dist/opencode-sync-server /usr/local/bin/opencode-sync-server
 sudo systemctl restart opencode-sync
 ```
+
+> **Don't symlink the binary** into `/usr/local/bin/opencode-sync-server`. The unit ships with `ProtectHome=true`, so a symlink resolving into `/home/...` will fail to exec inside the service namespace (`status=203/EXEC`).
 
 ## API endpoints
 

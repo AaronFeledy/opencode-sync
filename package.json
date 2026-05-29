@@ -14,6 +14,7 @@
     "typecheck": "bun run --cwd shared typecheck && bun run --cwd plugin typecheck && bun run --cwd server typecheck",
     "server:dev": "bun run --cwd server dev",
     "server:start": "bun run --cwd server start",
+    "install-server": "./scripts/install-server.sh",
     "test": "bun run scripts/test.ts",
     "pretest": "mkdir -p /tmp/opencode-sync-test-home"
   },

@@ -131,6 +131,40 @@ export class DbWriter {
     return this.upsertRow(kind, row) ? "applied" : "error";
   }
 
+  missingDependencies(envelope: SyncEnvelope): Array<{ kind: SyncKind; id: string }> {
+    if (envelope.deleted || !envelope.data) return [];
+    const data = envelope.data as unknown as Record<string, SQLQueryBindings>;
+    const missing: Array<{ kind: SyncKind; id: string }> = [];
+
+    const check = (kind: SyncKind, id: SQLQueryBindings | undefined): void => {
+      if (typeof id !== "string" || id.length === 0) return;
+      if (!this.rowExists(kind, [id])) {
+        missing.push({ kind, id });
+      }
+    };
+
+    switch (envelope.kind) {
+      case "session":
+        check("project", data["project_id"]);
+        break;
+      case "message":
+        check("session", data["session_id"]);
+        break;
+      case "part":
+        check("message", data["message_id"]);
+        break;
+      case "todo":
+      case "session_share":
+        check("session", data["session_id"]);
+        break;
+      case "permission":
+        check("project", data["project_id"]);
+        break;
+    }
+
+    return missing;
+  }
+
   close(): void {
     this.db.close();
   }
@@ -161,6 +195,18 @@ export class DbWriter {
       .get(...pkValues);
 
     return row?.time_updated ?? null;
+  }
+
+  private rowExists(kind: SyncKind, pkValues: SQLQueryBindings[]): boolean {
+    const pkCols = PK_COLUMNS[kind]!;
+    if (pkValues.length !== pkCols.length) return false;
+    const where = pkCols.map((col) => `${col} = ?`).join(" AND ");
+    const row = this.db
+      .query<{ n: number }, SQLQueryBindings[]>(
+        `SELECT 1 AS n FROM ${kind} WHERE ${where}`,
+      )
+      .get(...pkValues);
+    return row !== null && row !== undefined;
   }
 
   private upsertRow(kind: SyncKind, data: Record<string, SQLQueryBindings>): boolean {

@@ -9,16 +9,20 @@ import type {
   FileSyncConfig,
   FileManifestEntry,
 } from "@opencode-sync/shared";
-import { AUTH_SYNC_PATH, FILE_SYNC_PATHS, FILE_SYNC_IGNORE } from "@opencode-sync/shared";
+import {
+  FILE_SYNC_PATHS,
+  FILE_SYNC_IGNORE,
+  isHomeRootedRelpath,
+} from "@opencode-sync/shared";
 import { StaleError, type SyncClient } from "./client.js";
 import type { StateManager } from "./state.js";
 import { sha256Hex, atomicWriteFile } from "./util.js";
 
 // ── Constants ──────────────────────────────────────────────────────
 
-const CONFIG_BASE = path.join(os.homedir(), ".config", "opencode");
+const HOME_BASE = os.homedir();
+const CONFIG_BASE = path.join(HOME_BASE, ".config", "opencode");
 const CONFLICTS_DIR = path.join(CONFIG_BASE, ".sync-conflicts");
-const AUTH_FILE_PATH = path.join(os.homedir(), ".local", "share", "opencode", "auth.json");
 
 // ── File sync ──────────────────────────────────────────────────────
 
@@ -80,7 +84,7 @@ export class FileSync {
           continue;
         }
         if (stat.isDirectory()) {
-          this.walkDir(absPath, CONFIG_BASE, entries, cache);
+          this.walkDir(absPath, this.baseDirFor(relRoot), entries, cache);
         } else if (stat.isFile()) {
           const relpath = this.toManifestRelpath(absPath, relRoot);
           if (this.shouldIgnore(relpath)) continue;
@@ -457,19 +461,20 @@ export class FileSync {
     return false;
   }
 
+  private baseDirFor(relpath: string): string {
+    return isHomeRootedRelpath(relpath) ? HOME_BASE : CONFIG_BASE;
+  }
+
   private resolveConfiguredPath(relRoot: string): string {
-    if (relRoot === AUTH_SYNC_PATH) return AUTH_FILE_PATH;
-    return path.resolve(CONFIG_BASE, relRoot);
+    return path.resolve(this.baseDirFor(relRoot), relRoot);
   }
 
   private resolveLocalPath(relpath: string): string {
-    if (relpath === AUTH_SYNC_PATH) return AUTH_FILE_PATH;
-    return path.join(CONFIG_BASE, relpath);
+    return path.join(this.baseDirFor(relpath), relpath);
   }
 
   private toManifestRelpath(absPath: string, relRoot: string): string {
-    if (relRoot === AUTH_SYNC_PATH) return AUTH_SYNC_PATH;
-    return path.relative(CONFIG_BASE, absPath);
+    return path.relative(this.baseDirFor(relRoot), absPath);
   }
 
   private walkDir(

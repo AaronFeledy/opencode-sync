@@ -2,6 +2,6 @@
  * @opencode-sync/shared — shared types for the sync system.
  */
 
-export * from "./types.js";
-export * from "./protocol.js";
-export * from "./files.js";
+export * from "./types";
+export * from "./protocol";
+export * from "./files";

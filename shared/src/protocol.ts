@@ -59,6 +59,15 @@ export interface PullQuery {
 export interface PullResponse {
   /** Current max server_seq */
   server_seq: number;
+  /**
+   * Cursor clients should persist after this page. Normally this is the last
+   * envelope from the base seq window. It can differ from the final envelope
+   * when the server appends dependency rows with later server_seq values so
+   * children can apply without skipping intervening ledger rows.
+   */
+  cursor_seq?: number;
+  /** True when the server included currently-known parent rows for children. */
+  dependency_closure?: boolean;
   /** Envelopes in server_seq order */
   envelopes: SyncEnvelope[];
   /** True if there are more rows to pull */
