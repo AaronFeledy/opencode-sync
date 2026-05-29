@@ -640,9 +640,10 @@ export class SessionSync {
 
       for (const { index, envelope, firstOutcome } of deferred) {
         const retryOutcome = applyOnce(envelope);
-        outcomes[index] = firstOutcome.thrownError
-          ? { ...retryOutcome, firstAttemptError: firstOutcome.thrownError }
-          : retryOutcome;
+        outcomes[index] = {
+          ...retryOutcome,
+          firstAttemptError: firstOutcome.thrownError ?? "first attempt returned error",
+        };
       }
 
       for (const [index, envelope] of res.envelopes.entries()) {
