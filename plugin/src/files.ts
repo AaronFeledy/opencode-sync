@@ -93,7 +93,26 @@ export class FileSync {
         const releaseLock = this.isAuthRelpath(relRoot)
           ? await this.acquireAuthLock()
           : undefined;
-        if (this.isAuthRelpath(relRoot) && !releaseLock) continue;
+        if (this.isAuthRelpath(relRoot) && !releaseLock) {
+          // OpenCode holds the auth lock (mid token-refresh). Don't read a
+          // possibly half-written file — but don't drop it from the manifest
+          // either. Dropping it makes the sync loop treat the path as
+          // remote-only (clobbering on-disk creds) and makes replaceKnownFiles
+          // forget its tracked state. Carry forward the last-known entry so
+          // this cycle treats it as present/unchanged and reconciles later.
+          const cached = cache[relRoot];
+          if (cached) {
+            entries.push({
+              relpath: relRoot,
+              sha256: cached.sha256,
+              size: cached.size,
+              mtime: cached.mtime,
+              machine_id: this.machineId,
+              deleted: false,
+            });
+          }
+          continue;
+        }
 
         try {
           const absPath = this.resolveConfiguredPath(relRoot);
@@ -395,6 +414,20 @@ export class FileSync {
         keepLocalAuth = this.shouldKeepLocalAuth(entry.relpath, absPath, remoteData);
         if (
           !keepLocalAuth &&
+          this.isAuthRelpath(entry.relpath) &&
+          !expectedLocal &&
+          fs.existsSync(absPath)
+        ) {
+          // Local auth file exists but was absent from this cycle's manifest
+          // (lock-skipped with no cached entry). Don't overwrite credentials
+          // we never compared against — let a later cycle reconcile.
+          this.log("local auth present but untracked, skipping remote download", {
+            relpath: entry.relpath,
+          });
+          return false;
+        }
+        if (
+          !keepLocalAuth &&
           expectedLocal &&
           this.isAuthRelpath(entry.relpath) &&
           !this.currentFileMatches(entry.relpath, expectedLocal)
@@ -414,8 +447,13 @@ export class FileSync {
         await releaseLock?.();
       }
       if (keepLocalAuth) {
-        await this.uploadCurrentFile(entry.relpath, Math.max(Date.now(), entry.mtime + 1));
-        this.log("kept local auth file over stale remote", { relpath: entry.relpath });
+        const pushed = await this.uploadCurrentFile(
+          entry.relpath,
+          Math.max(Date.now(), entry.mtime + 1),
+        );
+        if (pushed) {
+          this.log("kept local auth file over stale remote", { relpath: entry.relpath });
+        }
         return false;
       }
       this.log("downloaded", { relpath: entry.relpath });
@@ -530,7 +568,19 @@ export class FileSync {
     local: FileManifestEntry,
   ): Promise<{ entry: FileManifestEntry; uploaded: boolean }> {
     try {
-      await this.uploadCurrentFile(remote.relpath, Math.max(Date.now(), remote.mtime + 1));
+      const pushed = await this.uploadCurrentFile(
+        remote.relpath,
+        Math.max(Date.now(), remote.mtime + 1),
+      );
+      if (!pushed) {
+        // Lock contention prevented the upload — the server still holds its
+        // tombstone. Report no upload and keep the prior tracked entry so the
+        // sync counters and knownFiles state stay truthful; retry next cycle.
+        this.log("deferred keeping local auth over remote tombstone (lock busy)", {
+          relpath: remote.relpath,
+        });
+        return { entry: local, uploaded: false };
+      }
       const absPath = this.resolveLocalPath(remote.relpath);
       const stat = fs.statSync(absPath);
       this.log("kept local auth file over remote tombstone", { relpath: remote.relpath });
@@ -688,12 +738,18 @@ export class FileSync {
     return this.resolveLocalPath(AUTH_LOCK_SYNC_PATH);
   }
 
-  private isAuthLockStale(): boolean {
+  /**
+   * Returns the lock's mtime when it looks abandoned (older than the stale
+   * window), otherwise null. The caller re-checks this exact mtime right
+   * before stealing so a holder that refreshed its lock in the meantime is
+   * not robbed mid-write.
+   */
+  private staleAuthLockMtime(): number | null {
     try {
       const stats = fs.statSync(this.authLockPath());
-      return Date.now() - stats.mtimeMs > AUTH_LOCK_STALE_MS;
+      return Date.now() - stats.mtimeMs > AUTH_LOCK_STALE_MS ? stats.mtimeMs : null;
     } catch {
-      return false;
+      return null;
     }
   }
 
@@ -712,8 +768,23 @@ export class FileSync {
         if (code !== "EEXIST") throw error;
       }
 
-      if (this.isAuthLockStale()) {
-        await fs.promises.rm(this.authLockPath(), { force: true, recursive: true }).catch(() => {});
+      const staleMtime = this.staleAuthLockMtime();
+      if (staleMtime !== null) {
+        // Re-stat immediately before stealing: only remove the lock if its
+        // mtime is unchanged since we judged it stale. If the holder bumped
+        // the mtime (still alive, still writing), back off instead of
+        // stealing and racing a concurrent auth write.
+        let current: number | null = null;
+        try {
+          current = fs.statSync(this.authLockPath()).mtimeMs;
+        } catch {
+          current = null;
+        }
+        if (current === staleMtime) {
+          await fs.promises
+            .rm(this.authLockPath(), { force: true, recursive: true })
+            .catch(() => {});
+        }
         continue;
       }
 
@@ -800,10 +871,10 @@ export class FileSync {
     }
   }
 
-  private async uploadCurrentFile(relpath: string, mtime: number): Promise<void> {
+  private async uploadCurrentFile(relpath: string, mtime: number): Promise<boolean> {
     const absPath = this.resolveLocalPath(relpath);
     const releaseLock = this.isAuthRelpath(relpath) ? await this.acquireAuthLock() : undefined;
-    if (this.isAuthRelpath(relpath) && !releaseLock) return;
+    if (this.isAuthRelpath(relpath) && !releaseLock) return false;
     let data: Uint8Array;
     try {
       data = new Uint8Array(fs.readFileSync(absPath));
@@ -812,5 +883,6 @@ export class FileSync {
       await releaseLock?.();
     }
     await this.client.putFile(relpath, data, this.machineId, mtime);
+    return true;
   }
 }

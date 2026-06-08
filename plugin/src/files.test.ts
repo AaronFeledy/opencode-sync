@@ -302,6 +302,90 @@ test("skips auth sync while OpenCode auth lock is active", async () => {
   expect(client.uploads).toHaveLength(0);
 });
 
+// Regression: the auth lock is held while the local manifest is computed
+// (OpenCode mid token-refresh) but released before the download. The locally
+// refreshed credentials must survive — a stale remote must not clobber them,
+// and the tracked knownFiles entry must not be dropped. See Bugbot H1.
+test("does not clobber locally refreshed auth when lock releases mid-sync", async () => {
+  process.env.OPENCODE_SYNC_AUTH_LOCK_WAIT_MS = "0";
+  const oldContent = '{"openai":{"type":"api","key":"local-old"}}';
+  const newContent = '{"openai":{"type":"api","key":"local-new"}}';
+  const remoteContent = '{"openai":{"type":"api","key":"remote-stale"}}';
+
+  // On disk: freshly written by OpenCode (mtime 3000), newer than what we last
+  // tracked (mtime 1000). The lock hides this from the manifest pass.
+  writeTrackedFile(AUTH_FILE_PATH, newContent, 3_000);
+  fs.mkdirSync(AUTH_LOCK_PATH, { recursive: true });
+
+  const stateManager = new StateManager("desktop");
+  stateManager.replaceKnownFiles([
+    toManifestEntry(AUTH_SYNC_PATH, oldContent, 1_000, "desktop"),
+  ]);
+
+  const client = new MockClient();
+  const remoteEntry = toManifestEntry(AUTH_SYNC_PATH, remoteContent, 2_000, "laptop");
+  client.manifest = [remoteEntry];
+  client.blobs.set(remoteEntry.sha256, new TextEncoder().encode(remoteContent));
+  // Simulate OpenCode releasing the lock between manifest computation and the
+  // download attempt.
+  client.getBlobImpl = async (sha256) => {
+    fs.rmSync(AUTH_LOCK_PATH, { recursive: true, force: true });
+    const blob = client.blobs.get(sha256);
+    if (!blob) throw new Error(`missing blob: ${sha256}`);
+    return Uint8Array.from(blob).buffer;
+  };
+
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, auth_json: true },
+    stateManager,
+    () => {},
+  );
+
+  await fileSync.sync();
+
+  expect(fs.readFileSync(AUTH_FILE_PATH, "utf-8")).toBe(newContent);
+  expect(client.uploads).toHaveLength(0);
+  // Tracked state for the path must be preserved, not dropped.
+  expect(stateManager.state.knownFiles[AUTH_SYNC_PATH]).toBeDefined();
+});
+
+// Regression: same lock-release race but with no prior tracked entry. The
+// download guard must still refuse to overwrite an existing on-disk auth file
+// that never made it into this cycle's manifest. See Bugbot H1.
+test("does not clobber untracked on-disk auth when lock releases mid-sync", async () => {
+  process.env.OPENCODE_SYNC_AUTH_LOCK_WAIT_MS = "0";
+  const localContent = '{"openai":{"type":"api","key":"local-untracked"}}';
+  const remoteContent = '{"openai":{"type":"api","key":"remote-stale"}}';
+
+  writeTrackedFile(AUTH_FILE_PATH, localContent, 3_000);
+  fs.mkdirSync(AUTH_LOCK_PATH, { recursive: true });
+
+  const client = new MockClient();
+  const remoteEntry = toManifestEntry(AUTH_SYNC_PATH, remoteContent, 2_000, "laptop");
+  client.manifest = [remoteEntry];
+  client.blobs.set(remoteEntry.sha256, new TextEncoder().encode(remoteContent));
+  client.getBlobImpl = async (sha256) => {
+    fs.rmSync(AUTH_LOCK_PATH, { recursive: true, force: true });
+    const blob = client.blobs.get(sha256);
+    if (!blob) throw new Error(`missing blob: ${sha256}`);
+    return Uint8Array.from(blob).buffer;
+  };
+
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, auth_json: true },
+    new StateManager("desktop"),
+    () => {},
+  );
+
+  await fileSync.sync();
+
+  expect(fs.readFileSync(AUTH_FILE_PATH, "utf-8")).toBe(localContent);
+});
+
 test("does not download remote auth files when auth_json is disabled", async () => {
   const authContent = '{"anthropic":{"type":"oauth","refresh":"secret","expires":1}}';
   const accountsContent = '{"accounts":[{"type":"oauth","refresh":"secret","access":"a","expires":1,"addedAt":1,"lastUsed":1}]}';
