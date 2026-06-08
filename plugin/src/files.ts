@@ -809,7 +809,11 @@ export class FileSync {
     const localAnthropic = this.oauthProvider(local?.anthropic);
     const remoteAnthropic = this.oauthProvider(remote?.anthropic);
     if (!localAnthropic || !remoteAnthropic) return false;
-    if (localAnthropic.refresh === remoteAnthropic.refresh) return false;
+    // Freshness is decided purely by `expires`, which covers both a refresh
+    // rotation (different refresh token) and a plain access-token refresh
+    // (same refresh token, later expiry). Short-circuiting on equal refresh
+    // would let a stale remote with a newer mtime overwrite a still-valid
+    // local access token.
     return localAnthropic.expires > remoteAnthropic.expires;
   }
 

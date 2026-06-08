@@ -354,6 +354,51 @@ test("does not clobber locally refreshed auth when lock releases mid-sync", asyn
 // Regression: same lock-release race but with no prior tracked entry. The
 // download guard must still refuse to overwrite an existing on-disk auth file
 // that never made it into this cycle's manifest. See Bugbot H1.
+// Regression: a plain access-token refresh keeps the same refresh token but a
+// later `expires`. A stale remote with a newer mtime must not overwrite the
+// still-valid local access token. See Bugbot "Same refresh skips fresher check".
+test("keeps fresher local auth access token when refresh token is unchanged", async () => {
+  const localAuth = JSON.stringify({
+    anthropic: {
+      type: "oauth",
+      refresh: "same-refresh",
+      access: "local-fresh-access",
+      expires: 20_000,
+    },
+  });
+  const remoteAuth = JSON.stringify({
+    anthropic: {
+      type: "oauth",
+      refresh: "same-refresh",
+      access: "remote-stale-access",
+      expires: 10_000,
+    },
+  });
+  writeTrackedFile(AUTH_FILE_PATH, localAuth, 1_000);
+
+  const client = new MockClient();
+  // Remote has a newer mtime, so without the freshness check it would win.
+  const remoteEntry = toManifestEntry(AUTH_SYNC_PATH, remoteAuth, 2_000, "laptop");
+  client.manifest = [remoteEntry];
+  client.blobs.set(remoteEntry.sha256, new TextEncoder().encode(remoteAuth));
+
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, auth_json: true },
+    new StateManager("desktop"),
+    () => {},
+  );
+
+  await fileSync.sync();
+
+  expect(fs.readFileSync(AUTH_FILE_PATH, "utf-8")).toBe(localAuth);
+  expect(client.uploads).toHaveLength(1);
+  expect(client.uploads[0]?.relpath).toBe(AUTH_SYNC_PATH);
+  expect(client.uploads[0]?.data).toBe(localAuth);
+  expect(client.uploads[0]?.mtime).toBeGreaterThan(remoteEntry.mtime);
+});
+
 test("does not clobber untracked on-disk auth when lock releases mid-sync", async () => {
   process.env.OPENCODE_SYNC_AUTH_LOCK_WAIT_MS = "0";
   const localContent = '{"openai":{"type":"api","key":"local-untracked"}}';
