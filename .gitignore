@@ -31,3 +31,6 @@ server/data/
 .vscode/
 .idea/
 FINDINGS.md
+
+# OMO agent planning/scratch output
+.omo/
