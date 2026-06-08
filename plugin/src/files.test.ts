@@ -357,6 +357,100 @@ test("does not clobber locally refreshed auth when lock releases mid-sync", asyn
 // Regression: a plain access-token refresh keeps the same refresh token but a
 // later `expires`. A stale remote with a newer mtime must not overwrite the
 // still-valid local access token. See Bugbot "Same refresh skips fresher check".
+// Regression: a newer local mtime must NOT push a staler OAuth token over a
+// fresher copy already on the server. See Bugbot "Auth upload ignores token
+// freshness".
+test("does not upload stale auth over a fresher remote with an older mtime", async () => {
+  const localAuth = JSON.stringify({
+    anthropic: {
+      type: "oauth",
+      refresh: "same-refresh",
+      access: "local-stale-access",
+      expires: 5_000,
+    },
+  });
+  const remoteAuth = JSON.stringify({
+    anthropic: {
+      type: "oauth",
+      refresh: "same-refresh",
+      access: "remote-fresh-access",
+      expires: 10_000,
+    },
+  });
+  // Local file has the NEWER mtime but the STALER token.
+  writeTrackedFile(AUTH_FILE_PATH, localAuth, 2_000);
+
+  const client = new MockClient();
+  const remoteEntry = toManifestEntry(AUTH_SYNC_PATH, remoteAuth, 1_000, "laptop");
+  client.manifest = [remoteEntry];
+  client.blobs.set(remoteEntry.sha256, new TextEncoder().encode(remoteAuth));
+
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, auth_json: true },
+    new StateManager("desktop"),
+    () => {},
+  );
+
+  await fileSync.sync();
+
+  // Server keeps its fresher token; local converges to it.
+  expect(client.uploads).toHaveLength(0);
+  expect(fs.readFileSync(AUTH_FILE_PATH, "utf-8")).toBe(remoteAuth);
+});
+
+test("does not upload stale account store over a fresher remote with an older mtime", async () => {
+  const localAccounts = JSON.stringify({
+    accounts: [
+      {
+        type: "oauth",
+        refresh: "same-refresh",
+        access: "local-stale",
+        expires: 5_000,
+        addedAt: 1,
+        lastUsed: 1,
+      },
+    ],
+  });
+  const remoteAccounts = JSON.stringify({
+    accounts: [
+      {
+        type: "oauth",
+        refresh: "same-refresh",
+        access: "remote-fresh",
+        expires: 10_000,
+        addedAt: 1,
+        lastUsed: 1,
+      },
+    ],
+  });
+  writeTrackedFile(ANTHROPIC_ACCOUNTS_FILE_PATH, localAccounts, 2_000);
+
+  const client = new MockClient();
+  const remoteEntry = toManifestEntry(
+    ANTHROPIC_ACCOUNTS_SYNC_PATH,
+    remoteAccounts,
+    1_000,
+    "laptop",
+  );
+  client.manifest = [remoteEntry];
+  client.blobs.set(remoteEntry.sha256, new TextEncoder().encode(remoteAccounts));
+
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, auth_json: true },
+    new StateManager("desktop"),
+    () => {},
+  );
+
+  await fileSync.sync();
+
+  expect(client.uploads).toHaveLength(0);
+  expect(fs.readFileSync(ANTHROPIC_ACCOUNTS_FILE_PATH, "utf-8")).toBe(remoteAccounts);
+});
+
 test("keeps fresher local auth access token when refresh token is unchanged", async () => {
   const localAuth = JSON.stringify({
     anthropic: {

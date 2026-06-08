@@ -366,6 +366,10 @@ export class FileSync {
       }
 
       if (remote.deleted) {
+        // Auth tombstones are fully reconciled in the remote-entry pass
+        // (keepLocalAuthOverRemoteTombstone) — don't re-upload here.
+        if (this.isAuthRelpath(local.relpath)) continue;
+
         // Remote tombstone is newer or equal — keep it.
         if (local.mtime <= remote.mtime) continue;
 
@@ -379,6 +383,19 @@ export class FileSync {
 
       // Local is newer — upload
       if (local.mtime > remote.mtime) {
+        // A newer mtime alone must not let a staler OAuth token clobber a
+        // fresher copy already on the server. For auth paths, compare token
+        // freshness and pull the remote down instead when it is fresher.
+        if (this.isAuthRelpath(local.relpath)) {
+          const result = await this.uploadAuthRespectingFreshness(local, remote);
+          if (result === "uploaded") uploaded++;
+          else if (result === "downloaded") {
+            downloaded++;
+            postSyncByPath.set(remote.relpath, { ...remote, machine_id: this.machineId });
+          }
+          continue;
+        }
+
         const ok = await this.uploadFile(local);
         if (ok) uploaded++;
       }
@@ -839,6 +856,79 @@ export class FileSync {
         continue;
       }
       if (account.expires > remoteExpires) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Upload an auth file only when it is at least as fresh as the server copy.
+   * A newer local mtime is not sufficient: if the server already holds a
+   * strictly fresher OAuth token, pulling it down (rather than uploading the
+   * staler local copy) keeps every machine on the newest credentials.
+   */
+  private async uploadAuthRespectingFreshness(
+    local: FileManifestEntry,
+    remote: FileManifestEntry,
+  ): Promise<"uploaded" | "downloaded" | "skipped"> {
+    let remoteData: Buffer | undefined;
+    try {
+      remoteData = Buffer.from(await this.client.getBlob(remote.sha256));
+    } catch (err) {
+      // Can't fetch the remote to compare — fall back to mtime-based upload.
+      this.log("failed to fetch remote auth for freshness check, uploading by mtime", {
+        relpath: local.relpath,
+        error: String(err),
+      });
+      remoteData = undefined;
+    }
+
+    if (
+      remoteData &&
+      this.remoteAuthIsFresher(local.relpath, this.resolveLocalPath(local.relpath), remoteData)
+    ) {
+      this.log("remote auth token is fresher, downloading instead of uploading", {
+        relpath: local.relpath,
+      });
+      const ok = await this.downloadFile(remote, local);
+      return ok ? "downloaded" : "skipped";
+    }
+
+    const ok = await this.uploadFile(local);
+    return ok ? "uploaded" : "skipped";
+  }
+
+  /**
+   * Mirror of shouldKeepLocalAuth: true when the REMOTE copy carries a strictly
+   * fresher OAuth token, so a newer local mtime must not overwrite it.
+   */
+  private remoteAuthIsFresher(relpath: string, localPath: string, remoteData: Buffer): boolean {
+    if (!fs.existsSync(localPath)) return false;
+    if (relpath === ANTHROPIC_ACCOUNTS_SYNC_PATH) {
+      return this.remoteAccountStoreHasFresherToken(localPath, remoteData);
+    }
+    if (relpath !== AUTH_SYNC_PATH) return false;
+    const local = this.parseAuthJson(fs.readFileSync(localPath, "utf-8"));
+    const remote = this.parseAuthJson(remoteData.toString("utf-8"));
+    const localAnthropic = this.oauthProvider(local?.anthropic);
+    const remoteAnthropic = this.oauthProvider(remote?.anthropic);
+    if (!localAnthropic || !remoteAnthropic) return false;
+    return remoteAnthropic.expires > localAnthropic.expires;
+  }
+
+  private remoteAccountStoreHasFresherToken(localPath: string, remoteData: Buffer): boolean {
+    const local = this.parseAccountStore(fs.readFileSync(localPath, "utf-8"));
+    const remote = this.parseAccountStore(remoteData.toString("utf-8"));
+    if (!local.length || !remote.length) return false;
+    const localByRefresh = new Map(local.map((account) => [account.refresh, account.expires]));
+    for (const account of remote) {
+      const localExpires = localByRefresh.get(account.refresh);
+      if (typeof localExpires === "undefined") {
+        if (account.expires > Math.max(...local.map((localAccount) => localAccount.expires))) {
+          return true;
+        }
+        continue;
+      }
+      if (account.expires > localExpires) return true;
     }
     return false;
   }
