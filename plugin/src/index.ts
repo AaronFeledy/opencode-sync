@@ -198,9 +198,14 @@ export const server: Plugin = async (input, _options) => {
   boot.step("connecting to sync server");
   try {
     const health = await client.health();
+    // Negotiate optional capabilities (e.g. gzip request bodies). Older
+    // servers omit `features`, leaving request compression disabled so we
+    // never send a body they can't inflate.
+    client.setServerFeatures(health.features);
     log("connected to server", {
       version: health.version,
       serverTime: health.time,
+      features: health.features ?? [],
     });
     boot.step(`connected to sync server (${health.version})`);
   } catch (err) {

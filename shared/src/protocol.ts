@@ -102,8 +102,24 @@ export interface HeadsResponse {
 
 // ── Health ──────────────────────────────────────────────────────────
 
+/**
+ * Capability advertised by a server that can inflate gzip-encoded request
+ * bodies (`Content-Encoding: gzip`). Clients MUST NOT gzip request bodies
+ * unless the server lists this in `HealthResponse.features` — older servers
+ * omit it and would otherwise try to `JSON.parse` compressed bytes and 400.
+ * Response compression needs no such flag: it's negotiated per-request via
+ * the standard `Accept-Encoding`/`Content-Encoding` headers.
+ */
+export const FEATURE_GZIP_REQUEST = "gzip-request";
+
 export interface HealthResponse {
   ok: boolean;
   version: string;
   time: number;
+  /**
+   * Optional capability tokens the server supports (e.g.
+   * `FEATURE_GZIP_REQUEST`). Absent on older servers — treat missing as
+   * "no optional capabilities".
+   */
+  features?: string[];
 }

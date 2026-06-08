@@ -567,3 +567,33 @@ test("M8: handleSyncPush rejects time_updated <= 0", async () => {
 
   db.close();
 });
+
+// Regression (PR #6 review): the plugin gzips large request bodies and sets
+// `Content-Encoding: gzip`. The server must inflate them before parsing —
+// otherwise push/heads from an updated client hit `JSON.parse(<gzip bytes>)`
+// and 400, silently breaking sync. readJsonBody handles this transparently.
+test("handleSyncPush inflates a gzip-encoded request body", async () => {
+  const db = new LedgerDB(createDataDir(), silentLogger);
+
+  const envelopes = Array.from({ length: 50 }, (_, i) => ({
+    id: `g-${i}`,
+    kind: "session" as const,
+    machine_id: "m1",
+    time_updated: i + 1,
+    server_seq: 0,
+    deleted: false,
+    data: { id: `g-${i}`, project_id: "p1", body: "x".repeat(200) },
+  }));
+
+  const gzipBody = Bun.gzipSync(JSON.stringify({ machine_id: "m1", envelopes }));
+  const req = new Request("http://localhost/sync/push", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Content-Encoding": "gzip" },
+    body: gzipBody,
+  });
+
+  const res = await handleSyncPush(req, db, silentLogger);
+  expect(res.status).toBe(200);
+  const json = (await res.json()) as { accepted: string[] };
+  expect(json.accepted.length).toBe(50);
+});
