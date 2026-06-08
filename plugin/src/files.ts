@@ -15,6 +15,7 @@ import {
   AUTH_SYNC_PATH,
   FILE_SYNC_PATHS,
   FILE_SYNC_IGNORE,
+  isFunctionalRelpath,
   isHomeRootedRelpath,
 } from "@opencode-sync/shared";
 import { StaleError, type SyncClient } from "./client.js";
@@ -52,6 +53,13 @@ export class FileSync {
   private config: FileSyncConfig;
   private stateManager: StateManager;
   private log: (msg: string, data?: Record<string, unknown>) => void;
+  /**
+   * Invoked at the end of a sync that *pulled down* one or more
+   * functionality-affecting files (config or auth). The host wires this to
+   * a TUI toast prompting the user to restart opencode so the new config /
+   * credentials take effect. Optional — omitted in tests and headless runs.
+   */
+  private notifyRestart?: (relpaths: string[]) => void;
 
   constructor(
     client: SyncClient,
@@ -59,12 +67,14 @@ export class FileSync {
     config: FileSyncConfig,
     stateManager: StateManager,
     log: (msg: string, data?: Record<string, unknown>) => void,
+    notifyRestart?: (relpaths: string[]) => void,
   ) {
     this.client = client;
     this.machineId = machineId;
     this.config = config;
     this.stateManager = stateManager;
     this.log = log;
+    this.notifyRestart = notifyRestart;
   }
 
   /**
@@ -185,10 +195,19 @@ export class FileSync {
   /**
    * Full file sync: compare local vs remote, push/pull as needed.
    */
-  async sync(): Promise<{ uploaded: number; downloaded: number; conflicts: number }> {
+  async sync(): Promise<{
+    uploaded: number;
+    downloaded: number;
+    conflicts: number;
+    functionalPulled: string[];
+  }> {
     let uploaded = 0;
     let downloaded = 0;
     let conflicts = 0;
+    // Relpaths of functionality-affecting files (config / auth) that were
+    // pulled DOWN this cycle (downloaded or locally deleted). A non-empty
+    // set at the end triggers the restart notice.
+    const functionalPulled = new Set<string>();
 
     let remoteManifest: FileManifestEntry[];
     try {
@@ -199,10 +218,16 @@ export class FileSync {
       this.log("failed to fetch remote manifest, skipping file sync", {
         error: String(err),
       });
-      return { uploaded: 0, downloaded: 0, conflicts: 0 };
+      return { uploaded: 0, downloaded: 0, conflicts: 0, functionalPulled: [] };
     }
 
-    const localManifest = await this.computeLocalManifest();
+    // Process functionality-affecting files (config + auth) before the
+    // rest so a freshly-pulled config/auth lands as early as possible.
+    remoteManifest = this.prioritizeFunctionalFirst(remoteManifest);
+
+    const localManifest = this.prioritizeFunctionalFirst(
+      await this.computeLocalManifest(),
+    );
     const previousLocalFiles = new Map(
       Object.entries(this.stateManager.state.knownFiles).filter(([relpath]) => {
         return this.isConfiguredRelpath(relpath) && !this.shouldIgnore(relpath);
@@ -317,6 +342,7 @@ export class FileSync {
         if (ok) {
           downloaded++;
           postSyncByPath.delete(remote.relpath);
+          if (isFunctionalRelpath(remote.relpath)) functionalPulled.add(remote.relpath);
         }
         continue;
       }
@@ -327,6 +353,7 @@ export class FileSync {
         if (ok) {
           downloaded++;
           postSyncByPath.set(remote.relpath, { ...remote, machine_id: this.machineId });
+          if (isFunctionalRelpath(remote.relpath)) functionalPulled.add(remote.relpath);
         }
         continue;
       }
@@ -340,6 +367,7 @@ export class FileSync {
         if (ok) {
           downloaded++;
           postSyncByPath.set(remote.relpath, { ...remote, machine_id: this.machineId });
+          if (isFunctionalRelpath(remote.relpath)) functionalPulled.add(remote.relpath);
         }
         continue;
       }
@@ -392,6 +420,7 @@ export class FileSync {
           else if (result === "downloaded") {
             downloaded++;
             postSyncByPath.set(remote.relpath, { ...remote, machine_id: this.machineId });
+            if (isFunctionalRelpath(remote.relpath)) functionalPulled.add(remote.relpath);
           }
           continue;
         }
@@ -409,10 +438,37 @@ export class FileSync {
     // filesystem and re-hashing every configured file.
     this.stateManager.replaceKnownFiles([...postSyncByPath.values()]);
 
-    return { uploaded, downloaded, conflicts };
+    const functional = [...functionalPulled];
+    if (functional.length > 0) {
+      this.log("pulled functionality-affecting files; restart required", {
+        relpaths: functional,
+      });
+      try {
+        this.notifyRestart?.(functional);
+      } catch (err) {
+        // A misbehaving notifier must never break the sync loop.
+        this.log("restart notifier threw", { error: String(err) });
+      }
+    }
+
+    return { uploaded, downloaded, conflicts, functionalPulled: functional };
   }
 
   // ── Private helpers ─────────────────────────────────────────────
+
+  /**
+   * Return a copy of `entries` with functionality-affecting files (config
+   * + auth) ordered first. The sort is stable, so the relative order within
+   * each group (and thus the existing per-category iteration order) is
+   * preserved.
+   */
+  private prioritizeFunctionalFirst<T extends { relpath: string }>(entries: T[]): T[] {
+    return [...entries].sort((a, b) => {
+      const aRank = isFunctionalRelpath(a.relpath) ? 0 : 1;
+      const bRank = isFunctionalRelpath(b.relpath) ? 0 : 1;
+      return aRank - bRank;
+    });
+  }
 
   private async downloadFile(
     entry: FileManifestEntry,

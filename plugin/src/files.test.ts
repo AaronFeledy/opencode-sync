@@ -1064,3 +1064,104 @@ test("M5: symlinked configured root is refused", async () => {
 
   fs.rmSync(external, { recursive: true, force: true });
 });
+
+test("processes functional config/auth files before other scopes", async () => {
+  const client = new MockClient();
+  const cfg = toManifestEntry("opencode.json", "{}\n", 2_000, "laptop");
+  const agent = toManifestEntry("agents/custom.md", "body\n", 2_000, "laptop");
+  // Remote manifest deliberately lists the non-functional file first to
+  // prove ordering is by priority, not manifest position.
+  client.manifest = [agent, cfg];
+  client.blobs.set(cfg.sha256, new Uint8Array(Buffer.from("{}\n")));
+  client.blobs.set(agent.sha256, new Uint8Array(Buffer.from("body\n")));
+
+  const downloaded: string[] = [];
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, opencode_json: true, agents: true },
+    new StateManager("desktop"),
+    (msg, data) => {
+      if (msg === "downloaded" && data && typeof data.relpath === "string") {
+        downloaded.push(data.relpath);
+      }
+    },
+    () => {},
+  );
+
+  await fileSync.sync();
+
+  expect(downloaded).toEqual(["opencode.json", "agents/custom.md"]);
+});
+
+test("notifies restart when a functional config file is pulled down", async () => {
+  const client = new MockClient();
+  const content = '{"theme":"dark"}\n';
+  const entry = toManifestEntry("opencode.json", content, 2_000, "laptop");
+  client.manifest = [entry];
+  client.blobs.set(entry.sha256, new Uint8Array(Buffer.from(content)));
+
+  const notified: string[][] = [];
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, opencode_json: true },
+    new StateManager("desktop"),
+    () => {},
+    (relpaths) => notified.push(relpaths),
+  );
+
+  const result = await fileSync.sync();
+
+  expect(fs.existsSync(path.join(CONFIG_BASE, "opencode.json"))).toBe(true);
+  expect(result.functionalPulled).toEqual(["opencode.json"]);
+  expect(notified).toEqual([["opencode.json"]]);
+});
+
+test("notifies restart when an auth file is pulled down", async () => {
+  const client = new MockClient();
+  const content = '{"anthropic":{"type":"oauth","refresh":"r","expires":9}}';
+  const entry = toManifestEntry(AUTH_SYNC_PATH, content, 2_000, "laptop");
+  client.manifest = [entry];
+  client.blobs.set(entry.sha256, new Uint8Array(Buffer.from(content)));
+
+  const notified: string[][] = [];
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, auth_json: true },
+    new StateManager("desktop"),
+    () => {},
+    (relpaths) => notified.push(relpaths),
+  );
+
+  const result = await fileSync.sync();
+
+  expect(fs.existsSync(AUTH_FILE_PATH)).toBe(true);
+  expect(result.functionalPulled).toEqual([AUTH_SYNC_PATH]);
+  expect(notified).toEqual([[AUTH_SYNC_PATH]]);
+});
+
+test("does not notify restart when only non-functional files are pulled down", async () => {
+  const client = new MockClient();
+  const content = "agent body\n";
+  const entry = toManifestEntry("agents/custom.md", content, 2_000, "laptop");
+  client.manifest = [entry];
+  client.blobs.set(entry.sha256, new Uint8Array(Buffer.from(content)));
+
+  const notified: string[][] = [];
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, agents: true },
+    new StateManager("desktop"),
+    () => {},
+    (relpaths) => notified.push(relpaths),
+  );
+
+  const result = await fileSync.sync();
+
+  expect(fs.existsSync(path.join(CONFIG_BASE, "agents/custom.md"))).toBe(true);
+  expect(result.functionalPulled).toEqual([]);
+  expect(notified).toEqual([]);
+});

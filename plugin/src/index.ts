@@ -146,7 +146,7 @@ function createBootStatus(name: string): BootStatus {
 // function". The plugin's identity for our own logging is just the string
 // `opencode-sync` baked into every line written by `logger.log` below.
 
-export const server: Plugin = async (_input, _options) => {
+export const server: Plugin = async (input, _options) => {
   // All log output goes to a file — see `logger.ts` for the rationale
   // (stdout/stderr both bleed through the TUI's alternate-screen render
   // and overlay sync messages on top of the rendered UI).
@@ -264,12 +264,40 @@ export const server: Plugin = async (_input, _options) => {
   ensureDb();
 
   // 6. Create file sync (independent of DB)
+  //
+  // When a sync pulls down functionality-affecting files (config / auth),
+  // opencode must be restarted to pick them up (it reads them at startup) —
+  // surface a TUI toast saying so. Best-effort: the sync engine usually runs
+  // in the backend worker, and showToast is routed to the attached TUI via
+  // the server; failures (no TUI attached, server busy) are logged and
+  // ignored so they never break the sync loop.
+  const notifyRestart = (relpaths: string[]): void => {
+    const names = relpaths.map((relpath) => path.basename(relpath));
+    const summary =
+      names.length <= 3
+        ? names.join(", ")
+        : `${names.slice(0, 3).join(", ")} +${names.length - 3} more`;
+    log("prompting restart after functional file pull", { relpaths });
+    void input.client.tui
+      .showToast({
+        body: {
+          title: "opencode-sync",
+          message: `Synced updated config/auth (${summary}) from another machine. Restart opencode to apply.`,
+          variant: "warning",
+        },
+      })
+      .catch((err: unknown) => {
+        log("failed to show restart toast", { error: String(err) });
+      });
+  };
+
   const fileSync = new FileSync(
     client,
     config.machineId,
     config.fileSync,
     stateManager,
     log,
+    notifyRestart,
   );
 
   // 7. Define the sync routine (used for both initial and periodic runs).
@@ -396,11 +424,15 @@ export const server: Plugin = async (_input, _options) => {
 
     try {
       const progress = label === "initial sync" ? (message: string) => boot.step(message) : undefined;
+      // Functionality-affecting files (config + auth) go first — both ahead
+      // of the rest of the file set (ordered inside fileSync.sync) and ahead
+      // of session rows — so opencode's own config/credentials are in place
+      // as early as possible on a fresh or reconnecting peer.
+      if (progress) progress("syncing config files");
+      await fileSync.sync();
+
       if (progress) progress("checking database");
       await runRowSync(label, progress);
-
-      if (label === "initial sync") boot.step("syncing config files");
-      await fileSync.sync();
       return true;
     } catch (err) {
       log(`${label} error`, { error: String(err) });

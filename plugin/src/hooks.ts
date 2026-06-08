@@ -192,9 +192,12 @@ export function createEventHandler(ctx: HookContext): (input: { event: any }) =>
       case "server.connected": {
         log("server connected, running full sync");
         try {
+          // Config/auth files first (and, inside fileSync, ahead of the
+          // other file scopes), then session rows — same priority as the
+          // periodic sync in index.ts.
+          await fileSync.sync();
           const sync = ctx.sessionSync;
           if (sync) await sync.sync();
-          await fileSync.sync();
         } catch (err) {
           log("full sync error on connect", { error: String(err) });
         }
