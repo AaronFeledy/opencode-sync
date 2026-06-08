@@ -14,12 +14,27 @@ import type {
   SyncEnvelope,
   SyncKind,
 } from "@opencode-sync/shared";
+import { FEATURE_GZIP_REQUEST } from "@opencode-sync/shared";
 import { sleep } from "./util.js";
 
 // ── Constants ──────────────────────────────────────────────────────
 
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 500;
+
+/**
+ * JSON request bodies at or above this many bytes are gzip-compressed
+ * before upload. Push and heads batches during a large backlog are well
+ * above this; tiny control requests stay uncompressed (gzip framing can
+ * make sub-kilobyte payloads larger, and the CPU isn't worth it).
+ *
+ * Request compression is additionally gated on the server advertising
+ * `FEATURE_GZIP_REQUEST` (see `compressRequests`) so we never send a
+ * compressed body to a server that can't inflate it. Response
+ * decompression needs no handling here — Bun's `fetch` auto-decompresses
+ * gzip responses.
+ */
+const REQUEST_COMPRESS_THRESHOLD_BYTES = 1024;
 
 // ── Errors ─────────────────────────────────────────────────────────
 
@@ -89,10 +104,28 @@ export class SyncClient {
   private baseUrl: string;
   private token: string;
 
+  /**
+   * Whether the server has advertised that it can inflate gzip-encoded
+   * request bodies (see `FEATURE_GZIP_REQUEST`). Defaults to `false` so we
+   * never send a compressed body to a server that would choke on it — a
+   * new client must not break sync against an un-upgraded server. Enabled
+   * via `setServerFeatures()` after a successful `/health` handshake.
+   */
+  private compressRequests = false;
+
   constructor(serverUrl: string, token: string) {
     // Normalise — strip trailing slash
     this.baseUrl = serverUrl.replace(/\/+$/, "");
     this.token = token;
+  }
+
+  /**
+   * Record the server's advertised capabilities (from `HealthResponse`).
+   * Currently used only to decide whether request bodies may be gzipped.
+   * Safe to call repeatedly (e.g. on every reconnect handshake).
+   */
+  setServerFeatures(features: string[] | undefined): void {
+    this.compressRequests = features?.includes(FEATURE_GZIP_REQUEST) ?? false;
   }
 
   // ── Public API ──────────────────────────────────────────────────
@@ -217,14 +250,30 @@ export class SyncClient {
       }
 
       try {
+        // Binary bodies (file uploads) pass through untouched — blobs are
+        // often already compressed, so re-gzipping wastes CPU. JSON bodies
+        // above the threshold are gzipped with a Content-Encoding header the
+        // server understands.
+        let outBody: Uint8Array | string | undefined;
+        const encodingHeaders: Record<string, string> = {};
+        if (body instanceof Uint8Array) {
+          outBody = body;
+        } else if (body !== undefined) {
+          const json = JSON.stringify(body);
+          if (this.compressRequests && json.length >= REQUEST_COMPRESS_THRESHOLD_BYTES) {
+            outBody = Bun.gzipSync(json);
+            encodingHeaders["Content-Encoding"] = "gzip";
+          } else {
+            outBody = json;
+          }
+        } else {
+          outBody = undefined;
+        }
+
         const res = await fetch(url, {
           method,
-          headers,
-          body: body instanceof Uint8Array
-            ? body
-            : body !== undefined
-              ? JSON.stringify(body)
-              : undefined,
+          headers: { ...headers, ...encodingHeaders },
+          body: outBody,
         });
 
         // 409 Conflict — LWW-stale writes. Surface as a typed error so

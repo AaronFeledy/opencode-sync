@@ -13,6 +13,7 @@ import { dirname } from "node:path";
 import type { Logger } from "../log.js";
 import type { LedgerDB } from "../db.js";
 import type { FileManifestEntry } from "@opencode-sync/shared";
+import { jsonResponse } from "../http.js";
 
 // ── Path validation ────────────────────────────────────────────────
 
@@ -42,7 +43,9 @@ export function handleFilesManifest(
 ): Response {
   const manifest = db.getManifest();
   logger.debug("files manifest", { entries: manifest.length });
-  return Response.json(manifest);
+  // The full manifest (including tombstones) can be large; gzip it when
+  // the client supports it — this is fetched on every file sync.
+  return jsonResponse(req, manifest);
 }
 
 // ── GET /files/blob/:sha256 ─────────────────────────────────────────

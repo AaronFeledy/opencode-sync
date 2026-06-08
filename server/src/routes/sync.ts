@@ -5,6 +5,7 @@
 
 import type { Logger } from "../log.js";
 import type { LedgerDB } from "../db.js";
+import { readJsonBody, jsonResponse } from "../http.js";
 import {
   SYNC_KINDS,
   type HeadsResponse,
@@ -50,10 +51,10 @@ export async function handleSyncPush(
   db: LedgerDB,
   logger: Logger,
 ): Promise<Response> {
-  // Parse body
+  // Parse body (transparently inflates gzip-encoded request bodies)
   let body: unknown;
   try {
-    body = await req.json();
+    body = await readJsonBody(req);
   } catch {
     return Response.json({ error: "Invalid JSON body" }, { status: 400 });
   }
@@ -182,7 +183,7 @@ export async function handleSyncPush(
     stale,
   };
 
-  return Response.json(response);
+  return jsonResponse(req, response);
 }
 
 // ── Heads (deletion-safety cross-check) ─────────────────────────────
@@ -204,7 +205,7 @@ export async function handleSyncHeads(
 ): Promise<Response> {
   let body: unknown;
   try {
-    body = await req.json();
+    body = await readJsonBody(req);
   } catch {
     return Response.json({ error: "Invalid JSON body" }, { status: 400 });
   }
@@ -230,7 +231,7 @@ export async function handleSyncHeads(
     // Vacuous request — return immediately with empty heads. Avoids
     // round-tripping an obviously-empty response through the DB layer.
     const response: HeadsResponse = { heads: [] };
-    return Response.json(response);
+    return jsonResponse(req, response);
   }
 
   if (row_keys.length > HEADS_MAX_BATCH) {
@@ -286,7 +287,7 @@ export async function handleSyncHeads(
     })),
   };
 
-  return Response.json(response);
+  return jsonResponse(req, response);
 }
 
 // ── Pull ────────────────────────────────────────────────────────────
@@ -344,5 +345,5 @@ export function handleSyncPull(
     more: result.more,
   };
 
-  return Response.json(response);
+  return jsonResponse(req, response);
 }

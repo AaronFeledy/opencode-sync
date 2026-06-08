@@ -14,6 +14,18 @@ import { writeHaltMarker, isSyncHalted, HALT_REASONS } from "./halt.js";
 
 const PUSH_BATCH_SIZE = 100;
 
+/**
+ * Rows requested per `/sync/pull` page. The pull loop is serial — each
+ * page must be received and applied before the next request's `since`
+ * cursor is known — so a larger page directly cuts the number of
+ * network round-trips when catching up a large backlog (weeks of
+ * unsynced rows). 2000 stays well under the server's hard cap of 5000
+ * (server/src/routes/sync.ts) while paying ~4x fewer round-trips than
+ * the previous implicit default of 500. Combined with gzip on the
+ * response, each page is also far smaller on the wire.
+ */
+const PULL_PAGE_SIZE = 2000;
+
 type SessionSyncProgress = (message: string) => void;
 
 type SessionSyncOptions = {
@@ -550,6 +562,7 @@ export class SessionSync {
       const res = await this.client.pull(
         this.stateManager.state.lastPulledSeq,
         this.machineId,
+        PULL_PAGE_SIZE,
       );
       pulled += res.envelopes.length;
       const pageCursorSeq = res.cursor_seq ??
