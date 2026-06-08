@@ -21,6 +21,17 @@ import { sleep } from "./util.js";
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 500;
 
+/**
+ * JSON request bodies at or above this many bytes are gzip-compressed
+ * before upload. Push and heads batches during a large backlog are well
+ * above this; tiny control requests stay uncompressed (gzip framing can
+ * make sub-kilobyte payloads larger, and the CPU isn't worth it). The
+ * server inflates `Content-Encoding: gzip` bodies transparently, and
+ * Bun's `fetch` auto-decompresses gzip responses, so no response-side
+ * handling is needed here.
+ */
+const REQUEST_COMPRESS_THRESHOLD_BYTES = 1024;
+
 // ── Errors ─────────────────────────────────────────────────────────
 
 /**
@@ -217,14 +228,30 @@ export class SyncClient {
       }
 
       try {
+        // Binary bodies (file uploads) pass through untouched — blobs are
+        // often already compressed, so re-gzipping wastes CPU. JSON bodies
+        // above the threshold are gzipped with a Content-Encoding header the
+        // server understands.
+        let outBody: Uint8Array | string | undefined;
+        const encodingHeaders: Record<string, string> = {};
+        if (body instanceof Uint8Array) {
+          outBody = body;
+        } else if (body !== undefined) {
+          const json = JSON.stringify(body);
+          if (json.length >= REQUEST_COMPRESS_THRESHOLD_BYTES) {
+            outBody = Bun.gzipSync(json);
+            encodingHeaders["Content-Encoding"] = "gzip";
+          } else {
+            outBody = json;
+          }
+        } else {
+          outBody = undefined;
+        }
+
         const res = await fetch(url, {
           method,
-          headers,
-          body: body instanceof Uint8Array
-            ? body
-            : body !== undefined
-              ? JSON.stringify(body)
-              : undefined,
+          headers: { ...headers, ...encodingHeaders },
+          body: outBody,
         });
 
         // 409 Conflict — LWW-stale writes. Surface as a typed error so
