@@ -7,7 +7,11 @@ import { FileSync } from "./files.js";
 import { StateManager } from "./state.js";
 import { sha256Hex } from "./util.js";
 import type { FileManifestEntry, FileSyncConfig } from "@opencode-sync/shared";
-import { AUTH_SYNC_PATH, HOME_AGENTS_SYNC_PATH } from "@opencode-sync/shared";
+import {
+  ANTHROPIC_ACCOUNTS_SYNC_PATH,
+  AUTH_SYNC_PATH,
+  HOME_AGENTS_SYNC_PATH,
+} from "@opencode-sync/shared";
 
 const HOME = os.homedir();
 
@@ -27,6 +31,8 @@ const CONFIG_BASE = path.join(HOME, ".config", "opencode");
 const CONFLICTS_DIR = path.join(CONFIG_BASE, ".sync-conflicts");
 const DATA_BASE = path.join(HOME, ".local", "share", "opencode");
 const AUTH_FILE_PATH = path.join(DATA_BASE, "auth.json");
+const AUTH_LOCK_PATH = path.join(DATA_BASE, "auth.json.lock");
+const ANTHROPIC_ACCOUNTS_FILE_PATH = path.join(DATA_BASE, "anthropic-oauth-accounts.json");
 const BASE_CONFIG: FileSyncConfig = {
   agents: false,
   commands: false,
@@ -45,6 +51,7 @@ class MockClient {
   uploads: Array<{ relpath: string; data: string; mtime: number }> = [];
   deletes: string[] = [];
   deleteMtimes: number[] = [];
+  getBlobImpl?: (sha256: string) => Promise<ArrayBuffer>;
 
   /**
    * Optional failure injection for `deleteFile`. Test code can set this
@@ -63,6 +70,7 @@ class MockClient {
   }
 
   async getBlob(sha256: string): Promise<ArrayBuffer> {
+    if (this.getBlobImpl) return this.getBlobImpl(sha256);
     const blob = this.blobs.get(sha256);
     if (!blob) throw new Error(`missing blob: ${sha256}`);
 
@@ -118,6 +126,8 @@ beforeEach(() => {
 
   fs.rmSync(CONFIG_BASE, { recursive: true, force: true });
   fs.rmSync(DATA_BASE, { recursive: true, force: true });
+  fs.rmSync(path.join(HOME, HOME_AGENTS_SYNC_PATH), { recursive: true, force: true });
+  delete process.env.OPENCODE_SYNC_AUTH_LOCK_WAIT_MS;
 });
 
 test("includes oh-my-openagent config files with opencode_json sync", async () => {
@@ -250,6 +260,508 @@ test("maps auth.json to a server-safe relpath", async () => {
 
   expect(client.uploads).toHaveLength(1);
   expect(client.uploads[0]?.relpath).toBe(AUTH_SYNC_PATH);
+});
+
+test("syncs Anthropic OAuth account store with auth_json enabled", async () => {
+  writeTrackedFile(ANTHROPIC_ACCOUNTS_FILE_PATH, '{"accounts":[]}', 1_000);
+
+  const client = new MockClient();
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, auth_json: true },
+    new StateManager("desktop"),
+    () => {},
+  );
+
+  await fileSync.sync();
+
+  expect(client.uploads.map((upload) => upload.relpath)).toEqual([
+    ANTHROPIC_ACCOUNTS_SYNC_PATH,
+  ]);
+});
+
+test("skips auth sync while OpenCode auth lock is active", async () => {
+  process.env.OPENCODE_SYNC_AUTH_LOCK_WAIT_MS = "0";
+  writeTrackedFile(AUTH_FILE_PATH, '{"anthropic":{"type":"oauth"}}', 1_000);
+  fs.mkdirSync(AUTH_LOCK_PATH, { recursive: true });
+
+  const client = new MockClient();
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, auth_json: true },
+    new StateManager("desktop"),
+    () => {},
+  );
+
+  const manifest = await fileSync.computeLocalManifest();
+  await fileSync.sync();
+
+  expect(manifest).toEqual([]);
+  expect(client.uploads).toHaveLength(0);
+});
+
+// Regression: the auth lock is held while the local manifest is computed
+// (OpenCode mid token-refresh) but released before the download. The locally
+// refreshed credentials must survive — a stale remote must not clobber them,
+// and the tracked knownFiles entry must not be dropped. See Bugbot H1.
+test("does not clobber locally refreshed auth when lock releases mid-sync", async () => {
+  process.env.OPENCODE_SYNC_AUTH_LOCK_WAIT_MS = "0";
+  const oldContent = '{"openai":{"type":"api","key":"local-old"}}';
+  const newContent = '{"openai":{"type":"api","key":"local-new"}}';
+  const remoteContent = '{"openai":{"type":"api","key":"remote-stale"}}';
+
+  // On disk: freshly written by OpenCode (mtime 3000), newer than what we last
+  // tracked (mtime 1000). The lock hides this from the manifest pass.
+  writeTrackedFile(AUTH_FILE_PATH, newContent, 3_000);
+  fs.mkdirSync(AUTH_LOCK_PATH, { recursive: true });
+
+  const stateManager = new StateManager("desktop");
+  stateManager.replaceKnownFiles([
+    toManifestEntry(AUTH_SYNC_PATH, oldContent, 1_000, "desktop"),
+  ]);
+
+  const client = new MockClient();
+  const remoteEntry = toManifestEntry(AUTH_SYNC_PATH, remoteContent, 2_000, "laptop");
+  client.manifest = [remoteEntry];
+  client.blobs.set(remoteEntry.sha256, new TextEncoder().encode(remoteContent));
+  // Simulate OpenCode releasing the lock between manifest computation and the
+  // download attempt.
+  client.getBlobImpl = async (sha256) => {
+    fs.rmSync(AUTH_LOCK_PATH, { recursive: true, force: true });
+    const blob = client.blobs.get(sha256);
+    if (!blob) throw new Error(`missing blob: ${sha256}`);
+    return Uint8Array.from(blob).buffer;
+  };
+
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, auth_json: true },
+    stateManager,
+    () => {},
+  );
+
+  await fileSync.sync();
+
+  expect(fs.readFileSync(AUTH_FILE_PATH, "utf-8")).toBe(newContent);
+  expect(client.uploads).toHaveLength(0);
+  // Tracked state for the path must be preserved, not dropped.
+  expect(stateManager.state.knownFiles[AUTH_SYNC_PATH]).toBeDefined();
+});
+
+// Regression: same lock-release race but with no prior tracked entry. The
+// download guard must still refuse to overwrite an existing on-disk auth file
+// that never made it into this cycle's manifest. See Bugbot H1.
+// Regression: a plain access-token refresh keeps the same refresh token but a
+// later `expires`. A stale remote with a newer mtime must not overwrite the
+// still-valid local access token. See Bugbot "Same refresh skips fresher check".
+// Regression: a newer local mtime must NOT push a staler OAuth token over a
+// fresher copy already on the server. See Bugbot "Auth upload ignores token
+// freshness".
+test("does not upload stale auth over a fresher remote with an older mtime", async () => {
+  const localAuth = JSON.stringify({
+    anthropic: {
+      type: "oauth",
+      refresh: "same-refresh",
+      access: "local-stale-access",
+      expires: 5_000,
+    },
+  });
+  const remoteAuth = JSON.stringify({
+    anthropic: {
+      type: "oauth",
+      refresh: "same-refresh",
+      access: "remote-fresh-access",
+      expires: 10_000,
+    },
+  });
+  // Local file has the NEWER mtime but the STALER token.
+  writeTrackedFile(AUTH_FILE_PATH, localAuth, 2_000);
+
+  const client = new MockClient();
+  const remoteEntry = toManifestEntry(AUTH_SYNC_PATH, remoteAuth, 1_000, "laptop");
+  client.manifest = [remoteEntry];
+  client.blobs.set(remoteEntry.sha256, new TextEncoder().encode(remoteAuth));
+
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, auth_json: true },
+    new StateManager("desktop"),
+    () => {},
+  );
+
+  await fileSync.sync();
+
+  // Server keeps its fresher token; local converges to it.
+  expect(client.uploads).toHaveLength(0);
+  expect(fs.readFileSync(AUTH_FILE_PATH, "utf-8")).toBe(remoteAuth);
+});
+
+test("does not upload stale account store over a fresher remote with an older mtime", async () => {
+  const localAccounts = JSON.stringify({
+    accounts: [
+      {
+        type: "oauth",
+        refresh: "same-refresh",
+        access: "local-stale",
+        expires: 5_000,
+        addedAt: 1,
+        lastUsed: 1,
+      },
+    ],
+  });
+  const remoteAccounts = JSON.stringify({
+    accounts: [
+      {
+        type: "oauth",
+        refresh: "same-refresh",
+        access: "remote-fresh",
+        expires: 10_000,
+        addedAt: 1,
+        lastUsed: 1,
+      },
+    ],
+  });
+  writeTrackedFile(ANTHROPIC_ACCOUNTS_FILE_PATH, localAccounts, 2_000);
+
+  const client = new MockClient();
+  const remoteEntry = toManifestEntry(
+    ANTHROPIC_ACCOUNTS_SYNC_PATH,
+    remoteAccounts,
+    1_000,
+    "laptop",
+  );
+  client.manifest = [remoteEntry];
+  client.blobs.set(remoteEntry.sha256, new TextEncoder().encode(remoteAccounts));
+
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, auth_json: true },
+    new StateManager("desktop"),
+    () => {},
+  );
+
+  await fileSync.sync();
+
+  expect(client.uploads).toHaveLength(0);
+  expect(fs.readFileSync(ANTHROPIC_ACCOUNTS_FILE_PATH, "utf-8")).toBe(remoteAccounts);
+});
+
+test("keeps fresher local auth access token when refresh token is unchanged", async () => {
+  const localAuth = JSON.stringify({
+    anthropic: {
+      type: "oauth",
+      refresh: "same-refresh",
+      access: "local-fresh-access",
+      expires: 20_000,
+    },
+  });
+  const remoteAuth = JSON.stringify({
+    anthropic: {
+      type: "oauth",
+      refresh: "same-refresh",
+      access: "remote-stale-access",
+      expires: 10_000,
+    },
+  });
+  writeTrackedFile(AUTH_FILE_PATH, localAuth, 1_000);
+
+  const client = new MockClient();
+  // Remote has a newer mtime, so without the freshness check it would win.
+  const remoteEntry = toManifestEntry(AUTH_SYNC_PATH, remoteAuth, 2_000, "laptop");
+  client.manifest = [remoteEntry];
+  client.blobs.set(remoteEntry.sha256, new TextEncoder().encode(remoteAuth));
+
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, auth_json: true },
+    new StateManager("desktop"),
+    () => {},
+  );
+
+  await fileSync.sync();
+
+  expect(fs.readFileSync(AUTH_FILE_PATH, "utf-8")).toBe(localAuth);
+  expect(client.uploads).toHaveLength(1);
+  expect(client.uploads[0]?.relpath).toBe(AUTH_SYNC_PATH);
+  expect(client.uploads[0]?.data).toBe(localAuth);
+  expect(client.uploads[0]?.mtime).toBeGreaterThan(remoteEntry.mtime);
+});
+
+test("does not clobber untracked on-disk auth when lock releases mid-sync", async () => {
+  process.env.OPENCODE_SYNC_AUTH_LOCK_WAIT_MS = "0";
+  const localContent = '{"openai":{"type":"api","key":"local-untracked"}}';
+  const remoteContent = '{"openai":{"type":"api","key":"remote-stale"}}';
+
+  writeTrackedFile(AUTH_FILE_PATH, localContent, 3_000);
+  fs.mkdirSync(AUTH_LOCK_PATH, { recursive: true });
+
+  const client = new MockClient();
+  const remoteEntry = toManifestEntry(AUTH_SYNC_PATH, remoteContent, 2_000, "laptop");
+  client.manifest = [remoteEntry];
+  client.blobs.set(remoteEntry.sha256, new TextEncoder().encode(remoteContent));
+  client.getBlobImpl = async (sha256) => {
+    fs.rmSync(AUTH_LOCK_PATH, { recursive: true, force: true });
+    const blob = client.blobs.get(sha256);
+    if (!blob) throw new Error(`missing blob: ${sha256}`);
+    return Uint8Array.from(blob).buffer;
+  };
+
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, auth_json: true },
+    new StateManager("desktop"),
+    () => {},
+  );
+
+  await fileSync.sync();
+
+  expect(fs.readFileSync(AUTH_FILE_PATH, "utf-8")).toBe(localContent);
+});
+
+test("does not download remote auth files when auth_json is disabled", async () => {
+  const authContent = '{"anthropic":{"type":"oauth","refresh":"secret","expires":1}}';
+  const accountsContent = '{"accounts":[{"type":"oauth","refresh":"secret","access":"a","expires":1,"addedAt":1,"lastUsed":1}]}';
+  const authEntry = toManifestEntry(AUTH_SYNC_PATH, authContent, 1_000, "laptop");
+  const accountsEntry = toManifestEntry(ANTHROPIC_ACCOUNTS_SYNC_PATH, accountsContent, 1_000, "laptop");
+
+  const client = new MockClient();
+  client.manifest = [authEntry, accountsEntry];
+  client.blobs.set(authEntry.sha256, new TextEncoder().encode(authContent));
+  client.blobs.set(accountsEntry.sha256, new TextEncoder().encode(accountsContent));
+
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, auth_json: false },
+    new StateManager("desktop"),
+    () => {},
+  );
+
+  await fileSync.sync();
+
+  expect(fs.existsSync(AUTH_FILE_PATH)).toBe(false);
+  expect(fs.existsSync(ANTHROPIC_ACCOUNTS_FILE_PATH)).toBe(false);
+});
+
+test("keeps newer local Anthropic OAuth refresh token over stale remote auth.json", async () => {
+  const localAuth = JSON.stringify({
+    anthropic: {
+      type: "oauth",
+      refresh: "local-new-refresh",
+      access: "local-access",
+      expires: 10_000,
+    },
+  });
+  const remoteAuth = JSON.stringify({
+    anthropic: {
+      type: "oauth",
+      refresh: "remote-old-refresh",
+      access: "remote-access",
+      expires: 5_000,
+    },
+  });
+  writeTrackedFile(AUTH_FILE_PATH, localAuth, 1_000);
+
+  const client = new MockClient();
+  const remoteEntry = toManifestEntry(AUTH_SYNC_PATH, remoteAuth, 2_000, "laptop");
+  client.manifest = [remoteEntry];
+  client.blobs.set(remoteEntry.sha256, new TextEncoder().encode(remoteAuth));
+
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, auth_json: true },
+    new StateManager("desktop"),
+    () => {},
+  );
+
+  await fileSync.sync();
+
+  expect(fs.readFileSync(AUTH_FILE_PATH, "utf-8")).toBe(localAuth);
+  expect(client.uploads).toHaveLength(1);
+  expect(client.uploads[0]?.relpath).toBe(AUTH_SYNC_PATH);
+  expect(client.uploads[0]?.data).toBe(localAuth);
+  expect(client.uploads[0]?.mtime).toBeGreaterThan(remoteEntry.mtime);
+});
+
+test("keeps local auth.json over a remote tombstone", async () => {
+  const localAuth = JSON.stringify({
+    anthropic: {
+      type: "oauth",
+      refresh: "local-refresh",
+      access: "local-access",
+      expires: 10_000,
+    },
+  });
+  writeTrackedFile(AUTH_FILE_PATH, localAuth, 1_000);
+
+  const client = new MockClient();
+  client.manifest = [toManifestEntry(AUTH_SYNC_PATH, localAuth, 2_000, "laptop", true)];
+
+  const stateManager = new StateManager("desktop");
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, auth_json: true },
+    stateManager,
+    () => {},
+  );
+
+  await fileSync.sync();
+
+  expect(fs.existsSync(AUTH_FILE_PATH)).toBe(true);
+  expect(fs.readFileSync(AUTH_FILE_PATH, "utf-8")).toBe(localAuth);
+  expect(client.uploads).toHaveLength(1);
+  expect(client.uploads[0]?.relpath).toBe(AUTH_SYNC_PATH);
+  expect(client.uploads[0]?.data).toBe(localAuth);
+  expect(client.uploads[0]?.mtime).toBeGreaterThan(2_000);
+  expect(stateManager.state.knownFiles[AUTH_SYNC_PATH]).toBeDefined();
+});
+
+test("does not push remote tombstones for locally deleted auth files", async () => {
+  const authContent = JSON.stringify({
+    anthropic: {
+      type: "oauth",
+      refresh: "remote-refresh",
+      access: "remote-access",
+      expires: 10_000,
+    },
+  });
+  const previousEntry = toManifestEntry(AUTH_SYNC_PATH, authContent, 1_000, "desktop");
+  const remoteEntry = toManifestEntry(AUTH_SYNC_PATH, authContent, 2_000, "laptop");
+
+  const stateManager = new StateManager("desktop");
+  stateManager.replaceKnownFiles([previousEntry]);
+
+  const client = new MockClient();
+  client.manifest = [remoteEntry];
+  client.blobs.set(remoteEntry.sha256, new TextEncoder().encode(authContent));
+
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, auth_json: true },
+    stateManager,
+    () => {},
+  );
+
+  await fileSync.sync();
+
+  expect(client.deletes).toEqual([]);
+  expect(fs.readFileSync(AUTH_FILE_PATH, "utf-8")).toBe(authContent);
+  expect(stateManager.state.knownFiles[AUTH_SYNC_PATH]?.sha256).toBe(remoteEntry.sha256);
+});
+
+test("skips remote auth download if local auth changed during sync", async () => {
+  const originalLocalAuth = JSON.stringify({
+    anthropic: {
+      type: "oauth",
+      refresh: "same-refresh",
+      access: "old-local-access",
+      expires: 5_000,
+    },
+  });
+  const refreshedLocalAuth = JSON.stringify({
+    anthropic: {
+      type: "oauth",
+      refresh: "same-refresh",
+      access: "new-local-access",
+      expires: 20_000,
+    },
+  });
+  const remoteAuth = JSON.stringify({
+    anthropic: {
+      type: "oauth",
+      refresh: "same-refresh",
+      access: "remote-access",
+      expires: 10_000,
+    },
+  });
+  writeTrackedFile(AUTH_FILE_PATH, originalLocalAuth, 1_000);
+
+  const client = new MockClient();
+  const remoteEntry = toManifestEntry(AUTH_SYNC_PATH, remoteAuth, 2_000, "laptop");
+  client.manifest = [remoteEntry];
+  client.blobs.set(remoteEntry.sha256, new TextEncoder().encode(remoteAuth));
+  client.getBlobImpl = async (sha256) => {
+    writeTrackedFile(AUTH_FILE_PATH, refreshedLocalAuth, 3_000);
+    const blob = client.blobs.get(sha256);
+    if (!blob) throw new Error(`missing blob: ${sha256}`);
+    return Uint8Array.from(blob).buffer;
+  };
+
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, auth_json: true },
+    new StateManager("desktop"),
+    () => {},
+  );
+
+  await fileSync.sync();
+
+  expect(fs.readFileSync(AUTH_FILE_PATH, "utf-8")).toBe(refreshedLocalAuth);
+});
+
+test("keeps newer local Anthropic account store over stale remote account store", async () => {
+  const localAccounts = JSON.stringify({
+    accounts: [
+      {
+        type: "oauth",
+        refresh: "local-new-refresh",
+        access: "local-access",
+        expires: 10_000,
+        addedAt: 1,
+        lastUsed: 1,
+      },
+    ],
+  });
+  const remoteAccounts = JSON.stringify({
+    accounts: [
+      {
+        type: "oauth",
+        refresh: "remote-old-refresh",
+        access: "remote-access",
+        expires: 5_000,
+        addedAt: 1,
+        lastUsed: 1,
+      },
+    ],
+  });
+  writeTrackedFile(ANTHROPIC_ACCOUNTS_FILE_PATH, localAccounts, 1_000);
+
+  const client = new MockClient();
+  const remoteEntry = toManifestEntry(
+    ANTHROPIC_ACCOUNTS_SYNC_PATH,
+    remoteAccounts,
+    2_000,
+    "laptop",
+  );
+  client.manifest = [remoteEntry];
+  client.blobs.set(remoteEntry.sha256, new TextEncoder().encode(remoteAccounts));
+
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, auth_json: true },
+    new StateManager("desktop"),
+    () => {},
+  );
+
+  await fileSync.sync();
+
+  expect(fs.readFileSync(ANTHROPIC_ACCOUNTS_FILE_PATH, "utf-8")).toBe(localAccounts);
+  expect(client.uploads).toHaveLength(1);
+  expect(client.uploads[0]?.relpath).toBe(ANTHROPIC_ACCOUNTS_SYNC_PATH);
+  expect(client.uploads[0]?.data).toBe(localAccounts);
+  expect(client.uploads[0]?.mtime).toBeGreaterThan(remoteEntry.mtime);
 });
 
 // Regression: the `skills` flag previously pointed at the wrong directory
