@@ -108,6 +108,37 @@ export const FILE_SYNC_PATHS: Record<keyof FileSyncConfig, string[]> = {
 };
 
 /**
+ * Config flags whose files directly affect opencode's running behaviour —
+ * its configuration (`opencode.json` / `tui.json`) and credentials
+ * (`auth.json`). These are synced ahead of everything else, and when a
+ * change to one of them is *pulled down* from another machine the running
+ * opencode process must be restarted to pick it up (opencode reads these
+ * at startup). Less-critical scopes (agents, commands, skills, modes,
+ * `AGENTS.md`, `~/.agents`) are hot-reloaded or read per-invocation, so
+ * they neither need to go first nor require a restart.
+ */
+export const FUNCTIONAL_FILE_SYNC_FLAGS: readonly (keyof FileSyncConfig)[] = [
+  "opencode_json",
+  "tui_json",
+  "auth_json",
+];
+
+/**
+ * True when `relpath` belongs to a functionality-affecting category
+ * (config or auth). Used to (a) sync these paths before anything else and
+ * (b) decide whether a pulled-down change warrants a "restart opencode"
+ * notice.
+ */
+export function isFunctionalRelpath(relpath: string): boolean {
+  for (const flag of FUNCTIONAL_FILE_SYNC_FLAGS) {
+    for (const root of FILE_SYNC_PATHS[flag]) {
+      if (relpath === root || relpath.startsWith(`${root}/`)) return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Files that should never be synced (hardcoded).
  */
 export const FILE_SYNC_IGNORE = [
