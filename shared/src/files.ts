@@ -42,6 +42,8 @@ export interface FileSyncConfig {
 }
 
 export const AUTH_SYNC_PATH = ".local/share/opencode/auth.json";
+export const ANTHROPIC_ACCOUNTS_SYNC_PATH = ".local/share/opencode/anthropic-oauth-accounts.json";
+export const AUTH_LOCK_SYNC_PATH = `${AUTH_SYNC_PATH}.lock`;
 
 /**
  * Sync prefix for `~/.agents/` — manifest paths look like
@@ -58,6 +60,8 @@ export const HOME_AGENTS_SYNC_PATH = ".agents";
  */
 export const HOME_ROOTED_PATH_PREFIXES: readonly string[] = [
   AUTH_SYNC_PATH,
+  ANTHROPIC_ACCOUNTS_SYNC_PATH,
+  AUTH_LOCK_SYNC_PATH,
   HOME_AGENTS_SYNC_PATH,
 ];
 
@@ -99,7 +103,7 @@ export const FILE_SYNC_PATHS: Record<keyof FileSyncConfig, string[]> = {
     "oh-my-openagent.jsonc",
   ],
   tui_json: ["tui.json", "tui.jsonc"],
-  auth_json: [AUTH_SYNC_PATH],
+  auth_json: [AUTH_SYNC_PATH, ANTHROPIC_ACCOUNTS_SYNC_PATH],
   home_agents: [HOME_AGENTS_SYNC_PATH],
 };
 
@@ -109,5 +113,6 @@ export const FILE_SYNC_PATHS: Record<keyof FileSyncConfig, string[]> = {
 export const FILE_SYNC_IGNORE = [
   "opencode-sync.jsonc",
   "opencode-sync.overrides.jsonc",
+  AUTH_LOCK_SYNC_PATH,
   "plugins/",
 ] as const;

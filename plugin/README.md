@@ -98,7 +98,7 @@ Create `~/.config/opencode/opencode-sync.jsonc`:
 }
 ```
 
-> **⚠ `auth_json`**: Enabling this syncs `~/.local/share/opencode/auth.json` (API keys, OAuth tokens) through the server. The data is stored unencrypted on your VPS. Only enable if you trust every machine on the network and the VPS disk.
+> **⚠ `auth_json`**: Enabling this syncs `~/.local/share/opencode/auth.json` plus Anthropic's OAuth account store through the server. The data is stored unencrypted on your VPS. Only enable if you trust every machine on the network and the VPS disk. Local `auth.json.lock` state is never synced.
 
 > **`home_agents`**: Enabling this syncs the `~/.agents/` directory — the cross-tool agent home used by Claude Code and other agent runners (typically holds shared skills under `~/.agents/skills/`). Off by default because it lives outside opencode's config root.
 
@@ -146,6 +146,7 @@ Overrides are shallow-merged over synced config at plugin load time. Use this fo
 | `~/.config/opencode/oh-my-openagent.json` / `.jsonc` | synced |
 | `~/.config/opencode/tui.json` / `.jsonc` | synced |
 | `~/.local/share/opencode/auth.json` | **off** (opt-in via `auth_json`) |
+| `~/.local/share/opencode/anthropic-oauth-accounts.json` | **off** (opt-in via `auth_json`) |
 | `~/.agents/**` | **off** (opt-in via `home_agents`) |
 
 ### Never synced

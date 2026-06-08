@@ -10,6 +10,9 @@ import type {
   FileManifestEntry,
 } from "@opencode-sync/shared";
 import {
+  ANTHROPIC_ACCOUNTS_SYNC_PATH,
+  AUTH_LOCK_SYNC_PATH,
+  AUTH_SYNC_PATH,
   FILE_SYNC_PATHS,
   FILE_SYNC_IGNORE,
   isHomeRootedRelpath,
@@ -23,6 +26,23 @@ import { sha256Hex, atomicWriteFile } from "./util.js";
 const HOME_BASE = os.homedir();
 const CONFIG_BASE = path.join(HOME_BASE, ".config", "opencode");
 const CONFLICTS_DIR = path.join(CONFIG_BASE, ".sync-conflicts");
+const AUTH_LOCK_STALE_MS = 30_000;
+const AUTH_LOCK_RETRY_MS = 100;
+type ReleaseLock = () => Promise<void>;
+
+type AuthJsonProvider = {
+  type?: unknown;
+  access?: unknown;
+  refresh?: unknown;
+  expires?: unknown;
+};
+
+type AuthJsonShape = Record<string, AuthJsonProvider | unknown>;
+
+const AUTH_SYNC_RELPATHS = new Set([
+  AUTH_SYNC_PATH,
+  ANTHROPIC_ACCOUNTS_SYNC_PATH,
+]);
 
 // ── File sync ──────────────────────────────────────────────────────
 
@@ -70,26 +90,35 @@ export class FileSync {
       if (!this.config[flag]) continue;
 
       for (const relRoot of paths) {
-        const absPath = this.resolveConfiguredPath(relRoot);
+        const releaseLock = this.isAuthRelpath(relRoot)
+          ? await this.acquireAuthLock()
+          : undefined;
+        if (this.isAuthRelpath(relRoot) && !releaseLock) continue;
 
-        if (!fs.existsSync(absPath)) continue;
+        try {
+          const absPath = this.resolveConfiguredPath(relRoot);
 
-        // `lstatSync` so a symlinked configured root is visible as a
-        // symlink and can be refused. Following it could leak arbitrary
-        // filesystem paths (e.g. /etc/passwd, a git-managed dotfiles
-        // repo with secrets) into the sync stream. See FINDINGS.md M5.
-        const stat = fs.lstatSync(absPath);
-        if (stat.isSymbolicLink()) {
-          this.log("configured sync path is a symlink, skipping", { path: absPath });
-          continue;
-        }
-        if (stat.isDirectory()) {
-          this.walkDir(absPath, this.baseDirFor(relRoot), entries, cache);
-        } else if (stat.isFile()) {
-          const relpath = this.toManifestRelpath(absPath, relRoot);
-          if (this.shouldIgnore(relpath)) continue;
+          if (!fs.existsSync(absPath)) continue;
 
-          entries.push(this.buildManifestEntry(absPath, relpath, stat, cache));
+          // `lstatSync` so a symlinked configured root is visible as a
+          // symlink and can be refused. Following it could leak arbitrary
+          // filesystem paths (e.g. /etc/passwd, a git-managed dotfiles
+          // repo with secrets) into the sync stream. See FINDINGS.md M5.
+          const stat = fs.lstatSync(absPath);
+          if (stat.isSymbolicLink()) {
+            this.log("configured sync path is a symlink, skipping", { path: absPath });
+            continue;
+          }
+          if (stat.isDirectory()) {
+            this.walkDir(absPath, this.baseDirFor(relRoot), entries, cache);
+          } else if (stat.isFile()) {
+            const relpath = this.toManifestRelpath(absPath, relRoot);
+            if (this.shouldIgnore(relpath)) continue;
+
+            entries.push(this.buildManifestEntry(absPath, relpath, stat, cache));
+          }
+        } finally {
+          await releaseLock?.();
         }
       }
     }
@@ -144,7 +173,9 @@ export class FileSync {
 
     let remoteManifest: FileManifestEntry[];
     try {
-      remoteManifest = await this.client.getManifest();
+      remoteManifest = (await this.client.getManifest()).filter((entry) => {
+        return this.isConfiguredRelpath(entry.relpath) && !this.shouldIgnore(entry.relpath);
+      });
     } catch (err) {
       this.log("failed to fetch remote manifest, skipping file sync", {
         error: String(err),
@@ -153,7 +184,11 @@ export class FileSync {
     }
 
     const localManifest = await this.computeLocalManifest();
-    const previousLocalFiles = new Map(Object.entries(this.stateManager.state.knownFiles));
+    const previousLocalFiles = new Map(
+      Object.entries(this.stateManager.state.knownFiles).filter(([relpath]) => {
+        return this.isConfiguredRelpath(relpath) && !this.shouldIgnore(relpath);
+      }),
+    );
     const justDeletedRemote = new Set<string>();
     // Paths whose remote-delete failed transiently this cycle. Used to
     // skip the remote→local download branch so the file we're trying
@@ -187,6 +222,8 @@ export class FileSync {
 
       const remote = remoteByPath.get(relpath);
       if (!remote || remote.deleted) continue;
+
+      if (this.isAuthRelpath(relpath)) continue;
 
       // Only emit a tombstone when the server still has the version we last synced.
       // If the remote file changed while we were offline, prefer the remote copy.
@@ -240,6 +277,15 @@ export class FileSync {
       if (remote.deleted) {
         if (!local) continue;
 
+        if (this.isAuthRelpath(remote.relpath)) {
+          const kept = await this.keepLocalAuthOverRemoteTombstone(remote, local);
+          if (kept.uploaded) {
+            uploaded++;
+          }
+          postSyncByPath.set(remote.relpath, kept.entry);
+          continue;
+        }
+
         // Tombstones win equal-mtime ties (strict `>` here, `<=` in the
         // local-entries pass below). Live-vs-live conflicts at equal mtime
         // are stashed under .sync-conflicts/ instead — but a tombstone has
@@ -248,7 +294,7 @@ export class FileSync {
         // delete and an unrelated edit happen to land on the same ms.
         if (local.mtime > remote.mtime) continue;
 
-        const ok = await this.deleteLocalFile(remote.relpath);
+        const ok = await this.deleteLocalFile(remote.relpath, local);
         if (ok) {
           downloaded++;
           postSyncByPath.delete(remote.relpath);
@@ -258,7 +304,7 @@ export class FileSync {
 
       if (!local) {
         // Remote-only: download
-        const ok = await this.downloadFile(remote);
+        const ok = await this.downloadFile(remote, local);
         if (ok) {
           downloaded++;
           postSyncByPath.set(remote.relpath, { ...remote, machine_id: this.machineId });
@@ -271,7 +317,7 @@ export class FileSync {
 
       // Remote is newer — download
       if (remote.mtime > local.mtime) {
-        const ok = await this.downloadFile(remote);
+        const ok = await this.downloadFile(remote, local);
         if (ok) {
           downloaded++;
           postSyncByPath.set(remote.relpath, { ...remote, machine_id: this.machineId });
@@ -332,13 +378,46 @@ export class FileSync {
 
   // ── Private helpers ─────────────────────────────────────────────
 
-  private async downloadFile(entry: FileManifestEntry): Promise<boolean> {
+  private async downloadFile(
+    entry: FileManifestEntry,
+    expectedLocal?: FileManifestEntry,
+  ): Promise<boolean> {
     try {
       const blob = await this.client.getBlob(entry.sha256);
       const absPath = this.resolveLocalPath(entry.relpath);
-      fs.mkdirSync(path.dirname(absPath), { recursive: true });
-      await atomicWriteFile(absPath, Buffer.from(blob));
-      fs.utimesSync(absPath, new Date(entry.mtime), new Date(entry.mtime));
+      const releaseLock = this.isAuthRelpath(entry.relpath)
+        ? await this.acquireAuthLock()
+        : undefined;
+      if (this.isAuthRelpath(entry.relpath) && !releaseLock) return false;
+      let keepLocalAuth = false;
+      try {
+        const remoteData = Buffer.from(blob);
+        keepLocalAuth = this.shouldKeepLocalAuth(entry.relpath, absPath, remoteData);
+        if (
+          !keepLocalAuth &&
+          expectedLocal &&
+          this.isAuthRelpath(entry.relpath) &&
+          !this.currentFileMatches(entry.relpath, expectedLocal)
+        ) {
+          this.log("auth file changed during sync, skipping remote download", {
+            relpath: entry.relpath,
+          });
+          return false;
+        }
+        if (!keepLocalAuth) {
+          fs.mkdirSync(path.dirname(absPath), { recursive: true });
+          await atomicWriteFile(absPath, remoteData);
+          if (this.isAuthRelpath(entry.relpath)) fs.chmodSync(absPath, 0o600);
+          fs.utimesSync(absPath, new Date(entry.mtime), new Date(entry.mtime));
+        }
+      } finally {
+        await releaseLock?.();
+      }
+      if (keepLocalAuth) {
+        await this.uploadCurrentFile(entry.relpath, Math.max(Date.now(), entry.mtime + 1));
+        this.log("kept local auth file over stale remote", { relpath: entry.relpath });
+        return false;
+      }
       this.log("downloaded", { relpath: entry.relpath });
       return true;
     } catch (err) {
@@ -353,8 +432,21 @@ export class FileSync {
   private async uploadFile(entry: FileManifestEntry): Promise<boolean> {
     try {
       const absPath = this.resolveLocalPath(entry.relpath);
-      const data = new Uint8Array(fs.readFileSync(absPath));
-      await this.client.putFile(entry.relpath, data, this.machineId, entry.mtime);
+      const releaseLock = this.isAuthRelpath(entry.relpath)
+        ? await this.acquireAuthLock()
+        : undefined;
+      if (this.isAuthRelpath(entry.relpath) && !releaseLock) return false;
+      let data: Uint8Array;
+      let mtime = entry.mtime;
+      try {
+        data = new Uint8Array(fs.readFileSync(absPath));
+        if (this.isAuthRelpath(entry.relpath)) {
+          mtime = fs.statSync(absPath).mtimeMs;
+        }
+      } finally {
+        await releaseLock?.();
+      }
+      await this.client.putFile(entry.relpath, data, this.machineId, mtime);
       this.log("uploaded", { relpath: entry.relpath });
       return true;
     } catch (err) {
@@ -398,11 +490,30 @@ export class FileSync {
     }
   }
 
-  private async deleteLocalFile(relpath: string): Promise<boolean> {
+  private async deleteLocalFile(
+    relpath: string,
+    expectedLocal?: FileManifestEntry,
+  ): Promise<boolean> {
     try {
       const absPath = this.resolveLocalPath(relpath);
-      if (!fs.existsSync(absPath)) return true;
-      fs.unlinkSync(absPath);
+      const releaseLock = this.isAuthRelpath(relpath)
+        ? await this.acquireAuthLock()
+        : undefined;
+      if (this.isAuthRelpath(relpath) && !releaseLock) return false;
+      try {
+        if (!fs.existsSync(absPath)) return true;
+        if (
+          expectedLocal &&
+          this.isAuthRelpath(relpath) &&
+          !this.currentFileMatches(relpath, expectedLocal)
+        ) {
+          this.log("auth file changed during sync, skipping local delete", { relpath });
+          return false;
+        }
+        fs.unlinkSync(absPath);
+      } finally {
+        await releaseLock?.();
+      }
       this.log("deleted local file", { relpath });
       return true;
     } catch (err) {
@@ -411,6 +522,35 @@ export class FileSync {
         error: String(err),
       });
       return false;
+    }
+  }
+
+  private async keepLocalAuthOverRemoteTombstone(
+    remote: FileManifestEntry,
+    local: FileManifestEntry,
+  ): Promise<{ entry: FileManifestEntry; uploaded: boolean }> {
+    try {
+      await this.uploadCurrentFile(remote.relpath, Math.max(Date.now(), remote.mtime + 1));
+      const absPath = this.resolveLocalPath(remote.relpath);
+      const stat = fs.statSync(absPath);
+      this.log("kept local auth file over remote tombstone", { relpath: remote.relpath });
+      return {
+        entry: {
+          relpath: remote.relpath,
+          sha256: sha256Hex(fs.readFileSync(absPath)),
+          size: stat.size,
+          mtime: stat.mtimeMs,
+          machine_id: this.machineId,
+          deleted: false,
+        },
+        uploaded: true,
+      };
+    } catch (err) {
+      this.log("failed to keep local auth file over remote tombstone", {
+        relpath: remote.relpath,
+        error: String(err),
+      });
+      return { entry: local, uploaded: false };
     }
   }
 
@@ -445,6 +585,9 @@ export class FileSync {
   }
 
   private shouldIgnore(relpath: string): boolean {
+    if (relpath === AUTH_LOCK_SYNC_PATH || relpath.startsWith(`${AUTH_LOCK_SYNC_PATH}/`)) {
+      return true;
+    }
     for (const pattern of FILE_SYNC_IGNORE) {
       if (pattern.endsWith("/")) {
         // Directory prefix match — must match the full directory name
@@ -525,5 +668,149 @@ export class FileSync {
         entries.push(this.buildManifestEntry(fullPath, relpath, stat, cache));
       }
     }
+  }
+
+  private isAuthRelpath(relpath: string): boolean {
+    return AUTH_SYNC_RELPATHS.has(relpath);
+  }
+
+  private isConfiguredRelpath(relpath: string): boolean {
+    for (const [flag, roots] of Object.entries(FILE_SYNC_PATHS) as [keyof FileSyncConfig, string[]][]) {
+      if (!this.config[flag]) continue;
+      for (const root of roots) {
+        if (relpath === root || relpath.startsWith(`${root}/`)) return true;
+      }
+    }
+    return false;
+  }
+
+  private authLockPath(): string {
+    return this.resolveLocalPath(AUTH_LOCK_SYNC_PATH);
+  }
+
+  private isAuthLockStale(): boolean {
+    try {
+      const stats = fs.statSync(this.authLockPath());
+      return Date.now() - stats.mtimeMs > AUTH_LOCK_STALE_MS;
+    } catch {
+      return false;
+    }
+  }
+
+  private async acquireAuthLock(): Promise<ReleaseLock | undefined> {
+    const waitMs = Number(process.env.OPENCODE_SYNC_AUTH_LOCK_WAIT_MS ?? 5_000);
+    const deadline = Date.now() + waitMs;
+    fs.mkdirSync(path.dirname(this.authLockPath()), { recursive: true });
+    while (true) {
+      try {
+        fs.mkdirSync(this.authLockPath(), { recursive: false });
+        return async () => {
+          await fs.promises.rm(this.authLockPath(), { force: true, recursive: true }).catch(() => {});
+        };
+      } catch (error) {
+        const code = error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined;
+        if (code !== "EEXIST") throw error;
+      }
+
+      if (this.isAuthLockStale()) {
+        await fs.promises.rm(this.authLockPath(), { force: true, recursive: true }).catch(() => {});
+        continue;
+      }
+
+      if (Date.now() >= deadline) {
+        this.log("auth lock active, skipping auth file this cycle", {
+          lock: this.authLockPath(),
+        });
+        return undefined;
+      }
+      await new Promise((resolve) => setTimeout(resolve, AUTH_LOCK_RETRY_MS));
+    }
+  }
+
+  private shouldKeepLocalAuth(relpath: string, localPath: string, remoteData: Buffer): boolean {
+    if (!fs.existsSync(localPath)) return false;
+    if (relpath === ANTHROPIC_ACCOUNTS_SYNC_PATH) {
+      return this.localAccountStoreHasFresherToken(localPath, remoteData);
+    }
+    if (relpath !== AUTH_SYNC_PATH) return false;
+    const local = this.parseAuthJson(fs.readFileSync(localPath, "utf-8"));
+    const remote = this.parseAuthJson(remoteData.toString("utf-8"));
+    const localAnthropic = this.oauthProvider(local?.anthropic);
+    const remoteAnthropic = this.oauthProvider(remote?.anthropic);
+    if (!localAnthropic || !remoteAnthropic) return false;
+    if (localAnthropic.refresh === remoteAnthropic.refresh) return false;
+    return localAnthropic.expires > remoteAnthropic.expires;
+  }
+
+  private currentFileMatches(relpath: string, expected: FileManifestEntry): boolean {
+    const absPath = this.resolveLocalPath(relpath);
+    if (!fs.existsSync(absPath)) return false;
+    const stat = fs.statSync(absPath);
+    if (stat.size !== expected.size || stat.mtimeMs !== expected.mtime) return false;
+    return sha256Hex(fs.readFileSync(absPath)) === expected.sha256;
+  }
+
+  private localAccountStoreHasFresherToken(localPath: string, remoteData: Buffer): boolean {
+    const local = this.parseAccountStore(fs.readFileSync(localPath, "utf-8"));
+    const remote = this.parseAccountStore(remoteData.toString("utf-8"));
+    if (!local.length || !remote.length) return false;
+    const remoteByRefresh = new Map(remote.map((account) => [account.refresh, account.expires]));
+    for (const account of local) {
+      const remoteExpires = remoteByRefresh.get(account.refresh);
+      if (typeof remoteExpires === "undefined") {
+        if (account.expires > Math.max(...remote.map((remoteAccount) => remoteAccount.expires))) {
+          return true;
+        }
+        continue;
+      }
+      if (account.expires > remoteExpires) return true;
+    }
+    return false;
+  }
+
+  private parseAuthJson(text: string): AuthJsonShape | undefined {
+    try {
+      const value = JSON.parse(text) as unknown;
+      if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+      return value as AuthJsonShape;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private oauthProvider(value: unknown): { refresh: string; expires: number } | undefined {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+    const provider = value as AuthJsonProvider;
+    if (provider.type !== "oauth") return undefined;
+    if (typeof provider.refresh !== "string") return undefined;
+    if (typeof provider.expires !== "number") return undefined;
+    return { refresh: provider.refresh, expires: provider.expires };
+  }
+
+  private parseAccountStore(text: string): Array<{ refresh: string; expires: number }> {
+    try {
+      const value = JSON.parse(text) as { accounts?: unknown };
+      if (!Array.isArray(value.accounts)) return [];
+      return value.accounts.flatMap((account) => {
+        const provider = this.oauthProvider(account);
+        return provider ? [provider] : [];
+      });
+    } catch {
+      return [];
+    }
+  }
+
+  private async uploadCurrentFile(relpath: string, mtime: number): Promise<void> {
+    const absPath = this.resolveLocalPath(relpath);
+    const releaseLock = this.isAuthRelpath(relpath) ? await this.acquireAuthLock() : undefined;
+    if (this.isAuthRelpath(relpath) && !releaseLock) return;
+    let data: Uint8Array;
+    try {
+      data = new Uint8Array(fs.readFileSync(absPath));
+      fs.utimesSync(absPath, new Date(mtime), new Date(mtime));
+    } finally {
+      await releaseLock?.();
+    }
+    await this.client.putFile(relpath, data, this.machineId, mtime);
   }
 }
