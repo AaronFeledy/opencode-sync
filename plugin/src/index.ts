@@ -252,6 +252,7 @@ export const server: Plugin = async (input, _options) => {
         stateManager,
         config.machineId,
         log,
+        config.startupHistoryDays,
       );
       log("opened opencode database", { path: dbPath });
       return dbState.sessionSync;
@@ -410,7 +411,11 @@ export const server: Plugin = async (input, _options) => {
       return;
     }
 
-    await sync.sync({ progress });
+    if (label === "startup") {
+      await sync.syncRecent({ progress });
+    } else {
+      await sync.sync({ progress });
+    }
 
     // Capture fingerprint AFTER a successful sync. Doing this on every
     // sync (instead of only on first observation) keeps us tracking
@@ -428,7 +433,7 @@ export const server: Plugin = async (input, _options) => {
     syncInProgress = true;
 
     try {
-      const progress = label === "initial sync" ? (message: string) => boot.step(message) : undefined;
+      const progress = label === "startup" ? (message: string) => boot.step(message) : undefined;
       // Functionality-affecting files (config + auth) go first — both ahead
       // of the rest of the file set (ordered inside fileSync.sync) and ahead
       // of session rows — so opencode's own config/credentials are in place
@@ -468,18 +473,26 @@ export const server: Plugin = async (input, _options) => {
   process.once("SIGINT", cleanup);
   process.once("SIGTERM", cleanup);
 
-  // 8. Run initial sync to completion BEFORE arming the periodic timer.
-  //    On a fresh peer the initial sync can take longer than one tick of
-  //    the interval (default 15s), so arming the timer first would let
-  //    `periodicSync` fire concurrently with the initial sync.
-  boot.step("running initial sync");
-  if (await runSync("initial sync")) {
-    log("initial sync complete");
+  // 8. Block launch only on config files + recent sessions. The rest of
+  //    the ledger is too large to wait for (millions of part rows) and
+  //    opencode's TUI already lists the last 30 days from live SQLite.
+  boot.step("running startup sync");
+  if (await runSync("startup")) {
+    log("startup sync complete");
     boot.finish("startup complete");
   } else {
-    log("initial sync failed, will retry on next interval");
+    log("startup sync failed, will retry in background");
     boot.finish("startup incomplete; retrying in background");
   }
+
+  void (async () => {
+    try {
+      await stateManager.migrateDeferredJson();
+    } catch (err) {
+      log("state.json migration failed", { error: String(err) });
+    }
+    void runSync("background catch-up");
+  })();
 
   timer = setInterval(() => {
     // setInterval doesn't await — wrap in a void IIFE so an unhandled

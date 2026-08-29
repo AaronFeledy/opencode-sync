@@ -12,7 +12,7 @@ import { writeHaltMarker, isSyncHalted, HALT_REASONS } from "./halt.js";
 
 // ── Constants ──────────────────────────────────────────────────────
 
-const PUSH_BATCH_SIZE = 100;
+const PUSH_BATCH_SIZE = 1000;
 
 /**
  * Rows requested per `/sync/pull` page. The pull loop is serial — each
@@ -24,12 +24,25 @@ const PUSH_BATCH_SIZE = 100;
  * the previous implicit default of 500. Combined with gzip on the
  * response, each page is also far smaller on the wire.
  */
-const PULL_PAGE_SIZE = 2000;
+const PULL_PAGE_SIZE = 5000;
+const PULL_ERROR_LOOKAHEAD_PAGES = 10;
 
 type SessionSyncProgress = (message: string) => void;
 
 type SessionSyncOptions = {
   progress?: SessionSyncProgress;
+  /** Only pull/push rows with time_updated >= this (ms epoch). */
+  minTimeUpdated?: number;
+  /** Which pull cursor to read/write. `recent` is the launch-blocking window. */
+  seqCursor?: "main" | "recent";
+  /** When false, skip writing state.json (startup path — file is hundreds of MB). */
+  persistState?: boolean;
+  /** Override the local push scan cursor. */
+  since?: number;
+  /** Skip tombstone emission (startup path must not delete out-of-window rows). */
+  skipDeletions?: boolean;
+  /** Don't advance lastPushedRowTime (startup recent push must not skip older local rows). */
+  freezePushCursor?: boolean;
 };
 
 /**
@@ -164,6 +177,7 @@ export class SessionSync {
   private client: SyncClient;
   private stateManager: StateManager;
   private machineId: string;
+  private startupHistoryDays: number;
   private log: (msg: string, data?: Record<string, unknown>) => void;
 
   /**
@@ -201,6 +215,7 @@ export class SessionSync {
     stateManager: StateManager,
     machineId: string,
     log: (msg: string, data?: Record<string, unknown>) => void,
+    startupHistoryDays: number = 7,
   ) {
     this.dbReader = dbReader;
     this.dbWriter = dbWriter;
@@ -208,6 +223,7 @@ export class SessionSync {
     this.stateManager = stateManager;
     this.machineId = machineId;
     this.log = log;
+    this.startupHistoryDays = startupHistoryDays;
   }
 
   /**
@@ -365,7 +381,7 @@ export class SessionSync {
     // Persist state as each batch completes. Startup pushes can be long, and
     // an interrupted process should resume from the last confirmed batch
     // instead of replaying everything from the beginning.
-    const since = this.stateManager.pushReadSince();
+    const since = options.since ?? this.stateManager.pushReadSince();
     options.progress?.(`scanning local changes since ${since}`);
 
     let totalSeen = 0;
@@ -400,7 +416,7 @@ export class SessionSync {
           continue;
         }
 
-        const knownTime = this.stateManager.state.knownRows[rowStateKey(e.kind, e.id)];
+        const knownTime = this.stateManager.getKnownTime(rowStateKey(e.kind, e.id));
         if (knownTime !== undefined && knownTime >= e.time_updated) {
           totalAlreadySynced++;
           continue;
@@ -410,7 +426,7 @@ export class SessionSync {
       }
 
       if (toPush.length === 0) {
-        if (batchMaxLiveTime > 0) {
+        if (batchMaxLiveTime > 0 && !options.freezePushCursor) {
           this.stateManager.advancePushedRowTime(batchMaxLiveTime);
         }
         return;
@@ -426,7 +442,7 @@ export class SessionSync {
         this.rememberAcceptedRows(toPush, res.stale);
         this.forgetAcceptedTombstones(toPush, res.stale);
 
-        if (batchMaxLiveTime > 0) {
+        if (batchMaxLiveTime > 0 && !options.freezePushCursor) {
           this.stateManager.advancePushedRowTime(batchMaxLiveTime);
         }
       });
@@ -462,6 +478,33 @@ export class SessionSync {
     // fingerprint mismatch, etc.) — see buildDeletionEnvelopes for the
     // full ordering. We still flush the live-row batches above so the
     // user's actual data keeps making it to the server.
+    //
+    // Startup recent-push must skip this: a time-windowed scan would
+    // otherwise treat every older known row as a deletion.
+    const skipDeletions = options.skipDeletions || (
+      this.expectedDeletions.size === 0 && !this.stateManager.shouldReconcileDeletions()
+    );
+    if (skipDeletions) {
+      await flushBatch();
+      if (totalSeen > 0) {
+        const maxSyncedTime = Math.max(maxPushedTime, maxCheckedLiveTime);
+        if (maxSyncedTime > 0 && !options.freezePushCursor) {
+          this.stateManager.advancePushedRowTime(maxSyncedTime);
+        }
+        this.log("pushAll complete (deletions skipped)", {
+          total: totalSeen,
+          accepted: totalAccepted,
+          stale: totalStale,
+        });
+        options.progress?.(
+          `push: accepted ${totalAccepted}/${totalSeen} checked (deletions skipped)`,
+        );
+      } else {
+        options.progress?.("push: already up to date");
+      }
+      return;
+    }
+
     options.progress?.("checking for deleted rows");
     const tombstones = await this.buildDeletionEnvelopes();
     if (tombstones === null) {
@@ -484,6 +527,7 @@ export class SessionSync {
       return;
     }
 
+    this.stateManager.markDeletionReconciled();
     options.progress?.(`queued ${tombstones.length} deleted rows`);
 
     // Tombstones come from comparing knownRows to live PKs — bounded by
@@ -519,7 +563,7 @@ export class SessionSync {
     // everything older than this batch (with a safety margin for clock
     // skew). See StateManager.pushReadSince for details.
     const maxSyncedTime = Math.max(maxPushedTime, maxCheckedLiveTime);
-    if (maxSyncedTime > 0) {
+    if (maxSyncedTime > 0 && !options.freezePushCursor) {
       this.stateManager.advancePushedRowTime(maxSyncedTime);
     }
 
@@ -546,29 +590,44 @@ export class SessionSync {
     // state.json write at the end. The dozens of redundant writes per pull
     // were measurable on large backlogs.
     return this.stateManager.withBatch(async () => {
-      return this.pullInternal(options.progress);
-    });
+      return this.pullInternal(options);
+    }, { persist: options.persistState !== false });
   }
 
-  private async pullInternal(progress?: SessionSyncProgress): Promise<{ applied: number; conflicts: number; errors: number }> {
+  private async pullInternal(options: SessionSyncOptions = {}): Promise<{ applied: number; conflicts: number; errors: number }> {
+    const progress = options.progress;
     let applied = 0;
     let conflicts = 0;
     let errors = 0;
     let pulled = 0;
     let hasMore = true;
 
+    const seqCursor = options.seqCursor ?? "main";
+    const readSeq = (): number =>
+      seqCursor === "recent"
+        ? this.stateManager.state.lastRecentPulledSeq
+        : this.stateManager.state.lastPulledSeq;
+    const writeSeq = (seq: number): void => {
+      if (seqCursor === "recent") this.stateManager.updateRecentSeq(seq);
+      else this.stateManager.updateSeq(seq);
+    };
+    let lookaheadPages = 0;
+    let fetchSince = readSeq();
+    let cycleBlocked = false;
+
     while (hasMore) {
-      progress?.(`pulling remote rows after #${this.stateManager.state.lastPulledSeq}`);
+      progress?.(`pulling remote rows after #${fetchSince}`);
       const res = await this.client.pull(
-        this.stateManager.state.lastPulledSeq,
+        fetchSince,
         this.machineId,
         PULL_PAGE_SIZE,
+        options.minTimeUpdated,
       );
       pulled += res.envelopes.length;
       const pageCursorSeq = res.cursor_seq ??
         (res.envelopes.length > 0
           ? res.envelopes[res.envelopes.length - 1]!.server_seq
-          : this.stateManager.state.lastPulledSeq);
+          : readSeq());
 
       const rememberedRows: Record<string, { time_updated: number; parent?: string }> = {};
       const forgottenRows = new Set<string>();
@@ -591,7 +650,7 @@ export class SessionSync {
       // `PULL_POISON_THRESHOLD` retries, the envelope is recorded in
       // `poisonedEnvelopes` and skipped past — the cursor advances so
       // subsequent pulls can proceed. See FINDINGS.md H3.
-      let lastGoodSeq = this.stateManager.state.lastPulledSeq;
+      let lastGoodSeq = readSeq();
       let firstErrorSeq: number | null = null;
 
       const applyOnce = (envelope: SyncEnvelope): { result: ApplyResult; thrownError: string | null } => {
@@ -619,27 +678,38 @@ export class SessionSync {
         firstOutcome: { result: ApplyResult; thrownError: string | null };
       }> = [];
 
+      const live: Array<{ index: number; envelope: SyncEnvelope }> = [];
       for (const [index, envelope] of res.envelopes.entries()) {
-        // Skip already-poisoned envelopes to avoid re-applying and duplicate
-        // entries. Advance cursor if no prior error blocked us.
-        const alreadyPoisoned = this.stateManager.state.poisonedEnvelopes.some(
-          (p) =>
-            p.kind === envelope.kind &&
-            p.id === envelope.id &&
-            p.server_seq === envelope.server_seq,
+        const alreadyPoisoned = this.stateManager.isPoisoned(
+          envelope.kind,
+          envelope.id,
+          envelope.server_seq,
         );
         if (alreadyPoisoned) {
           outcomes[index] = { result: "poisoned-skip", thrownError: null };
           continue;
         }
+        live.push({ index, envelope });
+      }
 
-        const outcome = applyOnce(envelope);
-        if (outcome.result === "error") {
-          deferred.push({ index, envelope, firstOutcome: outcome });
+      live.sort((a, b) => {
+        const orderDiff = PULL_RETRY_ORDER[a.envelope.kind] - PULL_RETRY_ORDER[b.envelope.kind];
+        if (orderDiff !== 0) return orderDiff;
+        return a.envelope.server_seq - b.envelope.server_seq;
+      });
+
+      const pageResults = this.dbWriter.applyPage(live.map((item) => item.envelope));
+      for (const [i, item] of live.entries()) {
+        const result = pageResults[i] ?? "error";
+        if (result === "error") {
+          deferred.push({
+            index: item.index,
+            envelope: item.envelope,
+            firstOutcome: { result, thrownError: null },
+          });
           continue;
         }
-
-        outcomes[index] = outcome;
+        outcomes[item.index] = { result, thrownError: null };
       }
 
       // Retry once after the whole page has had a chance to land, ordered by
@@ -802,16 +872,16 @@ export class SessionSync {
       // flushBatch (lastPushedRowIds + knownRows[knownTime] >= e.time_updated)
       // are sufficient to suppress echoes without advancing the push cursor.
 
-      if (firstErrorSeq !== null) {
-        // Advance only past the prefix of cleanly-applied envelopes (if
-        // any) and stop pagination. Subsequent pages would be at higher
-        // seqs — fetching them would force the cursor past the failed
-        // envelope on success. Better to retry this page from the same
-        // cursor next cycle.
-        if (lastGoodSeq > this.stateManager.state.lastPulledSeq) {
-          this.stateManager.updateSeq(lastGoodSeq);
+      if (firstErrorSeq !== null || cycleBlocked) {
+        if (firstErrorSeq !== null && !cycleBlocked) {
+          if (lastGoodSeq > readSeq()) writeSeq(lastGoodSeq);
         }
-        break;
+        cycleBlocked = true;
+        fetchSince = pageCursorSeq;
+        lookaheadPages++;
+        if (lookaheadPages >= PULL_ERROR_LOOKAHEAD_PAGES || !res.more) break;
+        hasMore = res.more;
+        continue;
       }
 
       if (res.envelopes.length > 0) {
@@ -821,7 +891,8 @@ export class SessionSync {
         // to the global max would skip every row between the batch tail and
         // the global max on the next pagination request.
         // pullRows() guarantees ascending server_seq order.
-        this.stateManager.updateSeq(pageCursorSeq);
+        writeSeq(pageCursorSeq);
+        fetchSince = pageCursorSeq;
       } else if (res.more) {
         // Defensive: the current server can't produce {envelopes:[], more:true}
         // (its `more` flag is `rows.length > limit`, so empty rows implies
@@ -829,7 +900,7 @@ export class SessionSync {
         // shape we'd loop forever requesting the same `since` cursor.
         // Break out and let the next sync cycle retry from the same cursor.
         this.log("pull: server returned more=true with no envelopes; breaking", {
-          since: this.stateManager.state.lastPulledSeq,
+          since: readSeq(),
           server_seq: res.server_seq,
         });
         break;
@@ -837,7 +908,7 @@ export class SessionSync {
         // No envelopes and nothing more to fetch — we're caught up to the
         // server's global high-watermark; persist that so the cursor reflects
         // reality even when no rows changed.
-        this.stateManager.updateSeq(res.server_seq);
+        writeSeq(res.server_seq);
       }
 
       progress?.(
@@ -876,6 +947,39 @@ export class SessionSync {
     await this.pull(options);
     options.progress?.("pushing local changes");
     await this.pushAll(options);
+  }
+
+  /**
+   * Launch-blocking window: last `startupHistoryDays` of rows, no tombstones.
+   * Full history continues via `sync()` in the background.
+   */
+  async syncRecent(options: SessionSyncOptions = {}): Promise<void> {
+    if (this.isHaltedNow()) {
+      this.log("syncRecent skipped — sync halted by deletion-safety guard");
+      options.progress?.("halted by deletion-safety guard");
+      return;
+    }
+    const cutoff = Date.now() - this.startupHistoryDays * 24 * 60 * 60 * 1000;
+    const canFilter = this.client.supportsPullMinTime();
+    if (!canFilter) {
+      this.log("syncRecent: server lacks pull-min-time; skipping remote recent pull");
+      options.progress?.("server cannot filter recent rows; pushing local recent only");
+    } else {
+      options.progress?.(`pulling sessions from last ${this.startupHistoryDays} days`);
+      await this.pull({
+        ...options,
+        minTimeUpdated: cutoff,
+        seqCursor: "recent",
+        persistState: false,
+      });
+    }
+    options.progress?.(`pushing local sessions from last ${this.startupHistoryDays} days`);
+    await this.pushAll({
+      ...options,
+      since: cutoff,
+      skipDeletions: true,
+      freezePushCursor: true,
+    });
   }
 
   private buildSessionEnvelopes(

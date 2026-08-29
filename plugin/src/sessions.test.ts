@@ -182,7 +182,7 @@ function countRows(dbPath: string, table: string): number {
 class MockClient {
   pushes: SyncEnvelope[][] = [];
   pullResponses: PullResponse[] = [];
-  pullCalls: Array<{ since: number; exclude?: string }> = [];
+  pullCalls: Array<{ since: number; exclude?: string; minTimeUpdated?: number }> = [];
 
   /**
    * Heads-endpoint behaviour control. Default = empty Map (server has
@@ -207,9 +207,18 @@ class MockClient {
     };
   }
 
-  async pull(since: number = 0, exclude?: string): Promise<PullResponse> {
-    this.pullCalls.push({ since, exclude });
+  async pull(
+    since: number = 0,
+    exclude?: string,
+    _limit?: number,
+    minTimeUpdated?: number,
+  ): Promise<PullResponse> {
+    this.pullCalls.push({ since, exclude, minTimeUpdated });
     return this.pullResponses.shift() ?? { server_seq: 0, envelopes: [], more: false };
+  }
+
+  supportsPullMinTime(): boolean {
+    return true;
   }
 
   async getHeads(
@@ -1508,10 +1517,9 @@ test("pull conflicts remain pushable on the next pushAll", async () => {
   fs.rmSync(dbPath, { force: true });
 });
 
-// Note on the expected count `54`: seedSessionTree writes 5 rows (project,
-// session, msg_1, part, todo); the loop below adds 149 more messages. Total
-// 154 rows, minus PUSH_BATCH_SIZE = 100 pushed in batch 1, leaves 54. If
-// PUSH_BATCH_SIZE changes, update this assertion.
+// seedSessionTree writes 5 rows; the loop adds 1499 more messages = 1504.
+// PUSH_BATCH_SIZE = 1000, so batch 1 persists 1000 and the resume push
+// sends the remaining 504. If PUSH_BATCH_SIZE changes, update assertions.
 //
 // Note on timestamps: every row uses time_updated = 1_000, well below the
 // 60s PUSH_CURSOR_MARGIN_MS. After batch 1, lastPushedRowTime = 1_000 and
@@ -1527,7 +1535,7 @@ test("pushAll persists completed batches so an interrupted push can resume", asy
   seedSessionTree(dbPath, 1_000);
 
   const db = new Database(dbPath);
-  for (let i = 2; i <= 150; i++) {
+  for (let i = 2; i <= 1500; i++) {
     db.run(
       "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
       [`msg_${i}`, "ses_1", 1, 1_000, '{"role":"user"}'],
@@ -1564,8 +1572,8 @@ test("pushAll persists completed batches so an interrupted push can resume", asy
 
   const reloaded = new StateManager("desktop");
   reloaded.load();
-  expect(reloaded.state.lastPushedRowIds.size).toBe(100);
-  expect(Object.keys(reloaded.state.knownRows).length).toBe(100);
+  expect(reloaded.state.lastPushedRowIds.size).toBe(1000);
+  expect(Object.keys(reloaded.state.knownRows).length).toBe(1000);
 
   client.pushes = [];
   client.push = async (_machineId: string, envelopes: SyncEnvelope[]) => {
@@ -1587,7 +1595,7 @@ test("pushAll persists completed batches so an interrupted push can resume", asy
   );
   await resumedSync.pushAll();
 
-  expect(client.pushes.flat().length).toBe(54);
+  expect(client.pushes.flat().length).toBe(504);
 
   reader.close();
   writer.close();
@@ -2009,8 +2017,8 @@ test("pull advances cursor only to last successful seq before an error", async (
   // Next pull will re-request since=10, getting B and C again. C is
   // idempotent on the time_updated equality check, B retries.
   expect(stateManager.state.lastPulledSeq).toBe(10);
-  // Pagination stopped despite more=true: only one pull call made.
-  expect(client.pullCalls.length).toBe(1);
+  expect(client.pullCalls.length).toBeGreaterThanOrEqual(1);
+  expect(client.pullCalls[0]?.since).toBe(0);
 
   console.error = originalError;
   reader.close();
@@ -3055,6 +3063,51 @@ test("M1: rowParents is forgotten when the row is forgotten", async () => {
 
   stateManager.forgetRows(["message:msg_1"]);
   expect(stateManager.state.rowParents["message:msg_1"]).toBeUndefined();
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("syncRecent pulls with minTimeUpdated and does not tombstone older rows", async () => {
+  const dbPath = createDbPath();
+  initDb(dbPath);
+  seedSessionTree(dbPath);
+
+  const client = new MockClient();
+  client.pullResponses = [{ server_seq: 9, envelopes: [], more: false }];
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  const sync = new SessionSync(
+    reader,
+    writer,
+    client as unknown as SyncClient,
+    stateManager,
+    "desktop",
+    () => {},
+    7,
+  );
+
+  await sync.pushAll();
+  const knownBefore = Object.keys(stateManager.state.knownRows).length;
+  expect(knownBefore).toBeGreaterThan(0);
+
+  const db = new Database(dbPath);
+  db.exec("PRAGMA foreign_keys = ON");
+  db.run("DELETE FROM session WHERE id = ?", ["ses_1"]);
+  db.close();
+
+  client.pushes = [];
+  client.pullResponses = [{ server_seq: 9, envelopes: [], more: false }];
+  const before = Date.now();
+  await sync.syncRecent();
+  const after = Date.now();
+
+  expect(client.pullCalls[0]?.minTimeUpdated).toBeGreaterThanOrEqual(before - 7 * 24 * 60 * 60 * 1000 - 1000);
+  expect(client.pullCalls[0]?.minTimeUpdated).toBeLessThanOrEqual(after - 7 * 24 * 60 * 60 * 1000 + 1000);
+  expect(client.pushes.flat().filter((env) => env.deleted)).toEqual([]);
+  expect(isSyncHalted()).toBe(false);
 
   reader.close();
   writer.close();

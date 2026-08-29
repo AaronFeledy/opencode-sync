@@ -24,6 +24,7 @@ const MIGRATIONS = [
     PRIMARY KEY (kind, id)
   )`,
   `CREATE INDEX IF NOT EXISTS sync_row_seq_idx ON sync_row(server_seq)`,
+  `CREATE INDEX IF NOT EXISTS sync_row_time_seq_idx ON sync_row(time_updated, server_seq)`,
 
   // Server state
   `CREATE TABLE IF NOT EXISTS server_state (
@@ -59,6 +60,8 @@ export class LedgerDB {
   private stmtUpdateRow;
   private stmtPullRows;
   private stmtPullRowsExclude;
+  private stmtPullRowsMinTime;
+  private stmtPullRowsMinTimeExclude;
   private stmtGetManifest;
   private stmtGetManifestEntry;
   private stmtUpsertManifest;
@@ -134,6 +137,20 @@ export class LedgerDB {
       [number, string, number]
     >(
       `SELECT * FROM sync_row WHERE server_seq > ? AND machine_id != ? ORDER BY server_seq ASC LIMIT ?`,
+    );
+
+    this.stmtPullRowsMinTime = this.db.prepare<
+      { kind: string; id: string; machine_id: string; time_updated: number; server_seq: number; deleted: number; data: string | null; received_at: number },
+      [number, number, number]
+    >(
+      `SELECT * FROM sync_row WHERE server_seq > ? AND time_updated >= ? ORDER BY server_seq ASC LIMIT ?`,
+    );
+
+    this.stmtPullRowsMinTimeExclude = this.db.prepare<
+      { kind: string; id: string; machine_id: string; time_updated: number; server_seq: number; deleted: number; data: string | null; received_at: number },
+      [number, string, number, number]
+    >(
+      `SELECT * FROM sync_row WHERE server_seq > ? AND machine_id != ? AND time_updated >= ? ORDER BY server_seq ASC LIMIT ?`,
     );
 
     this.stmtGetManifest = this.db.prepare<
@@ -386,6 +403,7 @@ export class LedgerDB {
     since: number,
     exclude?: string,
     limit: number = 500,
+    minTimeUpdated?: number,
   ): { envelopes: SyncEnvelope[]; more: boolean; server_seq: number; cursor_seq: number; dependency_closure: boolean } {
     // Fetch limit+1 to detect whether there are more
     const fetchLimit = limit + 1;
@@ -401,7 +419,11 @@ export class LedgerDB {
       received_at: number;
     }>;
 
-    if (exclude) {
+    if (minTimeUpdated !== undefined) {
+      rows = exclude
+        ? this.stmtPullRowsMinTimeExclude.all(since, exclude, minTimeUpdated, fetchLimit)
+        : this.stmtPullRowsMinTime.all(since, minTimeUpdated, fetchLimit);
+    } else if (exclude) {
       rows = this.stmtPullRowsExclude.all(since, exclude, fetchLimit);
     } else {
       rows = this.stmtPullRows.all(since, fetchLimit);

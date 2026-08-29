@@ -54,6 +54,16 @@ export interface PullQuery {
   exclude?: string;
   /** Max rows to return (default 500) */
   limit?: number;
+  /**
+   * When set, only envelopes with `time_updated >= min_time_updated` are
+   * returned (still ordered by `server_seq`). Used by the plugin's
+   * launch-blocking recent-session pull so a peer does not have to walk
+   * the full ledger before opencode can start. Older servers ignore
+   * unknown query params — clients MUST also see `FEATURE_PULL_MIN_TIME`
+   * in `/health` before sending this, otherwise they would re-download
+   * the entire backlog.
+   */
+  min_time_updated?: number;
 }
 
 export interface PullResponse {
@@ -111,6 +121,25 @@ export interface HeadsResponse {
  * the standard `Accept-Encoding`/`Content-Encoding` headers.
  */
 export const FEATURE_GZIP_REQUEST = "gzip-request";
+
+/**
+ * Capability advertised by a server that honours `min_time_updated` on
+ * `GET /sync/pull`. Clients MUST NOT send that query param unless the
+ * server lists this feature — older servers ignore unknown params and
+ * would return the unfiltered ledger, defeating the recent-session
+ * startup path.
+ */
+export const FEATURE_PULL_MIN_TIME = "pull-min-time";
+
+/**
+ * Capability advertised by a server that accepts and returns MessagePack
+ * bodies (`Content-Type: application/msgpack`). Clients MUST NOT send
+ * MessagePack unless the server lists this — older servers would
+ * JSON.parse binary bytes and 400.
+ */
+export const FEATURE_MSGPACK = "msgpack";
+
+export const MSGPACK_CONTENT_TYPE = "application/msgpack";
 
 export interface HealthResponse {
   ok: boolean;

@@ -2,7 +2,12 @@
  * GET /health — unauthenticated health check.
  */
 
-import { FEATURE_GZIP_REQUEST, type HealthResponse } from "@opencode-sync/shared";
+import {
+  FEATURE_GZIP_REQUEST,
+  FEATURE_MSGPACK,
+  FEATURE_PULL_MIN_TIME,
+  type HealthResponse,
+} from "@opencode-sync/shared";
 import type { LedgerDB } from "../db.js";
 import type { Logger } from "../log.js";
 
@@ -18,7 +23,7 @@ export function handleHealth(
     time: Date.now(),
     // Advertise that this server can inflate gzip-encoded request bodies so
     // clients only compress uploads when it's safe (older servers omit this).
-    features: [FEATURE_GZIP_REQUEST],
+    features: [FEATURE_GZIP_REQUEST, FEATURE_PULL_MIN_TIME, FEATURE_MSGPACK],
   };
 
   return new Response(JSON.stringify(body), {

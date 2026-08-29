@@ -116,3 +116,26 @@ test("M3: save() then load() round-trips all fields", () => {
   expect(sm2.state.knownRows["message:m1"]).toBe(1001);
   expect(sm2.state.rowParents["message:m1"]).toBe("s1");
 });
+
+test("isPoisoned is O(1) and survives save/load", () => {
+  const sm = new StateManager("desktop");
+  sm.recordPoisonedEnvelope({ kind: "part", id: "p1", server_seq: 9 });
+  expect(sm.isPoisoned("part", "p1", 9)).toBe(true);
+  expect(sm.isPoisoned("part", "p1", 8)).toBe(false);
+  sm.save();
+
+  const sm2 = new StateManager("desktop");
+  sm2.load();
+  expect(sm2.isPoisoned("part", "p1", 9)).toBe(true);
+});
+
+test("getKnownTime does not require loading every known row", () => {
+  const sm = new StateManager("desktop");
+  sm.rememberRows({ "session:s1": 50 });
+  sm.save();
+
+  const sm2 = new StateManager("desktop");
+  sm2.load();
+  expect(sm2.getKnownTime("session:s1")).toBe(50);
+  expect(sm2.getKnownTime("session:missing")).toBeUndefined();
+});

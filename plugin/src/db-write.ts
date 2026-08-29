@@ -249,7 +249,9 @@ export class DbWriter {
       this.db.run(sql, params);
       return true;
     } catch (err) {
-      logger.error(`SQL upsert error for ${kind}:`, err);
+      if (!isForeignKeyError(err)) {
+        logger.error(`SQL upsert error for ${kind}:`, err);
+      }
       return false;
     }
   }
@@ -284,8 +286,41 @@ export class DbWriter {
       this.db.run(sql, pkValues);
       return "applied";
     } catch (err) {
-      logger.error(`SQL delete error for ${kind}:`, err);
+      if (!isForeignKeyError(err)) {
+        logger.error(`SQL delete error for ${kind}:`, err);
+      }
       return "error";
     }
   }
+
+  /**
+   * Apply a page of envelopes in one transaction with deferred FK checks
+   * so child-before-parent order inside the page can still commit.
+   * Falls back to per-row apply if the transaction rolls back.
+   */
+  applyPage(envelopes: SyncEnvelope[]): ApplyResult[] {
+    if (envelopes.length === 0) return [];
+    try {
+      return this.db.transaction(() => {
+        this.db.exec("PRAGMA defer_foreign_keys = ON");
+        try {
+          const results = envelopes.map((envelope) => this.applyEnvelope(envelope));
+          const violations = this.db.query("PRAGMA foreign_key_check").all();
+          if (violations.length > 0) {
+            throw new Error("foreign key check failed");
+          }
+          return results;
+        } finally {
+          this.db.exec("PRAGMA defer_foreign_keys = OFF");
+        }
+      })();
+    } catch {
+      return envelopes.map((envelope) => this.applyEnvelope(envelope));
+    }
+  }
+}
+
+function isForeignKeyError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.includes("FOREIGN KEY") || msg.includes("SQLITE_CONSTRAINT_FOREIGNKEY");
 }

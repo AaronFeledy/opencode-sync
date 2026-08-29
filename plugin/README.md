@@ -83,6 +83,10 @@ Create `~/.config/opencode/opencode-sync.jsonc`:
   // Sync interval in seconds (default: 15)
   "sync_interval_sec": 15,
 
+  // Days of session history to sync before opencode finishes launching.
+  // Everything older continues in the background. Default: 7.
+  "startup_history_days": 7,
+
   // Control which config files are synced
   "file_sync": {
     "agents": true,
