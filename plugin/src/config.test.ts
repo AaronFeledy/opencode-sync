@@ -50,4 +50,14 @@ test("loads token from token_env", () => {
   const config = loadPluginConfig();
 
   expect(config.token).toBe("secret-token");
+  expect(config.startupHistoryDays).toBe(7);
+});
+
+test("startup_history_days overrides the default", () => {
+  process.env.TEST_OPENCODE_SYNC_TOKEN = "secret-token";
+  writeConfig(
+    '{"server_url":"http://127.0.0.1:4455","token_env":"TEST_OPENCODE_SYNC_TOKEN","startup_history_days":3}\n',
+  );
+
+  expect(loadPluginConfig().startupHistoryDays).toBe(3);
 });

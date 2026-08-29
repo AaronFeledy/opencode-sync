@@ -20,6 +20,12 @@ export interface PluginConfig {
   includeAuth: boolean;
   /** Interval between background sync cycles, in seconds — default 15 */
   syncIntervalSec: number;
+  /**
+   * How many days of session history to pull/push before the plugin
+   * returns (and opencode can finish launching). The rest of the ledger
+   * continues in the background. Default 7.
+   */
+  startupHistoryDays: number;
   /** Per-category file sync toggles */
   fileSync: FileSyncConfig;
 }
@@ -80,6 +86,15 @@ export function loadPluginConfig(): PluginConfig {
   // ── syncIntervalSec ──
   const syncIntervalSec = (raw["sync_interval_sec"] as number | undefined) ?? 15;
 
+  // ── startupHistoryDays ──
+  const startupHistoryDaysRaw = raw["startup_history_days"];
+  const startupHistoryDays =
+    typeof startupHistoryDaysRaw === "number" &&
+    Number.isInteger(startupHistoryDaysRaw) &&
+    startupHistoryDaysRaw > 0
+      ? startupHistoryDaysRaw
+      : 7;
+
   // ── fileSync ──
   const fileSyncRaw = (raw["file_sync"] as Partial<FileSyncConfig> | undefined) ?? {};
   const fileSync: FileSyncConfig = {
@@ -98,6 +113,7 @@ export function loadPluginConfig(): PluginConfig {
     machineId,
     includeAuth,
     syncIntervalSec,
+    startupHistoryDays,
     fileSync,
   };
 }
