@@ -1,12 +1,13 @@
 /**
  * Persistent sync state — tracks what we've pushed/pulled so far.
- * Stored at ~/.local/share/opencode/opencode-sync/state.json
+ * Heavy maps live in state.sqlite. Legacy state.json is imported once
+ * (immediately if small, after plugin return if huge).
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Database } from "bun:sqlite";
 import type { FileManifestEntry, SyncKind } from "@opencode-sync/shared";
-import { atomicWriteFileSync } from "./util.js";
 import { logger } from "./logger.js";
 
 /**
@@ -23,8 +24,11 @@ import { logger } from "./logger.js";
  */
 export const PULL_POISON_THRESHOLD = 10;
 
-/** Cap on `poisonedEnvelopes` to bound `state.json` growth under attack. */
+/** Cap on `poisonedEnvelopes` to bound growth under attack. */
 const POISONED_ENVELOPES_MAX = 500;
+
+const JSON_MIGRATE_SYNC_MAX_BYTES = 5 * 1024 * 1024;
+const DELETION_RECONCILE_INTERVAL_MS = 5 * 60_000;
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -32,6 +36,12 @@ export interface SyncState {
   machineId: string;
   /** Server-assigned monotonic cursor — pull rows with seq > this */
   lastPulledSeq: number;
+  /**
+   * Cursor for the launch-blocking recent-session pull (`min_time_updated`).
+   * Independent of `lastPulledSeq` so background catch-up can keep walking
+   * the full ledger without skipping rows the recent path already applied.
+   */
+  lastRecentPulledSeq: number;
   /** Track what we've pushed so we don't re-push unchanged rows */
   lastPushedRowIds: Set<string>;
   /**
@@ -138,6 +148,7 @@ export interface SyncState {
 interface SyncStateJson {
   machineId: string;
   lastPulledSeq: number;
+  lastRecentPulledSeq?: number;
   lastPushedRowIds: string[];
   lastPushedRowTime?: number;
   knownRows?: Record<string, number>;
@@ -169,6 +180,34 @@ const PUSH_CURSOR_MARGIN_MS = 60_000;
 
 const STATE_DIR = path.join(os.homedir(), ".local", "share", "opencode", "opencode-sync");
 const STATE_FILE = path.join(STATE_DIR, "state.json");
+const STATE_DB_FILE = path.join(STATE_DIR, "state.sqlite");
+
+const STATE_SCHEMA = `
+CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS known_rows (row_key TEXT PRIMARY KEY, time_updated INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS row_parents (row_key TEXT PRIMARY KEY, parent TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS pending_tombstones (
+  row_key TEXT PRIMARY KEY,
+  first_seen_at INTEGER NOT NULL,
+  known_time_updated INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pull_error_counts (envelope_key TEXT PRIMARY KEY, count INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS poisoned (
+  kind TEXT NOT NULL,
+  id TEXT NOT NULL,
+  server_seq INTEGER NOT NULL,
+  skipped_at INTEGER NOT NULL,
+  last_error TEXT,
+  PRIMARY KEY (kind, id, server_seq)
+);
+CREATE TABLE IF NOT EXISTS last_pushed (id TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS known_files (
+  relpath TEXT PRIMARY KEY,
+  sha256 TEXT NOT NULL,
+  mtime REAL NOT NULL,
+  size INTEGER NOT NULL
+);
+`;
 
 export class StateManager {
   private _state: SyncState;
@@ -176,11 +215,17 @@ export class StateManager {
   private _batchDepth = 0;
   /** Set by mutating methods when they would have saved during a batch. */
   private _batchDirty = false;
+  private _db: Database | null = null;
+  private _heavyLoaded = false;
+  private _pendingJsonMigration: string | null = null;
+  private _poisonKeys = new Set<string>();
+  private _lastDeletionReconcileAt = 0;
 
   constructor(machineId: string) {
     this._state = {
       machineId,
       lastPulledSeq: 0,
+      lastRecentPulledSeq: 0,
       lastPushedRowIds: new Set(),
       lastPushedRowTime: 0,
       knownRows: {},
@@ -204,89 +249,106 @@ export class StateManager {
    * than silently resetting to defaults. See FINDINGS.md M3.
    */
   load(): void {
+    this.openDb();
+    if (this.sqliteHasMeta()) {
+      this.loadFromSqlite();
+      return;
+    }
     if (!fs.existsSync(STATE_FILE)) return;
 
-    let raw: string;
+    let size = 0;
     try {
-      raw = fs.readFileSync(STATE_FILE, "utf-8");
+      size = fs.statSync(STATE_FILE).size;
     } catch (err) {
-      // fs-level failure is NOT "corrupt" — surface it so the operator
-      // sees a loud error rather than an opaque re-pull-from-zero.
-      logger.error("state.load: failed to read state file", {
+      logger.error("state.load: failed to stat state file", {
         path: STATE_FILE,
         error: String(err),
       });
       throw err;
     }
 
-    let json: Partial<SyncStateJson>;
-    try {
-      json = JSON.parse(raw) as Partial<SyncStateJson>;
-    } catch (err) {
-      // Back up the corrupt file before the next save() clobbers it.
-      // `rename` is atomic on the same filesystem, so the original
-      // bytes are preserved even if the save-before-next-load races.
-      const backup = `${STATE_FILE}.corrupt-${Date.now()}`;
-      try {
-        fs.renameSync(STATE_FILE, backup);
-      } catch (backupErr) {
-        logger.error(
-          "state.load: corrupt state.json AND backup failed — resetting to defaults",
-          {
-            path: STATE_FILE,
-            parseError: String(err),
-            backupError: String(backupErr),
-          },
-        );
-        return;
-      }
-      logger.error(
-        "state.load: corrupt state.json — backed up and reset to defaults",
-        {
-          path: STATE_FILE,
-          backup,
-          bytes: raw.length,
-          error: String(err),
-        },
-      );
+    if (size > JSON_MIGRATE_SYNC_MAX_BYTES) {
+      this._pendingJsonMigration = STATE_FILE;
+      logger.log("deferring large state.json import until after startup", {
+        path: STATE_FILE,
+        bytes: size,
+      });
       return;
     }
 
-    this._state.lastPulledSeq = json.lastPulledSeq ?? 0;
-    this._state.lastPushedRowIds = new Set(json.lastPushedRowIds ?? []);
-    this._state.lastPushedRowTime = json.lastPushedRowTime ?? 0;
-    this._state.knownRows = this.parseKnownRows(json.knownRows);
-    this._state.knownFiles = this.parseKnownFiles(json.knownFiles);
-    this._state.lastFileSyncTime = json.lastFileSyncTime ?? 0;
-    this._state.dbFingerprint = this.parseDbFingerprint(json.dbFingerprint);
-    this._state.pendingTombstones = this.parsePendingTombstones(json.pendingTombstones);
-    this._state.pullErrorCounts = this.parsePullErrorCounts(json.pullErrorCounts);
-    this._state.poisonedEnvelopes = this.parsePoisonedEnvelopes(json.poisonedEnvelopes);
-    this._state.rowParents = this.parseRowParents(json.rowParents);
-
-    // Preserve machineId from constructor — don't override with stale file.
+    const json = this.readJsonFile(STATE_FILE);
+    if (!json) return;
+    this.applyJson(json);
+    this._heavyLoaded = true;
+    this.save();
   }
 
-  /** Persist state to disk atomically. */
+  async migrateDeferredJson(): Promise<void> {
+    const pending = this._pendingJsonMigration;
+    if (!pending) return;
+    this._pendingJsonMigration = null;
+    const json = this.readJsonFile(pending);
+    if (!json) return;
+    this.applyJson(json);
+    this._heavyLoaded = true;
+    this.save();
+    try {
+      fs.renameSync(pending, `${pending}.migrated`);
+    } catch (err) {
+      logger.error("state: failed to rename migrated state.json", { error: String(err) });
+    }
+  }
+
   save(): void {
-    fs.mkdirSync(STATE_DIR, { recursive: true });
+    this.openDb();
+    const db = this._db!;
+    db.transaction(() => {
+      this.writeMeta();
+      db.exec("DELETE FROM last_pushed");
+      const insPushed = db.prepare("INSERT INTO last_pushed (id) VALUES (?)");
+      for (const id of this._state.lastPushedRowIds) insPushed.run(id);
 
-    const json: SyncStateJson = {
-      machineId: this._state.machineId,
-      lastPulledSeq: this._state.lastPulledSeq,
-      lastPushedRowIds: [...this._state.lastPushedRowIds],
-      lastPushedRowTime: this._state.lastPushedRowTime,
-      knownRows: this._state.knownRows,
-      knownFiles: this._state.knownFiles,
-      lastFileSyncTime: this._state.lastFileSyncTime,
-      dbFingerprint: this._state.dbFingerprint,
-      pendingTombstones: this._state.pendingTombstones,
-      pullErrorCounts: this._state.pullErrorCounts,
-      poisonedEnvelopes: this._state.poisonedEnvelopes,
-      rowParents: this._state.rowParents,
-    };
+      db.exec("DELETE FROM known_files");
+      const insFile = db.prepare("INSERT INTO known_files (relpath, sha256, mtime, size) VALUES (?, ?, ?, ?)");
+      for (const [relpath, file] of Object.entries(this._state.knownFiles)) {
+        insFile.run(relpath, file.sha256, file.mtime, file.size);
+      }
 
-    atomicWriteFileSync(STATE_FILE, JSON.stringify(json, null, 2));
+      db.exec("DELETE FROM pending_tombstones");
+      const insPending = db.prepare(
+        "INSERT INTO pending_tombstones (row_key, first_seen_at, known_time_updated) VALUES (?, ?, ?)",
+      );
+      for (const [rowKey, entry] of Object.entries(this._state.pendingTombstones)) {
+        insPending.run(rowKey, entry.firstSeenAt, entry.knownTimeUpdated);
+      }
+
+      db.exec("DELETE FROM pull_error_counts");
+      const insErr = db.prepare("INSERT INTO pull_error_counts (envelope_key, count) VALUES (?, ?)");
+      for (const [key, count] of Object.entries(this._state.pullErrorCounts)) {
+        insErr.run(key, count);
+      }
+
+      db.exec("DELETE FROM poisoned");
+      const insPoison = db.prepare(
+        "INSERT INTO poisoned (kind, id, server_seq, skipped_at, last_error) VALUES (?, ?, ?, ?, ?)",
+      );
+      for (const p of this._state.poisonedEnvelopes) {
+        insPoison.run(p.kind, p.id, p.server_seq, p.skippedAt, p.lastError ?? null);
+      }
+
+      if (this._heavyLoaded) {
+        db.exec("DELETE FROM known_rows");
+        const insRow = db.prepare("INSERT INTO known_rows (row_key, time_updated) VALUES (?, ?)");
+        for (const [rowKey, timeUpdated] of Object.entries(this._state.knownRows)) {
+          insRow.run(rowKey, timeUpdated);
+        }
+        db.exec("DELETE FROM row_parents");
+        const insParent = db.prepare("INSERT INTO row_parents (row_key, parent) VALUES (?, ?)");
+        for (const [rowKey, parent] of Object.entries(this._state.rowParents)) {
+          insParent.run(rowKey, parent);
+        }
+      }
+    })();
   }
 
   /**
@@ -339,7 +401,13 @@ export class StateManager {
   }
 
   get state(): SyncState {
-    return this._state;
+    const self = this;
+    return new Proxy(this._state, {
+      get(target, prop, receiver) {
+        if (prop === "knownRows" || prop === "rowParents") self.ensureHeavy();
+        return Reflect.get(target, prop, receiver);
+      },
+    });
   }
 
   /**
@@ -351,7 +419,7 @@ export class StateManager {
    * paginated pull/push, where each iteration calls `markPushed`,
    * `rememberRows`, `forgetRows`, and `updateSeq`).
    */
-  async withBatch<T>(fn: () => Promise<T>): Promise<T> {
+  async withBatch<T>(fn: () => Promise<T>, options?: { persist?: boolean }): Promise<T> {
     this._batchDepth++;
     try {
       return await fn();
@@ -359,7 +427,7 @@ export class StateManager {
       this._batchDepth--;
       if (this._batchDepth === 0 && this._batchDirty) {
         this._batchDirty = false;
-        this.save();
+        if (options?.persist !== false) this.save();
       }
     }
   }
@@ -378,6 +446,11 @@ export class StateManager {
 
   updateSeq(seq: number): void {
     this._state.lastPulledSeq = seq;
+    this.maybeSave();
+  }
+
+  updateRecentSeq(seq: number): void {
+    this._state.lastRecentPulledSeq = seq;
     this.maybeSave();
   }
 
@@ -402,6 +475,7 @@ export class StateManager {
    */
   rememberRows(rows: Record<string, number | { time_updated: number; parent?: string }>): void {
     let changed = false;
+    const db = this._db;
 
     for (const [rowKey, entry] of Object.entries(rows)) {
       const timeUpdated = typeof entry === "number" ? entry : entry.time_updated;
@@ -409,20 +483,24 @@ export class StateManager {
 
       if (this._state.knownRows[rowKey] !== timeUpdated) {
         this._state.knownRows[rowKey] = timeUpdated;
+        this._heavyLoaded = true;
         changed = true;
+        db?.prepare("INSERT INTO known_rows (row_key, time_updated) VALUES (?, ?) ON CONFLICT(row_key) DO UPDATE SET time_updated = excluded.time_updated").run(rowKey, timeUpdated);
       }
 
       if (parent !== undefined && this._state.rowParents[rowKey] !== parent) {
         this._state.rowParents[rowKey] = parent;
         changed = true;
+        db?.prepare("INSERT INTO row_parents (row_key, parent) VALUES (?, ?) ON CONFLICT(row_key) DO UPDATE SET parent = excluded.parent").run(rowKey, parent);
       }
     }
 
-    if (changed) this.maybeSave();
+    if (changed && !db) this.maybeSave();
   }
 
   forgetRows(rowKeys: string[]): void {
     let changed = false;
+    const db = this._db;
 
     for (const rowKey of rowKeys) {
       if (rowKey in this._state.knownRows) {
@@ -433,9 +511,11 @@ export class StateManager {
         delete this._state.rowParents[rowKey];
         changed = true;
       }
+      db?.prepare("DELETE FROM known_rows WHERE row_key = ?").run(rowKey);
+      db?.prepare("DELETE FROM row_parents WHERE row_key = ?").run(rowKey);
     }
 
-    if (changed) this.maybeSave();
+    if (changed && !db) this.maybeSave();
   }
 
   /**
@@ -542,11 +622,44 @@ export class StateManager {
       skippedAt: Date.now(),
       lastError: entry.lastError,
     });
+    this._poisonKeys.add(`${entry.kind}:${entry.id}:${entry.server_seq}`);
     if (this._state.poisonedEnvelopes.length > POISONED_ENVELOPES_MAX) {
       this._state.poisonedEnvelopes = this._state.poisonedEnvelopes.slice(
         this._state.poisonedEnvelopes.length - POISONED_ENVELOPES_MAX,
       );
+      this.rebuildPoisonKeys();
     }
+    this.maybeSave();
+  }
+
+  isPoisoned(kind: string, id: string, serverSeq: number): boolean {
+    return this._poisonKeys.has(`${kind}:${id}:${serverSeq}`);
+  }
+
+  getKnownTime(rowKey: string): number | undefined {
+    if (this._heavyLoaded || !this._db) return this._state.knownRows[rowKey];
+    const row = this._db.prepare<{ time_updated: number }, [string]>(
+      "SELECT time_updated FROM known_rows WHERE row_key = ?",
+    ).get(rowKey);
+    return row?.time_updated;
+  }
+
+  shouldReconcileDeletions(): boolean {
+    if (Object.keys(this._state.pendingTombstones).length > 0) return true;
+    const known = this.knownRowCount();
+    if (known < 10_000) return true;
+    if (this._lastDeletionReconcileAt === 0) return true;
+    return Date.now() - this._lastDeletionReconcileAt >= DELETION_RECONCILE_INTERVAL_MS;
+  }
+
+  knownRowCount(): number {
+    if (this._heavyLoaded || !this._db) return Object.keys(this._state.knownRows).length;
+    const row = this._db.prepare<{ n: number }, []>("SELECT COUNT(*) AS n FROM known_rows").get();
+    return row?.n ?? 0;
+  }
+
+  markDeletionReconciled(): void {
+    this._lastDeletionReconcileAt = Date.now();
     this.maybeSave();
   }
 
@@ -564,6 +677,170 @@ export class StateManager {
   updateFileSyncTime(): void {
     this._state.lastFileSyncTime = Date.now();
     this.maybeSave();
+  }
+
+  private openDb(): void {
+    if (this._db) return;
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    this._db = new Database(STATE_DB_FILE);
+    this._db.exec("PRAGMA journal_mode = WAL");
+    this._db.exec("PRAGMA synchronous = NORMAL");
+    this._db.exec(STATE_SCHEMA);
+  }
+
+  private sqliteHasMeta(): boolean {
+    if (!this._db) return false;
+    const row = this._db.prepare<{ v: string }, [string]>("SELECT v FROM meta WHERE k = ?").get("lastPulledSeq");
+    return row !== null && row !== undefined;
+  }
+
+  private loadFromSqlite(): void {
+    const db = this._db!;
+    const meta = (k: string): string | undefined =>
+      db.prepare<{ v: string }, [string]>("SELECT v FROM meta WHERE k = ?").get(k)?.v;
+
+    this._state.lastPulledSeq = Number(meta("lastPulledSeq") ?? 0) || 0;
+    this._state.lastRecentPulledSeq = Number(meta("lastRecentPulledSeq") ?? 0) || 0;
+    this._state.lastPushedRowTime = Number(meta("lastPushedRowTime") ?? 0) || 0;
+    this._state.lastFileSyncTime = Number(meta("lastFileSyncTime") ?? 0) || 0;
+    this._lastDeletionReconcileAt = Number(meta("lastDeletionReconcileAt") ?? 0) || 0;
+    const fp = meta("dbFingerprint");
+    this._state.dbFingerprint = fp ? this.parseDbFingerprint(JSON.parse(fp)) : null;
+
+    this._state.lastPushedRowIds = new Set(
+      db.prepare<{ id: string }, []>("SELECT id FROM last_pushed").all().map((row) => row.id),
+    );
+
+    this._state.knownFiles = {};
+    for (const row of db.prepare<{ relpath: string; sha256: string; mtime: number; size: number }, []>(
+      "SELECT relpath, sha256, mtime, size FROM known_files",
+    ).all()) {
+      this._state.knownFiles[row.relpath] = { sha256: row.sha256, mtime: row.mtime, size: row.size };
+    }
+
+    this._state.pendingTombstones = {};
+    for (const row of db.prepare<{ row_key: string; first_seen_at: number; known_time_updated: number }, []>(
+      "SELECT row_key, first_seen_at, known_time_updated FROM pending_tombstones",
+    ).all()) {
+      this._state.pendingTombstones[row.row_key] = {
+        firstSeenAt: row.first_seen_at,
+        knownTimeUpdated: row.known_time_updated,
+      };
+    }
+
+    this._state.pullErrorCounts = {};
+    for (const row of db.prepare<{ envelope_key: string; count: number }, []>(
+      "SELECT envelope_key, count FROM pull_error_counts",
+    ).all()) {
+      this._state.pullErrorCounts[row.envelope_key] = row.count;
+    }
+
+    this._state.poisonedEnvelopes = db.prepare<{
+      kind: string;
+      id: string;
+      server_seq: number;
+      skipped_at: number;
+      last_error: string | null;
+    }, []>("SELECT kind, id, server_seq, skipped_at, last_error FROM poisoned").all().map((row) => ({
+      kind: row.kind as SyncKind,
+      id: row.id,
+      server_seq: row.server_seq,
+      skippedAt: row.skipped_at,
+      ...(row.last_error ? { lastError: row.last_error } : {}),
+    }));
+    this.rebuildPoisonKeys();
+    this._heavyLoaded = false;
+  }
+
+  private writeMeta(): void {
+    const db = this._db!;
+    const upsert = db.prepare("INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v");
+    upsert.run("lastPulledSeq", String(this._state.lastPulledSeq));
+    upsert.run("lastRecentPulledSeq", String(this._state.lastRecentPulledSeq));
+    upsert.run("lastPushedRowTime", String(this._state.lastPushedRowTime));
+    upsert.run("lastFileSyncTime", String(this._state.lastFileSyncTime));
+    upsert.run("lastDeletionReconcileAt", String(this._lastDeletionReconcileAt));
+    upsert.run("dbFingerprint", JSON.stringify(this._state.dbFingerprint));
+  }
+
+  private ensureHeavy(): void {
+    if (this._heavyLoaded) return;
+    this._heavyLoaded = true;
+    if (!this._db) return;
+    for (const row of this._db.prepare<{ row_key: string; time_updated: number }, []>(
+      "SELECT row_key, time_updated FROM known_rows",
+    ).all()) {
+      this._state.knownRows[row.row_key] = row.time_updated;
+    }
+    for (const row of this._db.prepare<{ row_key: string; parent: string }, []>(
+      "SELECT row_key, parent FROM row_parents",
+    ).all()) {
+      this._state.rowParents[row.row_key] = row.parent;
+    }
+  }
+
+  private rebuildPoisonKeys(): void {
+    this._poisonKeys = new Set(
+      this._state.poisonedEnvelopes.map((p) => `${p.kind}:${p.id}:${p.server_seq}`),
+    );
+  }
+
+  private readJsonFile(filePath: string): Partial<SyncStateJson> | null {
+    let raw: string;
+    try {
+      raw = fs.readFileSync(filePath, "utf-8");
+    } catch (err) {
+      logger.error("state.load: failed to read state file", {
+        path: filePath,
+        error: String(err),
+      });
+      throw err;
+    }
+
+    try {
+      return JSON.parse(raw) as Partial<SyncStateJson>;
+    } catch (err) {
+      const backup = `${filePath}.corrupt-${Date.now()}`;
+      try {
+        fs.renameSync(filePath, backup);
+      } catch (backupErr) {
+        logger.error(
+          "state.load: corrupt state.json AND backup failed — resetting to defaults",
+          {
+            path: filePath,
+            parseError: String(err),
+            backupError: String(backupErr),
+          },
+        );
+        return null;
+      }
+      logger.error(
+        "state.load: corrupt state.json — backed up and reset to defaults",
+        {
+          path: filePath,
+          backup,
+          bytes: raw.length,
+          error: String(err),
+        },
+      );
+      return null;
+    }
+  }
+
+  private applyJson(json: Partial<SyncStateJson>): void {
+    this._state.lastPulledSeq = json.lastPulledSeq ?? 0;
+    this._state.lastRecentPulledSeq = json.lastRecentPulledSeq ?? 0;
+    this._state.lastPushedRowIds = new Set(json.lastPushedRowIds ?? []);
+    this._state.lastPushedRowTime = json.lastPushedRowTime ?? 0;
+    this._state.knownRows = this.parseKnownRows(json.knownRows);
+    this._state.knownFiles = this.parseKnownFiles(json.knownFiles);
+    this._state.lastFileSyncTime = json.lastFileSyncTime ?? 0;
+    this._state.dbFingerprint = this.parseDbFingerprint(json.dbFingerprint);
+    this._state.pendingTombstones = this.parsePendingTombstones(json.pendingTombstones);
+    this._state.pullErrorCounts = this.parsePullErrorCounts(json.pullErrorCounts);
+    this._state.poisonedEnvelopes = this.parsePoisonedEnvelopes(json.poisonedEnvelopes);
+    this._state.rowParents = this.parseRowParents(json.rowParents);
+    this.rebuildPoisonKeys();
   }
 
   private parseKnownRows(value: unknown): Record<string, number> {
