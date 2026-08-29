@@ -14,7 +14,15 @@ import type {
   SyncEnvelope,
   SyncKind,
 } from "@opencode-sync/shared";
-import { FEATURE_GZIP_REQUEST } from "@opencode-sync/shared";
+import {
+  FEATURE_GZIP_REQUEST,
+  FEATURE_MSGPACK,
+  FEATURE_PULL_MIN_TIME,
+  MSGPACK_CONTENT_TYPE,
+  decodeMsgpack,
+  encodeMsgpack,
+  isMsgpackContentType,
+} from "@opencode-sync/shared";
 import { sleep } from "./util.js";
 
 // ── Constants ──────────────────────────────────────────────────────
@@ -112,6 +120,8 @@ export class SyncClient {
    * via `setServerFeatures()` after a successful `/health` handshake.
    */
   private compressRequests = false;
+  private pullMinTime = false;
+  private msgpack = false;
 
   constructor(serverUrl: string, token: string) {
     // Normalise — strip trailing slash
@@ -126,6 +136,12 @@ export class SyncClient {
    */
   setServerFeatures(features: string[] | undefined): void {
     this.compressRequests = features?.includes(FEATURE_GZIP_REQUEST) ?? false;
+    this.pullMinTime = features?.includes(FEATURE_PULL_MIN_TIME) ?? false;
+    this.msgpack = features?.includes(FEATURE_MSGPACK) ?? false;
+  }
+
+  supportsPullMinTime(): boolean {
+    return this.pullMinTime;
   }
 
   // ── Public API ──────────────────────────────────────────────────
@@ -139,11 +155,19 @@ export class SyncClient {
     return this.fetchJson<PushResponse>("POST", "/sync/push", body);
   }
 
-  async pull(since: number, exclude?: string, limit?: number): Promise<PullResponse> {
+  async pull(
+    since: number,
+    exclude?: string,
+    limit?: number,
+    minTimeUpdated?: number,
+  ): Promise<PullResponse> {
     const params = new URLSearchParams();
     params.set("since", String(since));
     if (exclude) params.set("exclude", exclude);
     if (limit !== undefined) params.set("limit", String(limit));
+    if (minTimeUpdated !== undefined && this.pullMinTime) {
+      params.set("min_time_updated", String(minTimeUpdated));
+    }
     return this.fetchJson<PullResponse>("GET", `/sync/pull?${params.toString()}`);
   }
 
@@ -224,6 +248,9 @@ export class SyncClient {
     if (contentType) {
       h["Content-Type"] = contentType;
     }
+    if (this.msgpack) {
+      h["Accept"] = `${MSGPACK_CONTENT_TYPE}, application/json`;
+    }
     return h;
   }
 
@@ -238,7 +265,10 @@ export class SyncClient {
     extraHeaders?: Record<string, string>,
   ): Promise<Response> {
     const url = `${this.baseUrl}${urlPath}`;
-    const ct = contentType ?? (body !== undefined && !(body instanceof Uint8Array) ? "application/json" : undefined);
+    const structured = body !== undefined && !(body instanceof Uint8Array);
+    const ct =
+      contentType ??
+      (structured ? (this.msgpack ? MSGPACK_CONTENT_TYPE : "application/json") : undefined);
     const headers = { ...this.headers(ct), ...extraHeaders };
 
     let lastError: Error | null = null;
@@ -254,17 +284,18 @@ export class SyncClient {
         // often already compressed, so re-gzipping wastes CPU. JSON bodies
         // above the threshold are gzipped with a Content-Encoding header the
         // server understands.
-        let outBody: Uint8Array | string | undefined;
+        let outBody: Uint8Array | undefined;
         const encodingHeaders: Record<string, string> = {};
         if (body instanceof Uint8Array) {
           outBody = body;
         } else if (body !== undefined) {
-          const json = JSON.stringify(body);
-          if (this.compressRequests && json.length >= REQUEST_COMPRESS_THRESHOLD_BYTES) {
-            outBody = Bun.gzipSync(json);
+          const packed = this.msgpack ? encodeMsgpack(body) : new TextEncoder().encode(JSON.stringify(body));
+          const payload = new Uint8Array(packed);
+          if (this.compressRequests && payload.byteLength >= REQUEST_COMPRESS_THRESHOLD_BYTES) {
+            outBody = new Uint8Array(Bun.gzipSync(payload));
             encodingHeaders["Content-Encoding"] = "gzip";
           } else {
-            outBody = json;
+            outBody = payload;
           }
         } else {
           outBody = undefined;
@@ -326,6 +357,9 @@ export class SyncClient {
 
   private async fetchJson<T>(method: string, urlPath: string, body?: unknown): Promise<T> {
     const res = await this.request(method, urlPath, body);
+    if (isMsgpackContentType(res.headers.get("content-type"))) {
+      return decodeMsgpack(new Uint8Array(await res.arrayBuffer())) as T;
+    }
     return (await res.json()) as T;
   }
 }
