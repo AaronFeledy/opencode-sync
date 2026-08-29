@@ -5,3 +5,4 @@
 export * from "./types";
 export * from "./protocol";
 export * from "./files";
+export * from "./codec";
