@@ -382,3 +382,61 @@ test("C1: equal time_updated is a skipped no-op (does not touch the row or child
   expect(sessionTitle(dbPath)).toBe("Old Title");
   expect(countRows(dbPath, "message")).toBe(3);
 });
+
+test("applyPage commits child-before-parent envelopes in one transaction", () => {
+  const dbPath = tempDbPath();
+  initSchema(dbPath);
+  const writer = new DbWriter(dbPath);
+
+  const session: SyncEnvelope = {
+    kind: "session",
+    id: "ses_new",
+    machine_id: "peer",
+    server_seq: 2,
+    time_updated: 400,
+    deleted: false,
+    data: {
+      id: "ses_new",
+      project_id: "proj_1",
+      parent_id: null,
+      slug: "new",
+      directory: "/tmp/p",
+      title: "New",
+      version: "1",
+      share_url: null,
+      summary_additions: null,
+      summary_deletions: null,
+      summary_files: null,
+      summary_diffs: null,
+      revert: null,
+      permission: null,
+      time_created: 400,
+      time_updated: 400,
+      time_compacting: null,
+      time_archived: null,
+      workspace_id: null,
+    },
+  };
+  const message: SyncEnvelope = {
+    kind: "message",
+    id: "msg_new",
+    machine_id: "peer",
+    server_seq: 1,
+    time_updated: 400,
+    deleted: false,
+    data: {
+      id: "msg_new",
+      session_id: "ses_new",
+      time_created: 400,
+      time_updated: 400,
+      data: "{}",
+    },
+  };
+
+  const results = writer.applyPage([message, session]);
+  expect(results).toEqual(["applied", "applied"]);
+  writer.close();
+
+  expect(countRows(dbPath, "session")).toBe(2);
+  expect(countRows(dbPath, "message")).toBe(4);
+});
