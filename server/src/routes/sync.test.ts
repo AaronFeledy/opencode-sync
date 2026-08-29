@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { SyncEnvelope } from "@opencode-sync/shared";
+import { decodeMsgpack, encodeMsgpack, MSGPACK_CONTENT_TYPE } from "@opencode-sync/shared";
 import { LedgerDB } from "../db.js";
 import type { Logger } from "../log.js";
 import { handleSyncPush, handleSyncHeads, handleSyncPull } from "./sync.js";
@@ -596,4 +597,91 @@ test("handleSyncPush inflates a gzip-encoded request body", async () => {
   expect(res.status).toBe(200);
   const json = (await res.json()) as { accepted: string[] };
   expect(json.accepted.length).toBe(50);
+});
+
+test("handleSyncPull honours min_time_updated", async () => {
+  const db = new LedgerDB(createDataDir(), silentLogger);
+  await seedRows(db, [
+    {
+      id: "old",
+      kind: "session",
+      machine_id: "m1",
+      time_updated: 100,
+      server_seq: 0,
+      deleted: false,
+      data: { id: "old" },
+    } as SyncEnvelope,
+    {
+      id: "new",
+      kind: "session",
+      machine_id: "m1",
+      time_updated: 5000,
+      server_seq: 0,
+      deleted: false,
+      data: { id: "new" },
+    } as SyncEnvelope,
+  ]);
+
+  const all = handleSyncPull(pullRequest(0, 100), db, silentLogger);
+  const allBody = (await all.json()) as { envelopes: Array<{ id: string }> };
+  expect(allBody.envelopes.map((e) => e.id).sort()).toEqual(["new", "old"]);
+
+  const url = new URL("http://localhost/sync/pull");
+  url.searchParams.set("since", "0");
+  url.searchParams.set("min_time_updated", "1000");
+  const recent = handleSyncPull(new Request(url.toString()), db, silentLogger);
+  const recentBody = (await recent.json()) as { envelopes: Array<{ id: string }> };
+  expect(recentBody.envelopes.map((e) => e.id)).toEqual(["new"]);
+
+  db.close();
+});
+
+test("handleSyncPush accepts a MessagePack body", async () => {
+  const db = new LedgerDB(createDataDir(), silentLogger);
+  const envelopes = [
+    {
+      id: "mp-1",
+      kind: "session" as const,
+      machine_id: "m1",
+      time_updated: 1,
+      server_seq: 0,
+      deleted: false,
+      data: { id: "mp-1" },
+    },
+  ];
+  const req = new Request("http://localhost/sync/push", {
+    method: "POST",
+    headers: { "Content-Type": MSGPACK_CONTENT_TYPE },
+    body: encodeMsgpack({ machine_id: "m1", envelopes }),
+  });
+  const res = await handleSyncPush(req, db, silentLogger);
+  expect(res.status).toBe(200);
+  const json = (await res.json()) as { accepted: string[] };
+  expect(json.accepted).toEqual(["mp-1"]);
+  db.close();
+});
+
+test("handleSyncPull returns MessagePack when requested", async () => {
+  const db = new LedgerDB(createDataDir(), silentLogger);
+  await seedRows(db, [
+    {
+      id: "mp-pull",
+      kind: "session",
+      machine_id: "m1",
+      time_updated: 1,
+      server_seq: 0,
+      deleted: false,
+      data: { id: "mp-pull" },
+    } as SyncEnvelope,
+  ]);
+  const req = new Request("http://localhost/sync/pull?since=0", {
+    headers: { Accept: MSGPACK_CONTENT_TYPE },
+  });
+  const res = handleSyncPull(req, db, silentLogger);
+  expect(res.headers.get("content-type")).toContain("msgpack");
+  const body = decodeMsgpack(new Uint8Array(await res.arrayBuffer())) as {
+    envelopes: Array<{ id: string }>;
+  };
+  expect(body.envelopes.map((e) => e.id)).toEqual(["mp-pull"]);
+  db.close();
 });

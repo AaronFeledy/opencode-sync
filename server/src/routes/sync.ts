@@ -327,7 +327,16 @@ export function handleSyncPull(
     limit = Math.min(limit, 5000);
   }
 
-  const result = db.pullRows(since, exclude, limit);
+  const minTimeRaw = url.searchParams.get("min_time_updated");
+  let minTimeUpdated: number | undefined;
+  if (minTimeRaw !== null && minTimeRaw.length > 0) {
+    minTimeUpdated = Number(minTimeRaw);
+    if (!Number.isFinite(minTimeUpdated) || minTimeUpdated < 0 || !Number.isInteger(minTimeUpdated)) {
+      return Response.json({ error: "min_time_updated must be a non-negative integer" }, { status: 400 });
+    }
+  }
+
+  const result = db.pullRows(since, exclude, limit, minTimeUpdated);
 
   logger.debug("sync pull", {
     since,
