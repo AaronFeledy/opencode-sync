@@ -498,7 +498,10 @@ test("legacy TEXT payloads still pull and migrate to blobs", async () => {
   const before = db2.pullRows(0);
   expect(before.envelopes[0]?.id).toBe("legacy");
   expect((before.envelopes[0]?.data as { title?: string })?.title).toContain("legacy");
-  expect(await db2.migrateLegacyPayloads()).toBe(1);
+  expect(await db2.migrateLegacyPayloads({ minFreeBytes: 0 })).toEqual({
+    migrated: 1,
+    done: true,
+  });
   const after = db2.pullRows(0);
   expect(after.envelopes[0]?.id).toBe("legacy");
   db2.close();
@@ -532,7 +535,10 @@ test("legacy migrate walks more than one batch by rowid", async () => {
   sqlite.close();
 
   const db2 = new LedgerDB(dir, silentLogger);
-  expect(await db2.migrateLegacyPayloads()).toBe(120);
+  expect(await db2.migrateLegacyPayloads({ minFreeBytes: 0 })).toEqual({
+    migrated: 120,
+    done: true,
+  });
   db2.close();
 
   const check = new Database(path.join(dir, "ledger.sqlite"), { readonly: true });
@@ -541,6 +547,81 @@ test("legacy migrate walks more than one batch by rowid", async () => {
   ).get();
   check.close();
   expect(leftover?.n).toBe(0);
+});
+
+test("legacy migrate stops at maxRows and resumes from the cursor", async () => {
+  const dir = createDataDir();
+  const db = new LedgerDB(dir, silentLogger);
+  db.close();
+
+  const sqlite = new Database(path.join(dir, "ledger.sqlite"));
+  const insert = sqlite.prepare(
+    `INSERT INTO sync_row (kind, id, machine_id, time_updated, server_seq, deleted, data, received_at)
+     VALUES ('session', ?, 'm1', 5, ?, 0, ?, 1)`,
+  );
+  sqlite.transaction(() => {
+    for (let i = 0; i < 40; i++) {
+      const id = `chunk_${i}`;
+      insert.run(id, i + 1, JSON.stringify(makeSession(id, 5)));
+    }
+  })();
+  sqlite.run("UPDATE server_state SET v = '41' WHERE k = 'next_seq'");
+  sqlite.close();
+
+  const db2 = new LedgerDB(dir, silentLogger);
+  expect(await db2.migrateLegacyPayloads({ maxRows: 15, minFreeBytes: 0 })).toEqual({
+    migrated: 15,
+    done: false,
+    paused: "max-rows",
+  });
+  expect(await db2.migrateLegacyPayloads({ maxRows: 15, minFreeBytes: 0 })).toEqual({
+    migrated: 15,
+    done: false,
+    paused: "max-rows",
+  });
+  expect(await db2.migrateLegacyPayloads({ maxRows: 15, minFreeBytes: 0 })).toEqual({
+    migrated: 10,
+    done: true,
+  });
+  db2.close();
+});
+
+test("legacy migrate pauses when the disk floor is hit and resumes later", async () => {
+  const dir = createDataDir();
+  const db = new LedgerDB(dir, silentLogger);
+  db.close();
+
+  const sqlite = new Database(path.join(dir, "ledger.sqlite"));
+  sqlite.run(
+    `INSERT INTO sync_row (kind, id, machine_id, time_updated, server_seq, deleted, data, received_at)
+     VALUES ('session', 'disk_1', 'm1', 5, 1, 0, ?, 1)`,
+    [JSON.stringify(makeSession("disk_1", 5))],
+  );
+  sqlite.run(
+    `INSERT INTO sync_row (kind, id, machine_id, time_updated, server_seq, deleted, data, received_at)
+     VALUES ('session', 'disk_2', 'm1', 5, 2, 0, ?, 1)`,
+    [JSON.stringify(makeSession("disk_2", 5))],
+  );
+  sqlite.run("UPDATE server_state SET v = '3' WHERE k = 'next_seq'");
+  sqlite.close();
+
+  let free = 0;
+  const db2 = new LedgerDB(dir, silentLogger);
+  expect(
+    await db2.migrateLegacyPayloads({
+      minFreeBytes: 100,
+      freeBytes: () => free,
+    }),
+  ).toEqual({ migrated: 0, done: false, paused: "disk" });
+
+  free = 1000;
+  expect(
+    await db2.migrateLegacyPayloads({
+      minFreeBytes: 100,
+      freeBytes: () => free,
+    }),
+  ).toEqual({ migrated: 2, done: true });
+  db2.close();
 });
 
 test("dependency closure still attaches parents stored as blobs", () => {
