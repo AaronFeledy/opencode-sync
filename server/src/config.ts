@@ -15,6 +15,9 @@ export interface ServerConfig {
   logLevel: LogLevel;
   /** Server version */
   version: string;
+  migrateChunkRows: number;
+  migrateMinFreeBytes: number;
+  migratePauseMs: number;
 }
 
 const VALID_LOG_LEVELS = new Set(["debug", "info", "warn", "error"]);
@@ -70,5 +73,21 @@ export function loadConfig(): ServerConfig {
     dataDir,
     logLevel,
     version,
+    migrateChunkRows: envNonNegativeInt("OPENCODE_SYNC_MIGRATE_CHUNK_ROWS", 500),
+    migrateMinFreeBytes: envNonNegativeInt(
+      "OPENCODE_SYNC_MIGRATE_MIN_FREE_BYTES",
+      1024 * 1024 * 1024,
+    ),
+    migratePauseMs: envNonNegativeInt("OPENCODE_SYNC_MIGRATE_PAUSE_MS", 1_000),
   });
+}
+
+function envNonNegativeInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) {
+    throw new Error(`Invalid ${name}="${raw}". Must be a non-negative integer.`);
+  }
+  return Math.floor(n);
 }

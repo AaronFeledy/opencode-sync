@@ -152,13 +152,36 @@ logger.info(`opencode-sync server v${config.version} listening`, {
   logLevel: config.logLevel,
 });
 
-void Promise.resolve()
-  .then(() => db.migrateLegacyPayloads())
-  .catch((err: unknown) => {
-    logger.error("legacy payload migration failed", {
-      error: err instanceof Error ? err.message : String(err),
-    });
-  });
+void runLegacyMigrateLoop();
+
+async function runLegacyMigrateLoop(): Promise<void> {
+  const chunkRows = config.migrateChunkRows;
+  const minFreeBytes = config.migrateMinFreeBytes;
+  const pauseMs = config.migratePauseMs;
+  for (;;) {
+    try {
+      const result = await db.migrateLegacyPayloads({
+        maxRows: chunkRows,
+        minFreeBytes,
+      });
+      if (result.done) {
+        logger.info("legacy payload migration complete", result);
+        return;
+      }
+      const waitMs =
+        result.paused === "disk" || result.paused === "enospc"
+          ? Math.max(pauseMs, 120_000)
+          : pauseMs;
+      logger.info("legacy payload migration chunk paused", { ...result, waitMs });
+      await Bun.sleep(waitMs);
+    } catch (err: unknown) {
+      logger.error("legacy payload migration failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      await Bun.sleep(Math.max(pauseMs, 120_000));
+    }
+  }
+}
 
 // ── Graceful shutdown ──────────────────────────────────────────────
 
