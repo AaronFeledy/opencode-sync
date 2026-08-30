@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -410,5 +411,79 @@ test("H5: GC is tolerant of an already-missing blob (idempotent)", () => {
   });
   expect(db.hasBlobFile(v2)).toBe(true);
 
+  db.close();
+});
+
+test("row payloads are stored as compressed blobs, not sqlite TEXT", () => {
+  const dir = createDataDir();
+  const db = new LedgerDB(dir, silentLogger);
+  const env = makeEnvelope("s1", "m1", 10);
+  db.upsertBatch([env]);
+  const pulled = db.pullRows(0);
+  expect(pulled.envelopes[0]?.data).toEqual(env.data);
+  db.close();
+
+  const sqlite = new Database(path.join(dir, "ledger.sqlite"), { readonly: true });
+  const row = sqlite.query<{ data: string | null; data_sha: string | null }, []>(
+    "SELECT data, data_sha FROM sync_row WHERE id = 's1'",
+  ).get();
+  sqlite.close();
+  expect(row?.data).toBeNull();
+  expect(row?.data_sha).toBeTruthy();
+  expect(fs.existsSync(path.join(dir, "row-blobs", row!.data_sha!.slice(0, 2), `${row!.data_sha}.gz`))).toBe(true);
+});
+
+test("legacy TEXT payloads still pull and migrate to blobs", () => {
+  const dir = createDataDir();
+  const db = new LedgerDB(dir, silentLogger);
+  db.close();
+
+  const sqlite = new Database(path.join(dir, "ledger.sqlite"));
+  sqlite.run(
+    `INSERT INTO sync_row (kind, id, machine_id, time_updated, server_seq, deleted, data, received_at)
+     VALUES ('session', 'legacy', 'm1', 5, 1, 0, ?, 1)`,
+    [JSON.stringify(makeSession("legacy", 5))],
+  );
+  sqlite.run("UPDATE server_state SET v = '2' WHERE k = 'next_seq'");
+  sqlite.close();
+
+  const db2 = new LedgerDB(dir, silentLogger);
+  const before = db2.pullRows(0);
+  expect(before.envelopes[0]?.id).toBe("legacy");
+  expect((before.envelopes[0]?.data as { title?: string })?.title).toContain("legacy");
+  expect(db2.migrateLegacyPayloads()).toBe(1);
+  const after = db2.pullRows(0);
+  expect(after.envelopes[0]?.id).toBe("legacy");
+  db2.close();
+
+  const check = new Database(path.join(dir, "ledger.sqlite"), { readonly: true });
+  const row = check.query<{ data: string | null; data_sha: string }, []>(
+    "SELECT data, data_sha FROM sync_row WHERE id = 'legacy'",
+  ).get();
+  check.close();
+  expect(row?.data).toBeNull();
+  expect(row?.data_sha.length).toBe(64);
+});
+
+test("dependency closure still attaches parents stored as blobs", () => {
+  const dir = createDataDir();
+  const db = new LedgerDB(dir, silentLogger);
+  db.upsertBatch([
+    makeProjectEnvelope("proj_1", "m1", 1),
+    {
+      kind: "message",
+      id: "msg_1",
+      machine_id: "m1",
+      time_updated: 3,
+      server_seq: 0,
+      deleted: false,
+      data: { id: "msg_1", session_id: "s1", time_created: 1, time_updated: 3, data: "{}" },
+    },
+    makeEnvelope("s1", "m1", 2),
+  ]);
+  const pulled = db.pullRows(1, undefined, 1);
+  expect(pulled.envelopes.some((e) => e.kind === "message" && e.id === "msg_1")).toBe(true);
+  expect(pulled.envelopes.some((e) => e.kind === "session" && e.id === "s1")).toBe(true);
+  expect(pulled.envelopes.some((e) => e.kind === "project" && e.id === "proj_1")).toBe(true);
   db.close();
 });

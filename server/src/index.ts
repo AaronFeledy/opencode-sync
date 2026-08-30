@@ -152,6 +152,14 @@ logger.info(`opencode-sync server v${config.version} listening`, {
   logLevel: config.logLevel,
 });
 
+void Promise.resolve()
+  .then(() => db.migrateLegacyPayloads())
+  .catch((err: unknown) => {
+    logger.error("legacy payload migration failed", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  });
+
 // ── Graceful shutdown ──────────────────────────────────────────────
 
 function shutdown(signal: string) {
