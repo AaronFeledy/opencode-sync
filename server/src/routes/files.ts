@@ -7,8 +7,8 @@
  * DELETE /files/:path          — mark a file as deleted (tombstone)
  */
 
-import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { existsSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import type { Logger } from "../log.js";
 import type { LedgerDB } from "../db.js";
@@ -147,7 +147,14 @@ export async function handleFilePut(
   if (!existsSync(blobPath)) {
     const blobDir = dirname(blobPath);
     mkdirSync(blobDir, { recursive: true });
-    writeFileSync(blobPath, buffer);
+    const tmp = `${blobPath}.${randomBytes(8).toString("hex")}.tmp`;
+    writeFileSync(tmp, buffer);
+    try {
+      renameSync(tmp, blobPath);
+    } catch (err) {
+      try { unlinkSync(tmp); } catch { /* tmp already gone */ }
+      if (!existsSync(blobPath)) throw err;
+    }
     logger.debug("blob written", { sha256, size: buffer.byteLength });
   }
 
@@ -239,5 +246,5 @@ export function handleFileDelete(
 
   logger.info("file deleted", { relpath, machine_id: machineId, mtime });
 
-  return Response.json(entry);
+  return Response.json(db.getManifestEntry(relpath) ?? entry);
 }

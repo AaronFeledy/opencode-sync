@@ -214,7 +214,8 @@ export class LedgerDB {
       "SELECT COUNT(*) AS n FROM sync_row WHERE data_sha = ?",
     );
     this.stmtClearLegacyData = this.db.prepare(
-      "UPDATE sync_row SET data = NULL, data_sha = ?, parent_kind = ?, parent_id = ? WHERE kind = ? AND id = ?",
+      `UPDATE sync_row SET data = NULL, data_sha = ?, parent_kind = ?, parent_id = ?
+       WHERE kind = ? AND id = ? AND data = ? AND (data_sha IS NULL OR data_sha = '')`,
     );
 
     // Wrap the batch upsert in a SQLite transaction. Provides:
@@ -325,7 +326,16 @@ export class LedgerDB {
       const results = this.txUpsertBatch(envelopes);
       const toGc = this.pendingRowBlobGc;
       this.pendingRowBlobGc = [];
-      for (const sha of toGc) this.gcRowBlob(sha);
+      for (const sha of toGc) {
+        try {
+          this.gcRowBlob(sha);
+        } catch (err) {
+          this.logger.warn("row blob gc failed", {
+            sha256: sha,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
       return results;
     } catch (err) {
       this.pendingRowBlobGc = [];
@@ -590,7 +600,14 @@ export class LedgerDB {
         if (row.data == null) continue;
         const sha = this.rowBlobs.putJson(row.data);
         const parent = payloadParent(row.kind, JSON.parse(row.data));
-        this.stmtClearLegacyData.run(sha, parent?.kind ?? null, parent?.id ?? null, row.kind, row.id);
+        this.stmtClearLegacyData.run(
+          sha,
+          parent?.kind ?? null,
+          parent?.id ?? null,
+          row.kind,
+          row.id,
+          row.data,
+        );
         migrated++;
       }
     }
