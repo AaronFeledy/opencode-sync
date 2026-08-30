@@ -20,3 +20,13 @@ test("putJson is content-addressed and round-trips", () => {
   expect(store.putJson(json)).toBe(sha);
   expect(fs.readdirSync(path.join(dir, sha.slice(0, 2))).length).toBe(1);
 });
+
+test("getJson returns null for a truncated gzip", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "row-blobs-"));
+  dirs.push(dir);
+  const store = new RowBlobStore(dir);
+  const json = JSON.stringify({ a: 1 });
+  const sha = store.putJson(json);
+  fs.writeFileSync(store.pathFor(sha), "not gzip");
+  expect(store.getJson(sha)).toBeNull();
+});

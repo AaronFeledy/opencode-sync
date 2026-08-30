@@ -381,6 +381,53 @@ test("H5: two paths sharing a sha don't orphan each other", () => {
   db.close();
 });
 
+test("H5: tombstone that preserves the previous sha still GCs the blob", () => {
+  const dir = createDataDir();
+  const db = new LedgerDB(dir, silentLogger);
+  const sha = writeBlob(db, "secret token\n");
+  db.upsertManifestEntry({
+    relpath: "auth.json",
+    sha256: sha,
+    size: 13,
+    mtime: 1000,
+    machine_id: "m1",
+    deleted: false,
+  });
+  db.upsertManifestEntry({
+    relpath: "auth.json",
+    sha256: sha,
+    size: 13,
+    mtime: 2000,
+    machine_id: "m1",
+    deleted: true,
+  });
+  expect(db.hasBlobFile(sha)).toBe(false);
+  expect(db.getManifestEntry("auth.json")?.sha256).toBe("");
+  db.close();
+});
+
+test("row blob GC waits until the sqlite transaction commits", () => {
+  const dir = createDataDir();
+  const db = new LedgerDB(dir, silentLogger);
+  const v1 = makeEnvelope("s1", "m1", 10);
+  db.upsertBatch([v1]);
+  const blobRoot = path.join(dir, "row-blobs");
+  const blobPath = fs.readdirSync(blobRoot).flatMap((aa) =>
+    fs.readdirSync(path.join(blobRoot, aa)).map((f) => path.join(blobRoot, aa, f)),
+  ).find((p) => p.endsWith(".gz"));
+  expect(blobPath && fs.existsSync(blobPath)).toBe(true);
+
+  const v2 = makeEnvelope("s1", "m1", 20);
+  v2.data = { ...makeSession("s1", 20), title: "updated" };
+  const boom = makeEnvelope("s2", "m1", 30);
+  (boom as { data: unknown }).data = { id: "s2", boom: 1n };
+
+  expect(() => db.upsertBatch([v2, boom])).toThrow();
+  expect(blobPath && fs.existsSync(blobPath)).toBe(true);
+  expect((db.pullRows(0).envelopes.find((e) => e.id === "s1")?.data as { title?: string })?.title).toBe("session s1");
+  db.close();
+});
+
 test("H5: GC is tolerant of an already-missing blob (idempotent)", () => {
   const dir = createDataDir();
   const db = new LedgerDB(dir, silentLogger);

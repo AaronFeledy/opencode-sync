@@ -109,6 +109,7 @@ export class LedgerDB {
   private stmtClearTombstoneSha;
   private stmtCountRowBlobRefs;
   private stmtClearLegacyData;
+  private pendingRowBlobGc: string[] = [];
 
   // Batch transaction wrapper — see upsertBatch().
   private txUpsertBatch: (
@@ -319,7 +320,17 @@ export class LedgerDB {
   upsertBatch(
     envelopes: SyncEnvelope[],
   ): Array<{ accepted: boolean; stale?: { server_time_updated: number } }> {
-    return this.txUpsertBatch(envelopes);
+    this.pendingRowBlobGc = [];
+    try {
+      const results = this.txUpsertBatch(envelopes);
+      const toGc = this.pendingRowBlobGc;
+      this.pendingRowBlobGc = [];
+      for (const sha of toGc) this.gcRowBlob(sha);
+      return results;
+    } catch (err) {
+      this.pendingRowBlobGc = [];
+      throw err;
+    }
   }
 
   /**
@@ -379,12 +390,12 @@ export class LedgerDB {
         kind,
         id,
       );
-      this.gcRowBlob(oldSha);
+      this.queueRowBlobGc(oldSha);
       return { accepted: true };
     }
 
     if (existing.time_updated > time_updated) {
-      this.gcRowBlob(incomingSha);
+      this.queueRowBlobGc(incomingSha);
       return { accepted: false, stale: { server_time_updated: existing.time_updated } };
     }
 
@@ -410,13 +421,13 @@ export class LedgerDB {
     // primary defense (this server check is a fallback for state-reset peers).
     const existingSha = existing.data_sha ?? (existing.data != null ? sha256Utf8(existing.data) : null);
     if (existing.deleted === incomingDeleted && existingSha === incomingSha) {
-      this.gcRowBlob(incomingSha === existing.data_sha ? null : incomingSha);
+      this.queueRowBlobGc(incomingSha === existing.data_sha ? null : incomingSha);
       return { accepted: true };
     }
 
     if (machine_id >= existing.machine_id) {
       if (machine_id === existing.machine_id) {
-        this.gcRowBlob(incomingSha);
+        this.queueRowBlobGc(incomingSha);
         return { accepted: true };
       }
       const seq = this.allocSeq();
@@ -433,11 +444,11 @@ export class LedgerDB {
         kind,
         id,
       );
-      this.gcRowBlob(oldSha);
+      this.queueRowBlobGc(oldSha);
       return { accepted: true };
     }
 
-    this.gcRowBlob(incomingSha);
+    this.queueRowBlobGc(incomingSha);
     return { accepted: false, stale: { server_time_updated: existing.time_updated } };
   }
 
@@ -547,6 +558,10 @@ export class LedgerDB {
     };
   }
 
+  private queueRowBlobGc(sha256: string | null): void {
+    if (sha256) this.pendingRowBlobGc.push(sha256);
+  }
+
   private gcRowBlob(sha256: string | null): void {
     if (!sha256) return;
     const refs = this.stmtCountRowBlobRefs.get(sha256);
@@ -651,7 +666,8 @@ export class LedgerDB {
       entry.deleted ? 1 : 0,
     );
 
-    if (!prevSha || prevSha === entry.sha256) return;
+    if (!prevSha) return;
+    if (prevSha === entry.sha256 && !entry.deleted) return;
 
     // Is the previous sha still referenced by any live row?
     const refs = this.stmtCountLiveRefsBySha.get(prevSha);
