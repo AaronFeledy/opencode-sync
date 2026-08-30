@@ -215,7 +215,7 @@ export class LedgerDB {
     );
     this.stmtClearLegacyData = this.db.prepare(
       `UPDATE sync_row SET data = NULL, data_sha = ?, parent_kind = ?, parent_id = ?
-       WHERE kind = ? AND id = ? AND data = ? AND (data_sha IS NULL OR data_sha = '')`,
+       WHERE kind = ? AND id = ? AND (data_sha IS NULL OR data_sha = '')`,
     );
 
     // Wrap the batch upsert in a SQLite transaction. Provides:
@@ -589,28 +589,53 @@ export class LedgerDB {
   }
 
   async migrateLegacyPayloads(): Promise<number> {
-    const stmt = this.db.prepare<SyncRow, []>(
-      "SELECT * FROM sync_row WHERE data IS NOT NULL AND (data_sha IS NULL OR data_sha = '') LIMIT 200",
+    // Walk by rowid so each batch is O(batch) instead of a fresh table scan
+    // from the start of a 12G ledger. Re-querying `WHERE data IS NOT NULL`
+    // without a cursor re-reads every already-migrated row on every loop.
+    type LegacyRow = SyncRow & { rowid: number };
+    const stmt = this.db.prepare<LegacyRow, [number]>(
+      `SELECT rowid, * FROM sync_row
+       WHERE rowid > ? AND data IS NOT NULL AND (data_sha IS NULL OR data_sha = '')
+       ORDER BY rowid
+       LIMIT 50`,
     );
-    let migrated = 0;
-    for (;;) {
-      const rows = stmt.all();
-      if (rows.length === 0) break;
+    const applyBatch = this.db.transaction((rows: LegacyRow[]) => {
+      let n = 0;
       for (const row of rows) {
         if (row.data == null) continue;
         const sha = this.rowBlobs.putJson(row.data);
-        const parent = payloadParent(row.kind, JSON.parse(row.data));
+        let parent: { kind: SyncKind; id: string } | null = null;
+        try {
+          parent = payloadParent(row.kind, JSON.parse(row.data));
+        } catch {
+          parent = null;
+        }
         this.stmtClearLegacyData.run(
           sha,
           parent?.kind ?? null,
           parent?.id ?? null,
           row.kind,
           row.id,
-          row.data,
         );
-        migrated++;
+        n++;
       }
-      await Bun.sleep(0);
+      return n;
+    });
+
+    let migrated = 0;
+    let afterRowid = 0;
+    for (;;) {
+      const rows = stmt.all(afterRowid);
+      if (rows.length === 0) break;
+      afterRowid = rows[rows.length - 1]!.rowid;
+      const prev = migrated;
+      migrated += applyBatch(rows);
+      if (Math.floor(migrated / 5000) !== Math.floor(prev / 5000)) {
+        this.logger.info("migrating legacy row payloads", { migrated });
+      }
+      // Real delay so /health and pull/push can run; sleep(0) was not enough
+      // while gzipping 50 large part payloads.
+      await Bun.sleep(25);
     }
     if (migrated > 0) {
       this.logger.info("migrated legacy row payloads to compressed blobs", { migrated });

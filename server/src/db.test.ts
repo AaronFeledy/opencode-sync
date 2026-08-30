@@ -512,6 +512,37 @@ test("legacy TEXT payloads still pull and migrate to blobs", async () => {
   expect(row?.data_sha.length).toBe(64);
 });
 
+test("legacy migrate walks more than one batch by rowid", async () => {
+  const dir = createDataDir();
+  const db = new LedgerDB(dir, silentLogger);
+  db.close();
+
+  const sqlite = new Database(path.join(dir, "ledger.sqlite"));
+  const insert = sqlite.prepare(
+    `INSERT INTO sync_row (kind, id, machine_id, time_updated, server_seq, deleted, data, received_at)
+     VALUES ('session', ?, 'm1', 5, ?, 0, ?, 1)`,
+  );
+  sqlite.transaction(() => {
+    for (let i = 0; i < 120; i++) {
+      const id = `legacy_${i}`;
+      insert.run(id, i + 1, JSON.stringify(makeSession(id, 5)));
+    }
+  })();
+  sqlite.run("UPDATE server_state SET v = '121' WHERE k = 'next_seq'");
+  sqlite.close();
+
+  const db2 = new LedgerDB(dir, silentLogger);
+  expect(await db2.migrateLegacyPayloads()).toBe(120);
+  db2.close();
+
+  const check = new Database(path.join(dir, "ledger.sqlite"), { readonly: true });
+  const leftover = check.query<{ n: number }, []>(
+    "SELECT COUNT(*) AS n FROM sync_row WHERE data IS NOT NULL",
+  ).get();
+  check.close();
+  expect(leftover?.n).toBe(0);
+});
+
 test("dependency closure still attaches parents stored as blobs", () => {
   const dir = createDataDir();
   const db = new LedgerDB(dir, silentLogger);
