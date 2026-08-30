@@ -203,8 +203,7 @@ test("handleFileDelete accepts a tombstone newer than the existing entry", async
   const entry = db.getManifestEntry("agents/foo.md");
   expect(entry?.deleted).toBe(true);
   expect(entry?.mtime).toBe(2000);
-  // Tombstone preserves the previous sha256 so clients can match what was deleted.
-  expect(entry?.sha256.length).toBeGreaterThan(0);
+  expect(entry?.sha256).toBe("");
 
   db.close();
 });

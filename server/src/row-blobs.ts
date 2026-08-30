@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 export function sha256Utf8(text: string): string {
@@ -18,9 +18,15 @@ export class RowBlobStore {
   putJson(json: string): string {
     const sha256 = sha256Utf8(json);
     const dest = this.pathFor(sha256);
-    if (!existsSync(dest)) {
-      mkdirSync(dirname(dest), { recursive: true });
-      writeFileSync(dest, Bun.gzipSync(Buffer.from(json)));
+    if (existsSync(dest)) return sha256;
+    mkdirSync(dirname(dest), { recursive: true });
+    const tmp = `${dest}.${randomBytes(8).toString("hex")}.tmp`;
+    writeFileSync(tmp, Bun.gzipSync(Buffer.from(json)));
+    try {
+      renameSync(tmp, dest);
+    } catch (err) {
+      try { unlinkSync(tmp); } catch { /* tmp already gone */ }
+      if (!existsSync(dest)) throw err;
     }
     return sha256;
   }
@@ -28,7 +34,11 @@ export class RowBlobStore {
   getJson(sha256: string): string | null {
     const dest = this.pathFor(sha256);
     if (!existsSync(dest)) return null;
-    return Buffer.from(Bun.gunzipSync(readFileSync(dest))).toString("utf8");
+    try {
+      return Buffer.from(Bun.gunzipSync(readFileSync(dest))).toString("utf8");
+    } catch {
+      return null;
+    }
   }
 
   unlink(sha256: string): void {

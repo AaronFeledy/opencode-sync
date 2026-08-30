@@ -109,6 +109,7 @@ export class LedgerDB {
   private stmtClearTombstoneSha;
   private stmtCountRowBlobRefs;
   private stmtClearLegacyData;
+  private pendingRowBlobGc: string[] = [];
 
   // Batch transaction wrapper — see upsertBatch().
   private txUpsertBatch: (
@@ -213,7 +214,8 @@ export class LedgerDB {
       "SELECT COUNT(*) AS n FROM sync_row WHERE data_sha = ?",
     );
     this.stmtClearLegacyData = this.db.prepare(
-      "UPDATE sync_row SET data = NULL, data_sha = ?, parent_kind = ?, parent_id = ? WHERE kind = ? AND id = ?",
+      `UPDATE sync_row SET data = NULL, data_sha = ?, parent_kind = ?, parent_id = ?
+       WHERE kind = ? AND id = ? AND data = ? AND (data_sha IS NULL OR data_sha = '')`,
     );
 
     // Wrap the batch upsert in a SQLite transaction. Provides:
@@ -319,7 +321,26 @@ export class LedgerDB {
   upsertBatch(
     envelopes: SyncEnvelope[],
   ): Array<{ accepted: boolean; stale?: { server_time_updated: number } }> {
-    return this.txUpsertBatch(envelopes);
+    this.pendingRowBlobGc = [];
+    try {
+      const results = this.txUpsertBatch(envelopes);
+      const toGc = this.pendingRowBlobGc;
+      this.pendingRowBlobGc = [];
+      for (const sha of toGc) {
+        try {
+          this.gcRowBlob(sha);
+        } catch (err) {
+          this.logger.warn("row blob gc failed", {
+            sha256: sha,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      return results;
+    } catch (err) {
+      this.pendingRowBlobGc = [];
+      throw err;
+    }
   }
 
   /**
@@ -379,12 +400,12 @@ export class LedgerDB {
         kind,
         id,
       );
-      this.gcRowBlob(oldSha);
+      this.queueRowBlobGc(oldSha);
       return { accepted: true };
     }
 
     if (existing.time_updated > time_updated) {
-      this.gcRowBlob(incomingSha);
+      this.queueRowBlobGc(incomingSha);
       return { accepted: false, stale: { server_time_updated: existing.time_updated } };
     }
 
@@ -410,13 +431,13 @@ export class LedgerDB {
     // primary defense (this server check is a fallback for state-reset peers).
     const existingSha = existing.data_sha ?? (existing.data != null ? sha256Utf8(existing.data) : null);
     if (existing.deleted === incomingDeleted && existingSha === incomingSha) {
-      this.gcRowBlob(incomingSha === existing.data_sha ? null : incomingSha);
+      this.queueRowBlobGc(incomingSha === existing.data_sha ? null : incomingSha);
       return { accepted: true };
     }
 
     if (machine_id >= existing.machine_id) {
       if (machine_id === existing.machine_id) {
-        this.gcRowBlob(incomingSha);
+        this.queueRowBlobGc(incomingSha);
         return { accepted: true };
       }
       const seq = this.allocSeq();
@@ -433,11 +454,11 @@ export class LedgerDB {
         kind,
         id,
       );
-      this.gcRowBlob(oldSha);
+      this.queueRowBlobGc(oldSha);
       return { accepted: true };
     }
 
-    this.gcRowBlob(incomingSha);
+    this.queueRowBlobGc(incomingSha);
     return { accepted: false, stale: { server_time_updated: existing.time_updated } };
   }
 
@@ -547,6 +568,10 @@ export class LedgerDB {
     };
   }
 
+  private queueRowBlobGc(sha256: string | null): void {
+    if (sha256) this.pendingRowBlobGc.push(sha256);
+  }
+
   private gcRowBlob(sha256: string | null): void {
     if (!sha256) return;
     const refs = this.stmtCountRowBlobRefs.get(sha256);
@@ -575,7 +600,14 @@ export class LedgerDB {
         if (row.data == null) continue;
         const sha = this.rowBlobs.putJson(row.data);
         const parent = payloadParent(row.kind, JSON.parse(row.data));
-        this.stmtClearLegacyData.run(sha, parent?.kind ?? null, parent?.id ?? null, row.kind, row.id);
+        this.stmtClearLegacyData.run(
+          sha,
+          parent?.kind ?? null,
+          parent?.id ?? null,
+          row.kind,
+          row.id,
+          row.data,
+        );
         migrated++;
       }
     }
@@ -651,7 +683,8 @@ export class LedgerDB {
       entry.deleted ? 1 : 0,
     );
 
-    if (!prevSha || prevSha === entry.sha256) return;
+    if (!prevSha) return;
+    if (prevSha === entry.sha256 && !entry.deleted) return;
 
     // Is the previous sha still referenced by any live row?
     const refs = this.stmtCountLiveRefsBySha.get(prevSha);
