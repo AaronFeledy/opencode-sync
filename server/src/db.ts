@@ -599,8 +599,12 @@ export class LedgerDB {
        ORDER BY rowid
        LIMIT 50`,
     );
-    const applyBatch = this.db.transaction((rows: LegacyRow[]) => {
-      let n = 0;
+    let migrated = 0;
+    let afterRowid = 0;
+    for (;;) {
+      const rows = stmt.all(afterRowid);
+      if (rows.length === 0) break;
+      afterRowid = rows[rows.length - 1]!.rowid;
       for (const row of rows) {
         if (row.data == null) continue;
         const sha = this.rowBlobs.putJson(row.data);
@@ -617,25 +621,12 @@ export class LedgerDB {
           row.kind,
           row.id,
         );
-        n++;
+        migrated++;
+        if (migrated % 5000 === 0) {
+          this.logger.info("migrating legacy row payloads", { migrated });
+        }
+        await Bun.sleep(0);
       }
-      return n;
-    });
-
-    let migrated = 0;
-    let afterRowid = 0;
-    for (;;) {
-      const rows = stmt.all(afterRowid);
-      if (rows.length === 0) break;
-      afterRowid = rows[rows.length - 1]!.rowid;
-      const prev = migrated;
-      migrated += applyBatch(rows);
-      if (Math.floor(migrated / 5000) !== Math.floor(prev / 5000)) {
-        this.logger.info("migrating legacy row payloads", { migrated });
-      }
-      // Real delay so /health and pull/push can run; sleep(0) was not enough
-      // while gzipping 50 large part payloads.
-      await Bun.sleep(25);
     }
     if (migrated > 0) {
       this.logger.info("migrated legacy row payloads to compressed blobs", { migrated });
