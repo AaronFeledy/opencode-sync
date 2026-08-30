@@ -15,6 +15,9 @@ HTTP ledger server that coordinates session and config file sync across machines
 | `OPENCODE_SYNC_LISTEN` | no | `0.0.0.0:4455` | `host:port` to bind. Use your ZeroTier IP to avoid exposing on public interfaces. |
 | `OPENCODE_SYNC_DATA_DIR` | no | `./data` | Directory for the ledger SQLite DB and content-addressed file blobs. |
 | `OPENCODE_SYNC_LOG_LEVEL` | no | `info` | Minimum log level: `debug`, `info`, `warn`, `error`. |
+| `OPENCODE_SYNC_MIGRATE_CHUNK_ROWS` | no | `500` | Legacy TEXT→blob migrate rows per chunk, then pause so HTTP can answer. |
+| `OPENCODE_SYNC_MIGRATE_MIN_FREE_BYTES` | no | `1073741824` (1 GiB) | Stop a migrate chunk when the data dir has less free space than this. `0` disables. |
+| `OPENCODE_SYNC_MIGRATE_PAUSE_MS` | no | `1000` | Sleep between successful migrate chunks. Disk/ENOSPC pauses wait at least 120s. |
 
 ## Development
 

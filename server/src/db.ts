@@ -3,7 +3,7 @@
  */
 
 import { Database } from "bun:sqlite";
-import { mkdirSync, existsSync, unlinkSync } from "node:fs";
+import { mkdirSync, existsSync, unlinkSync, statfsSync } from "node:fs";
 import { join } from "node:path";
 import type { SyncEnvelope, SyncKind, FileManifestEntry } from "@opencode-sync/shared";
 import type { Logger } from "./log.js";
@@ -85,8 +85,43 @@ function payloadParent(kind: string, data: unknown): { kind: SyncKind; id: strin
   }
 }
 
+export type LegacyMigratePause = "disk" | "max-rows" | "enospc";
+
+export type LegacyMigrateResult = {
+  migrated: number;
+  done: boolean;
+  paused?: LegacyMigratePause;
+};
+
+export type LegacyMigrateOptions = {
+  /** Stop after this many successful conversions. Default: no limit. */
+  maxRows?: number;
+  /** Pause when data-dir free space is below this. Default 1 GiB. 0 disables. */
+  minFreeBytes?: number;
+  /** Override free-space probe (tests). */
+  freeBytes?: () => number;
+  /** SELECT page size. Default 50. */
+  batchSize?: number;
+};
+
+const LEGACY_MIGRATE_CURSOR_KEY = "legacy_migrate_rowid";
+const DEFAULT_MIN_FREE_BYTES = 1024 * 1024 * 1024;
+
+function isNoSpaceError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as { code?: unknown; message?: unknown };
+  if (e.code === "ENOSPC") return true;
+  return typeof e.message === "string" && /ENOSPC|no space left/i.test(e.message);
+}
+
+function freeBytesAt(dir: string): number {
+  const s = statfsSync(dir);
+  return Number(s.bavail) * Number(s.bsize);
+}
+
 export class LedgerDB {
   private db: Database;
+  private dataDir: string;
   private blobDir: string;
   private logger: Logger;
   private rowBlobs: RowBlobStore;
@@ -109,6 +144,8 @@ export class LedgerDB {
   private stmtClearTombstoneSha;
   private stmtCountRowBlobRefs;
   private stmtClearLegacyData;
+  private stmtGetState;
+  private stmtSetState;
   private pendingRowBlobGc: string[] = [];
 
   // Batch transaction wrapper — see upsertBatch().
@@ -119,8 +156,8 @@ export class LedgerDB {
   constructor(dataDir: string, logger: Logger) {
     this.logger = logger;
 
-    // Ensure directories exist
     mkdirSync(dataDir, { recursive: true });
+    this.dataDir = dataDir;
     this.blobDir = join(dataDir, "blobs");
     mkdirSync(this.blobDir, { recursive: true });
 
@@ -216,6 +253,13 @@ export class LedgerDB {
     this.stmtClearLegacyData = this.db.prepare(
       `UPDATE sync_row SET data = NULL, data_sha = ?, parent_kind = ?, parent_id = ?
        WHERE kind = ? AND id = ? AND (data_sha IS NULL OR data_sha = '')`,
+    );
+    this.stmtGetState = this.db.prepare<{ v: string }, [string]>(
+      "SELECT v FROM server_state WHERE k = ?",
+    );
+    this.stmtSetState = this.db.prepare(
+      `INSERT INTO server_state (k, v) VALUES (?, ?)
+       ON CONFLICT(k) DO UPDATE SET v = excluded.v`,
     );
 
     // Wrap the batch upsert in a SQLite transaction. Provides:
@@ -588,50 +632,102 @@ export class LedgerDB {
     if (!cols.has("parent_id")) this.db.exec("ALTER TABLE sync_row ADD COLUMN parent_id TEXT");
   }
 
-  async migrateLegacyPayloads(): Promise<number> {
-    // Walk by rowid so each batch is O(batch) instead of a fresh table scan
-    // from the start of a 12G ledger. Re-querying `WHERE data IS NOT NULL`
-    // without a cursor re-reads every already-migrated row on every loop.
+  async migrateLegacyPayloads(opts: LegacyMigrateOptions = {}): Promise<LegacyMigrateResult> {
     type LegacyRow = SyncRow & { rowid: number };
-    const stmt = this.db.prepare<LegacyRow, [number]>(
+    const batchSize = opts.batchSize && opts.batchSize > 0 ? opts.batchSize : 50;
+    const maxRows = opts.maxRows && opts.maxRows > 0 ? opts.maxRows : Number.POSITIVE_INFINITY;
+    const minFreeBytes = opts.minFreeBytes ?? DEFAULT_MIN_FREE_BYTES;
+    const freeBytes = opts.freeBytes ?? (() => freeBytesAt(this.dataDir));
+    const stmt = this.db.prepare<LegacyRow, [number, number]>(
       `SELECT rowid, * FROM sync_row
        WHERE rowid > ? AND data IS NOT NULL AND (data_sha IS NULL OR data_sha = '')
        ORDER BY rowid
-       LIMIT 50`,
+       LIMIT ?`,
     );
     let migrated = 0;
-    let afterRowid = 0;
+    let afterRowid = this.readMigrateCursor();
+    const persistCursor = (): void => {
+      this.stmtSetState.run(LEGACY_MIGRATE_CURSOR_KEY, String(afterRowid));
+    };
+
     for (;;) {
-      const rows = stmt.all(afterRowid);
-      if (rows.length === 0) break;
-      afterRowid = rows[rows.length - 1]!.rowid;
+      if (minFreeBytes > 0 && freeBytes() < minFreeBytes) {
+        persistCursor();
+        this.logger.warn("legacy payload migration paused: low disk", {
+          migrated,
+          minFreeBytes,
+          afterRowid,
+        });
+        return { migrated, done: false, paused: "disk" };
+      }
+      const rows = stmt.all(afterRowid, batchSize);
+      if (rows.length === 0) {
+        this.stmtSetState.run(LEGACY_MIGRATE_CURSOR_KEY, "0");
+        if (migrated > 0) {
+          this.logger.info("migrated legacy row payloads to compressed blobs", { migrated });
+        }
+        return { migrated, done: true };
+      }
       for (const row of rows) {
         if (row.data == null) continue;
-        const sha = this.rowBlobs.putJson(row.data);
-        let parent: { kind: SyncKind; id: string } | null = null;
-        try {
-          parent = payloadParent(row.kind, JSON.parse(row.data));
-        } catch {
-          parent = null;
+        if (minFreeBytes > 0 && freeBytes() < minFreeBytes) {
+          persistCursor();
+          this.logger.warn("legacy payload migration paused: low disk", {
+            migrated,
+            minFreeBytes,
+            afterRowid,
+          });
+          return { migrated, done: false, paused: "disk" };
         }
-        this.stmtClearLegacyData.run(
-          sha,
-          parent?.kind ?? null,
-          parent?.id ?? null,
-          row.kind,
-          row.id,
-        );
+        try {
+          const sha = this.rowBlobs.putJson(row.data);
+          let parent: { kind: SyncKind; id: string } | null = null;
+          try {
+            parent = payloadParent(row.kind, JSON.parse(row.data));
+          } catch {
+            parent = null;
+          }
+          this.stmtClearLegacyData.run(
+            sha,
+            parent?.kind ?? null,
+            parent?.id ?? null,
+            row.kind,
+            row.id,
+          );
+        } catch (err) {
+          persistCursor();
+          if (isNoSpaceError(err)) {
+            this.logger.warn("legacy payload migration paused: ENOSPC", {
+              migrated,
+              afterRowid,
+              error: err instanceof Error ? err.message : String(err),
+            });
+            return { migrated, done: false, paused: "enospc" };
+          }
+          throw err;
+        }
+        afterRowid = row.rowid;
         migrated++;
         if (migrated % 5000 === 0) {
-          this.logger.info("migrating legacy row payloads", { migrated });
+          persistCursor();
+          this.logger.info("migrating legacy row payloads", { migrated, afterRowid });
+        }
+        if (migrated >= maxRows) {
+          persistCursor();
+          this.logger.info("legacy payload migration chunk complete", { migrated, afterRowid });
+          return { migrated, done: false, paused: "max-rows" };
         }
         await Bun.sleep(0);
       }
+      persistCursor();
     }
-    if (migrated > 0) {
-      this.logger.info("migrated legacy row payloads to compressed blobs", { migrated });
-    }
-    return migrated;
+  }
+
+  private readMigrateCursor(): number {
+    const row = this.stmtGetState.get(LEGACY_MIGRATE_CURSOR_KEY);
+    if (!row) return 0;
+    const n = Number.parseInt(row.v, 10);
+    return Number.isFinite(n) && n > 0 ? n : 0;
   }
 
   /**
