@@ -7,6 +7,21 @@ import { mkdirSync, existsSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import type { SyncEnvelope, SyncKind, FileManifestEntry } from "@opencode-sync/shared";
 import type { Logger } from "./log.js";
+import { RowBlobStore, sha256Utf8 } from "./row-blobs.js";
+
+type SyncRow = {
+  kind: string;
+  id: string;
+  machine_id: string;
+  time_updated: number;
+  server_seq: number;
+  deleted: number;
+  data: string | null;
+  received_at: number;
+  data_sha: string | null;
+  parent_kind: string | null;
+  parent_id: string | null;
+};
 
 // ── Schema migrations ──────────────────────────────────────────────
 
@@ -46,10 +61,35 @@ const MIGRATIONS = [
 
 // ── LedgerDB class ─────────────────────────────────────────────────
 
+function payloadParent(kind: string, data: unknown): { kind: SyncKind; id: string } | null {
+  if (!data || typeof data !== "object") return null;
+  const rec = data as Record<string, unknown>;
+  const idOf = (k: SyncKind, field: string): { kind: SyncKind; id: string } | null => {
+    const id = rec[field];
+    return typeof id === "string" && id.length > 0 ? { kind: k, id } : null;
+  };
+  switch (kind) {
+    case "session":
+      return idOf("project", "project_id");
+    case "message":
+      return idOf("session", "session_id");
+    case "part":
+      return idOf("message", "message_id");
+    case "todo":
+    case "session_share":
+      return idOf("session", "session_id");
+    case "permission":
+      return idOf("project", "project_id");
+    default:
+      return null;
+  }
+}
+
 export class LedgerDB {
   private db: Database;
   private blobDir: string;
   private logger: Logger;
+  private rowBlobs: RowBlobStore;
 
   // Prepared statements
   private stmtGetNextSeq;
@@ -67,6 +107,8 @@ export class LedgerDB {
   private stmtUpsertManifest;
   private stmtCountLiveRefsBySha;
   private stmtClearTombstoneSha;
+  private stmtCountRowBlobRefs;
+  private stmtClearLegacyData;
 
   // Batch transaction wrapper — see upsertBatch().
   private txUpsertBatch: (
@@ -84,6 +126,7 @@ export class LedgerDB {
     // Open database
     const dbPath = join(dataDir, "ledger.sqlite");
     this.db = new Database(dbPath);
+    this.rowBlobs = new RowBlobStore(join(dataDir, "row-blobs"));
 
     // Enable WAL mode for concurrent reads
     this.db.exec("PRAGMA journal_mode = WAL");
@@ -94,6 +137,7 @@ export class LedgerDB {
     for (const sql of MIGRATIONS) {
       this.db.exec(sql);
     }
+    this.ensurePayloadColumns();
     logger.info("Database initialized", { path: dbPath });
 
     // Prepare statements
@@ -105,51 +149,37 @@ export class LedgerDB {
       "UPDATE server_state SET v = ? WHERE k = 'next_seq'",
     );
 
-    this.stmtGetRow = this.db.prepare<
-      { kind: string; id: string; machine_id: string; time_updated: number; server_seq: number; deleted: number; data: string | null; received_at: number },
-      [string, string]
-    >("SELECT * FROM sync_row WHERE kind = ? AND id = ?");
+    this.stmtGetRow = this.db.prepare<SyncRow, [string, string]>(
+      "SELECT * FROM sync_row WHERE kind = ? AND id = ?",
+    );
 
-    this.stmtGetRowExclude = this.db.prepare<
-      { kind: string; id: string; machine_id: string; time_updated: number; server_seq: number; deleted: number; data: string | null; received_at: number },
-      [string, string, string]
-    >("SELECT * FROM sync_row WHERE kind = ? AND id = ? AND machine_id != ?");
+    this.stmtGetRowExclude = this.db.prepare<SyncRow, [string, string, string]>(
+      "SELECT * FROM sync_row WHERE kind = ? AND id = ? AND machine_id != ?",
+    );
 
     this.stmtInsertRow = this.db.prepare(
-      `INSERT INTO sync_row (kind, id, machine_id, time_updated, server_seq, deleted, data, received_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO sync_row (kind, id, machine_id, time_updated, server_seq, deleted, data, received_at, data_sha, parent_kind, parent_id)
+       VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)`,
     );
 
     this.stmtUpdateRow = this.db.prepare(
-      `UPDATE sync_row SET machine_id = ?, time_updated = ?, server_seq = ?, deleted = ?, data = ?, received_at = ?
+      `UPDATE sync_row SET machine_id = ?, time_updated = ?, server_seq = ?, deleted = ?, data = NULL, received_at = ?, data_sha = ?, parent_kind = ?, parent_id = ?
        WHERE kind = ? AND id = ?`,
     );
 
-    this.stmtPullRows = this.db.prepare<
-      { kind: string; id: string; machine_id: string; time_updated: number; server_seq: number; deleted: number; data: string | null; received_at: number },
-      [number, number]
-    >(
+    this.stmtPullRows = this.db.prepare<SyncRow, [number, number]>(
       `SELECT * FROM sync_row WHERE server_seq > ? ORDER BY server_seq ASC LIMIT ?`,
     );
 
-    this.stmtPullRowsExclude = this.db.prepare<
-      { kind: string; id: string; machine_id: string; time_updated: number; server_seq: number; deleted: number; data: string | null; received_at: number },
-      [number, string, number]
-    >(
+    this.stmtPullRowsExclude = this.db.prepare<SyncRow, [number, string, number]>(
       `SELECT * FROM sync_row WHERE server_seq > ? AND machine_id != ? ORDER BY server_seq ASC LIMIT ?`,
     );
 
-    this.stmtPullRowsMinTime = this.db.prepare<
-      { kind: string; id: string; machine_id: string; time_updated: number; server_seq: number; deleted: number; data: string | null; received_at: number },
-      [number, number, number]
-    >(
+    this.stmtPullRowsMinTime = this.db.prepare<SyncRow, [number, number, number]>(
       `SELECT * FROM sync_row WHERE server_seq > ? AND time_updated >= ? ORDER BY server_seq ASC LIMIT ?`,
     );
 
-    this.stmtPullRowsMinTimeExclude = this.db.prepare<
-      { kind: string; id: string; machine_id: string; time_updated: number; server_seq: number; deleted: number; data: string | null; received_at: number },
-      [number, string, number, number]
-    >(
+    this.stmtPullRowsMinTimeExclude = this.db.prepare<SyncRow, [number, string, number, number]>(
       `SELECT * FROM sync_row WHERE server_seq > ? AND machine_id != ? AND time_updated >= ? ORDER BY server_seq ASC LIMIT ?`,
     );
 
@@ -177,6 +207,13 @@ export class LedgerDB {
     );
     this.stmtClearTombstoneSha = this.db.prepare(
       "UPDATE file_manifest SET sha256 = '', size = 0 WHERE deleted = 1 AND sha256 = ?",
+    );
+
+    this.stmtCountRowBlobRefs = this.db.prepare<{ n: number }, [string]>(
+      "SELECT COUNT(*) AS n FROM sync_row WHERE data_sha = ?",
+    );
+    this.stmtClearLegacyData = this.db.prepare(
+      "UPDATE sync_row SET data = NULL, data_sha = ?, parent_kind = ?, parent_id = ? WHERE kind = ? AND id = ?",
     );
 
     // Wrap the batch upsert in a SQLite transaction. Provides:
@@ -304,12 +341,13 @@ export class LedgerDB {
     const { kind, id, machine_id, time_updated, deleted, data } = envelope;
     const now = Date.now();
     const incomingDeleted = deleted ? 1 : 0;
-    const incomingData = data != null ? JSON.stringify(data) : null;
+    const incomingJson = data != null ? JSON.stringify(data) : null;
+    const incomingSha = incomingJson != null ? this.rowBlobs.putJson(incomingJson) : null;
+    const parent = payloadParent(kind, data);
 
     const existing = this.stmtGetRow.get(kind, id);
 
     if (!existing) {
-      // Case 1: No existing row — insert
       const seq = this.allocSeq();
       this.stmtInsertRow.run(
         kind,
@@ -318,30 +356,35 @@ export class LedgerDB {
         time_updated,
         seq,
         incomingDeleted,
-        incomingData,
         now,
+        incomingSha,
+        parent?.kind ?? null,
+        parent?.id ?? null,
       );
       return { accepted: true };
     }
 
     if (existing.time_updated < time_updated) {
-      // Case 2: Incoming is newer — update
       const seq = this.allocSeq();
+      const oldSha = existing.data_sha;
       this.stmtUpdateRow.run(
         machine_id,
         time_updated,
         seq,
         incomingDeleted,
-        incomingData,
         now,
+        incomingSha,
+        parent?.kind ?? null,
+        parent?.id ?? null,
         kind,
         id,
       );
+      this.gcRowBlob(oldSha);
       return { accepted: true };
     }
 
     if (existing.time_updated > time_updated) {
-      // Case 3: Server has newer — reject
+      this.gcRowBlob(incomingSha);
       return { accepted: false, stale: { server_time_updated: existing.time_updated } };
     }
 
@@ -365,32 +408,36 @@ export class LedgerDB {
     // whose entire purpose is to *save* server work, so we accept the
     // assumption and rely on the plugin-side `lastPushedRowIds` dedup as the
     // primary defense (this server check is a fallback for state-reset peers).
-    if (existing.deleted === incomingDeleted && existing.data === incomingData) {
+    const existingSha = existing.data_sha ?? (existing.data != null ? sha256Utf8(existing.data) : null);
+    if (existing.deleted === incomingDeleted && existingSha === incomingSha) {
+      this.gcRowBlob(incomingSha === existing.data_sha ? null : incomingSha);
       return { accepted: true };
     }
 
-    // Different content at the same timestamp — tie-break by machine_id.
     if (machine_id >= existing.machine_id) {
-      // Incoming wins or is same (idempotent)
       if (machine_id === existing.machine_id) {
-        // Truly idempotent — same machine, same timestamp, no-op
+        this.gcRowBlob(incomingSha);
         return { accepted: true };
       }
       const seq = this.allocSeq();
+      const oldSha = existing.data_sha;
       this.stmtUpdateRow.run(
         machine_id,
         time_updated,
         seq,
         incomingDeleted,
-        incomingData,
         now,
+        incomingSha,
+        parent?.kind ?? null,
+        parent?.id ?? null,
         kind,
         id,
       );
+      this.gcRowBlob(oldSha);
       return { accepted: true };
     }
 
-    // Existing machine_id wins tie-break
+    this.gcRowBlob(incomingSha);
     return { accepted: false, stale: { server_time_updated: existing.time_updated } };
   }
 
@@ -408,16 +455,7 @@ export class LedgerDB {
     // Fetch limit+1 to detect whether there are more
     const fetchLimit = limit + 1;
 
-    let rows: Array<{
-      kind: string;
-      id: string;
-      machine_id: string;
-      time_updated: number;
-      server_seq: number;
-      deleted: number;
-      data: string | null;
-      received_at: number;
-    }>;
+    let rows: SyncRow[];
 
     if (minTimeUpdated !== undefined) {
       rows = exclude
@@ -436,15 +474,7 @@ export class LedgerDB {
     const cursorSeq = rows.length > 0 ? rows[rows.length - 1]!.server_seq : since;
     rows = this.withDependencyClosure(rows, exclude);
 
-    const envelopes: SyncEnvelope[] = rows.map((row) => ({
-      kind: row.kind as SyncEnvelope["kind"],
-      id: row.id,
-      machine_id: row.machine_id,
-      time_updated: row.time_updated,
-      server_seq: row.server_seq,
-      deleted: row.deleted === 1,
-      data: row.data != null ? JSON.parse(row.data) : null,
-    }));
+    const envelopes: SyncEnvelope[] = rows.map((row) => this.rowToEnvelope(row));
 
     // server_seq is the max seq we've seen, which is next_seq - 1
     const serverSeq = this.getNextSeq() - 1;
@@ -458,34 +488,13 @@ export class LedgerDB {
     };
   }
 
-  private withDependencyClosure(
-    rows: Array<{
-      kind: string;
-      id: string;
-      machine_id: string;
-      time_updated: number;
-      server_seq: number;
-      deleted: number;
-      data: string | null;
-      received_at: number;
-    }>,
-    exclude?: string,
-  ): Array<{
-    kind: string;
-    id: string;
-    machine_id: string;
-    time_updated: number;
-    server_seq: number;
-    deleted: number;
-    data: string | null;
-    received_at: number;
-  }> {
+  private withDependencyClosure(rows: SyncRow[], exclude?: string): SyncRow[] {
     const byKey = new Map(rows.map((row) => [`${row.kind}:${row.id}`, row]));
     const queue = [...rows];
 
     for (let index = 0; index < queue.length; index++) {
       const row = queue[index]!;
-      if (row.deleted === 1 || row.data === null) continue;
+      if (row.deleted === 1) continue;
 
       for (const dep of this.rowDependencies(row)) {
         const key = `${dep.kind}:${dep.id}`;
@@ -504,33 +513,76 @@ export class LedgerDB {
     return [...byKey.values()].sort((a, b) => a.server_seq - b.server_seq);
   }
 
-  private rowDependencies(row: { kind: string; data: string | null }): Array<{ kind: SyncKind; id: string }> {
-    if (row.data === null) return [];
-    let data: Record<string, unknown>;
-    try {
-      data = JSON.parse(row.data) as Record<string, unknown>;
-    } catch {
-      return [];
+  private rowDependencies(row: SyncRow): Array<{ kind: SyncKind; id: string }> {
+    if (row.parent_kind && row.parent_id) {
+      return [{ kind: row.parent_kind as SyncKind, id: row.parent_id }];
     }
+    const parent = payloadParent(row.kind, this.rowPayload(row));
+    return parent ? [parent] : [];
+  }
 
-    const dep = (kind: SyncKind, id: unknown): Array<{ kind: SyncKind; id: string }> =>
-      typeof id === "string" && id.length > 0 ? [{ kind, id }] : [];
-
-    switch (row.kind) {
-      case "session":
-        return dep("project", data["project_id"]);
-      case "message":
-        return dep("session", data["session_id"]);
-      case "part":
-        return dep("message", data["message_id"]);
-      case "todo":
-      case "session_share":
-        return dep("session", data["session_id"]);
-      case "permission":
-        return dep("project", data["project_id"]);
-      default:
-        return [];
+  private rowPayload(row: SyncRow): unknown {
+    if (row.deleted === 1) return null;
+    if (row.data_sha) {
+      const json = this.rowBlobs.getJson(row.data_sha);
+      if (json == null) {
+        this.logger.warn("row blob missing", { kind: row.kind, id: row.id, sha256: row.data_sha });
+        return row.data != null ? JSON.parse(row.data) : null;
+      }
+      return JSON.parse(json);
     }
+    if (row.data != null) return JSON.parse(row.data);
+    return null;
+  }
+
+  private rowToEnvelope(row: SyncRow): SyncEnvelope {
+    return {
+      kind: row.kind as SyncEnvelope["kind"],
+      id: row.id,
+      machine_id: row.machine_id,
+      time_updated: row.time_updated,
+      server_seq: row.server_seq,
+      deleted: row.deleted === 1,
+      data: this.rowPayload(row) as SyncEnvelope["data"],
+    };
+  }
+
+  private gcRowBlob(sha256: string | null): void {
+    if (!sha256) return;
+    const refs = this.stmtCountRowBlobRefs.get(sha256);
+    if (!refs || refs.n > 0) return;
+    this.rowBlobs.unlink(sha256);
+  }
+
+  private ensurePayloadColumns(): void {
+    const cols = new Set(
+      this.db.prepare<{ name: string }, []>("PRAGMA table_info(sync_row)").all().map((c) => c.name),
+    );
+    if (!cols.has("data_sha")) this.db.exec("ALTER TABLE sync_row ADD COLUMN data_sha TEXT");
+    if (!cols.has("parent_kind")) this.db.exec("ALTER TABLE sync_row ADD COLUMN parent_kind TEXT");
+    if (!cols.has("parent_id")) this.db.exec("ALTER TABLE sync_row ADD COLUMN parent_id TEXT");
+  }
+
+  migrateLegacyPayloads(): number {
+    const stmt = this.db.prepare<SyncRow, []>(
+      "SELECT * FROM sync_row WHERE data IS NOT NULL AND (data_sha IS NULL OR data_sha = '') LIMIT 200",
+    );
+    let migrated = 0;
+    for (;;) {
+      const rows = stmt.all();
+      if (rows.length === 0) break;
+      for (const row of rows) {
+        if (row.data == null) continue;
+        const sha = this.rowBlobs.putJson(row.data);
+        const parent = payloadParent(row.kind, JSON.parse(row.data));
+        this.stmtClearLegacyData.run(sha, parent?.kind ?? null, parent?.id ?? null, row.kind, row.id);
+        migrated++;
+      }
+    }
+    if (migrated > 0) {
+      this.logger.info("migrated legacy row payloads to compressed blobs", { migrated });
+    }
+    return migrated;
   }
 
   /**
