@@ -588,7 +588,7 @@ export class LedgerDB {
     if (!cols.has("parent_id")) this.db.exec("ALTER TABLE sync_row ADD COLUMN parent_id TEXT");
   }
 
-  migrateLegacyPayloads(): number {
+  async migrateLegacyPayloads(): Promise<number> {
     const stmt = this.db.prepare<SyncRow, []>(
       "SELECT * FROM sync_row WHERE data IS NOT NULL AND (data_sha IS NULL OR data_sha = '') LIMIT 200",
     );
@@ -610,6 +610,7 @@ export class LedgerDB {
         );
         migrated++;
       }
+      await Bun.sleep(0);
     }
     if (migrated > 0) {
       this.logger.info("migrated legacy row payloads to compressed blobs", { migrated });

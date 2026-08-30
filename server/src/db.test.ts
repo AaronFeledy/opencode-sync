@@ -480,7 +480,7 @@ test("row payloads are stored as compressed blobs, not sqlite TEXT", () => {
   expect(fs.existsSync(path.join(dir, "row-blobs", row!.data_sha!.slice(0, 2), `${row!.data_sha}.gz`))).toBe(true);
 });
 
-test("legacy TEXT payloads still pull and migrate to blobs", () => {
+test("legacy TEXT payloads still pull and migrate to blobs", async () => {
   const dir = createDataDir();
   const db = new LedgerDB(dir, silentLogger);
   db.close();
@@ -498,7 +498,7 @@ test("legacy TEXT payloads still pull and migrate to blobs", () => {
   const before = db2.pullRows(0);
   expect(before.envelopes[0]?.id).toBe("legacy");
   expect((before.envelopes[0]?.data as { title?: string })?.title).toContain("legacy");
-  expect(db2.migrateLegacyPayloads()).toBe(1);
+  expect(await db2.migrateLegacyPayloads()).toBe(1);
   const after = db2.pullRows(0);
   expect(after.envelopes[0]?.id).toBe("legacy");
   db2.close();
