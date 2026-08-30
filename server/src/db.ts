@@ -564,16 +564,20 @@ export class LedgerDB {
   }
 
   migrateLegacyPayloads(): number {
-    const rows = this.db.prepare<SyncRow, []>(
-      "SELECT * FROM sync_row WHERE data IS NOT NULL AND (data_sha IS NULL OR data_sha = '')",
-    ).all();
+    const stmt = this.db.prepare<SyncRow, []>(
+      "SELECT * FROM sync_row WHERE data IS NOT NULL AND (data_sha IS NULL OR data_sha = '') LIMIT 200",
+    );
     let migrated = 0;
-    for (const row of rows) {
-      if (row.data == null) continue;
-      const sha = this.rowBlobs.putJson(row.data);
-      const parent = payloadParent(row.kind, JSON.parse(row.data));
-      this.stmtClearLegacyData.run(sha, parent?.kind ?? null, parent?.id ?? null, row.kind, row.id);
-      migrated++;
+    for (;;) {
+      const rows = stmt.all();
+      if (rows.length === 0) break;
+      for (const row of rows) {
+        if (row.data == null) continue;
+        const sha = this.rowBlobs.putJson(row.data);
+        const parent = payloadParent(row.kind, JSON.parse(row.data));
+        this.stmtClearLegacyData.run(sha, parent?.kind ?? null, parent?.id ?? null, row.kind, row.id);
+        migrated++;
+      }
     }
     if (migrated > 0) {
       this.logger.info("migrated legacy row payloads to compressed blobs", { migrated });
