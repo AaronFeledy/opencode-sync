@@ -586,6 +586,40 @@ test("legacy migrate stops at maxRows and resumes from the cursor", async () => 
   db2.close();
 });
 
+test("legacy migrate reclaims sqlite pages after a chunk", async () => {
+  const dir = createDataDir();
+  const db = new LedgerDB(dir, silentLogger);
+  db.close();
+
+  const dbPath = path.join(dir, "ledger.sqlite");
+  const sqlite = new Database(dbPath);
+  const insert = sqlite.prepare(
+    `INSERT INTO sync_row (kind, id, machine_id, time_updated, server_seq, deleted, data, received_at)
+     VALUES ('session', ?, 'm1', 5, ?, 0, ?, 1)`,
+  );
+  const blob = "x".repeat(32 * 1024);
+  sqlite.transaction(() => {
+    for (let i = 0; i < 80; i++) {
+      const id = `reclaim_${i}`;
+      const session = makeSession(id, 5);
+      session.title = blob;
+      insert.run(id, i + 1, JSON.stringify(session));
+    }
+  })();
+  sqlite.run("UPDATE server_state SET v = '81' WHERE k = 'next_seq'");
+  sqlite.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  sqlite.close();
+  const before = fs.statSync(dbPath).size;
+
+  const db2 = new LedgerDB(dir, silentLogger);
+  expect(await db2.migrateLegacyPayloads({ minFreeBytes: 0 })).toEqual({
+    migrated: 80,
+    done: true,
+  });
+  db2.close();
+  expect(fs.statSync(dbPath).size).toBeLessThan(before);
+});
+
 test("legacy migrate pauses when the disk floor is hit and resumes later", async () => {
   const dir = createDataDir();
   const db = new LedgerDB(dir, silentLogger);
