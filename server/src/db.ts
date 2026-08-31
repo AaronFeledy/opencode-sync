@@ -3,7 +3,7 @@
  */
 
 import { Database } from "bun:sqlite";
-import { mkdirSync, existsSync, unlinkSync, statfsSync } from "node:fs";
+import { mkdirSync, existsSync, unlinkSync, statfsSync, statSync, truncateSync } from "node:fs";
 import { join } from "node:path";
 import type { SyncEnvelope, SyncKind, FileManifestEntry } from "@opencode-sync/shared";
 import type { Logger } from "./log.js";
@@ -161,12 +161,12 @@ export class LedgerDB {
     this.blobDir = join(dataDir, "blobs");
     mkdirSync(this.blobDir, { recursive: true });
 
-    // Open database
     const dbPath = join(dataDir, "ledger.sqlite");
     this.db = new Database(dbPath);
     this.rowBlobs = new RowBlobStore(join(dataDir, "row-blobs"));
-
-    // Enable WAL mode for concurrent reads
+    // Must run before CREATE TABLE on a new file. Existing DBs stay at
+    // auto_vacuum=NONE until a full VACUUM; incremental_vacuum is then a no-op.
+    this.db.exec("PRAGMA auto_vacuum = INCREMENTAL");
     this.db.exec("PRAGMA journal_mode = WAL");
     this.db.exec("PRAGMA synchronous = NORMAL");
     this.db.exec("PRAGMA foreign_keys = ON");
@@ -664,6 +664,7 @@ export class LedgerDB {
       if (rows.length === 0) {
         this.stmtSetState.run(LEGACY_MIGRATE_CURSOR_KEY, "0");
         if (migrated > 0) {
+          this.reclaimFreelist();
           this.logger.info("migrated legacy row payloads to compressed blobs", { migrated });
         }
         return { migrated, done: true };
@@ -714,6 +715,7 @@ export class LedgerDB {
         }
         if (migrated >= maxRows) {
           persistCursor();
+          this.reclaimFreelist();
           this.logger.info("legacy payload migration chunk complete", { migrated, afterRowid });
           return { migrated, done: false, paused: "max-rows" };
         }
@@ -728,6 +730,33 @@ export class LedgerDB {
     if (!row) return 0;
     const n = Number.parseInt(row.v, 10);
     return Number.isFinite(n) && n > 0 ? n : 0;
+  }
+
+  private reclaimFreelist(): void {
+    const row = this.db.prepare<Record<string, number>, []>("PRAGMA auto_vacuum").get();
+    const mode = row ? Object.values(row)[0] : 0;
+    if (mode !== 2) return;
+    this.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    this.db.exec("PRAGMA incremental_vacuum");
+    const pageSize = Object.values(
+      this.db.prepare<Record<string, number>, []>("PRAGMA page_size").get() ?? {},
+    )[0];
+    const pageCount = Object.values(
+      this.db.prepare<Record<string, number>, []>("PRAGMA page_count").get() ?? {},
+    )[0];
+    if (!pageSize || !pageCount) return;
+    const dbPath = join(this.dataDir, "ledger.sqlite");
+    const logical = pageSize * pageCount;
+    const current = statSync(dbPath).size;
+    if (current > logical) {
+      try {
+        truncateSync(dbPath, logical);
+      } catch (err) {
+        this.logger.warn("legacy migrate sqlite truncate failed", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
   }
 
   /**
