@@ -106,21 +106,18 @@ test("applyLoadedOverrides treats explicit null as a replacement", () => {
   expect(config).toEqual({ model: null });
 });
 
-test("M4: applyLoadedOverrides ignores __proto__ keys (prototype-pollution guard)", () => {
-  writeOverrides('{"__proto__":{"polluted":true},"model":"keep"}\n');
+test("M4: applyLoadedOverrides ignores __proto__/constructor/prototype keys (prototype-pollution guard)", () => {
+  writeOverrides(
+    '{"__proto__":{"polluted":true},"constructor":{"prototype":{"x":1}},"prototype":{"y":2},"model":"keep"}\n',
+  );
 
   const config: Record<string, unknown> = { model: "base" };
   applyLoadedOverrides(config);
 
-  expect(({} as Record<string, unknown>)["polluted"]).toBeUndefined();
-  expect((config as Record<string, unknown>)["polluted"]).toBeUndefined();
+  const plain = {} as Record<string, unknown>;
+  expect(plain["polluted"]).toBeUndefined();
+  expect(plain["x"]).toBeUndefined();
+  expect(plain["y"]).toBeUndefined();
+  expect(config["polluted"]).toBeUndefined();
   expect(config.model).toBe("keep");
-});
-
-test("M4: applyLoadedOverrides ignores constructor/prototype keys", () => {
-  writeOverrides('{"constructor":{"prototype":{"x":1}},"prototype":{"y":2}}\n');
-  const config: Record<string, unknown> = {};
-  applyLoadedOverrides(config);
-  expect(({} as Record<string, unknown>)["x"]).toBeUndefined();
-  expect(({} as Record<string, unknown>)["y"]).toBeUndefined();
 });

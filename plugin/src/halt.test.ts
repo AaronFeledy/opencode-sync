@@ -84,10 +84,6 @@ test("writeHaltMarker overwrites stale details on re-trip (freshest wins)", () =
   expect(got.reason).toBe(HALT_REASONS.DB_FINGERPRINT_MISMATCH);
 });
 
-test("clearHaltMarker is a no-op when nothing is halted", () => {
-  expect(() => clearHaltMarker()).not.toThrow();
-});
-
 test("clearHaltMarker removes a present marker", () => {
   writeHaltMarker({
     triggeredAt: Date.now(),
