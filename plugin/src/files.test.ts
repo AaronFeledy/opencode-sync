@@ -11,6 +11,8 @@ import {
   ANTHROPIC_ACCOUNTS_SYNC_PATH,
   AUTH_SYNC_PATH,
   HOME_AGENTS_SYNC_PATH,
+  OMO_JSON_SYNC_PATH,
+  OMO_JSONC_SYNC_PATH,
 } from "@opencode-sync/shared";
 
 const HOME = os.homedir();
@@ -43,6 +45,7 @@ const BASE_CONFIG: FileSyncConfig = {
   tui_json: false,
   auth_json: false,
   home_agents: false,
+  omo_json: false,
 };
 
 class MockClient {
@@ -127,6 +130,7 @@ beforeEach(() => {
   fs.rmSync(CONFIG_BASE, { recursive: true, force: true });
   fs.rmSync(DATA_BASE, { recursive: true, force: true });
   fs.rmSync(path.join(HOME, HOME_AGENTS_SYNC_PATH), { recursive: true, force: true });
+  fs.rmSync(path.join(HOME, ".omo"), { recursive: true, force: true });
   delete process.env.OPENCODE_SYNC_AUTH_LOCK_WAIT_MS;
 });
 
@@ -148,6 +152,69 @@ test("includes oh-my-openagent config files with opencode_json sync", async () =
     "oh-my-openagent.json",
     "oh-my-openagent.jsonc",
   ]);
+});
+
+test("includes ~/.omo/omo.jsonc with omo_json sync and ignores sibling ~/.omo files", async () => {
+  writeTrackedFile(path.join(HOME, OMO_JSONC_SYNC_PATH), "// omo\n{}\n", 1_000);
+  writeTrackedFile(path.join(HOME, OMO_JSON_SYNC_PATH), "{}\n", 2_000);
+  writeTrackedFile(path.join(HOME, ".omo", "plans", "ticket.md"), "local only\n", 3_000);
+
+  const fileSync = new FileSync(
+    new MockClient() as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, omo_json: true },
+    new StateManager("desktop"),
+    () => {},
+  );
+
+  const manifest = await fileSync.computeLocalManifest();
+
+  expect(manifest.map((entry) => entry.relpath).sort()).toEqual([
+    OMO_JSON_SYNC_PATH,
+    OMO_JSONC_SYNC_PATH,
+  ]);
+});
+
+test("does not include ~/.omo/omo.jsonc when omo_json is disabled", async () => {
+  writeTrackedFile(path.join(HOME, OMO_JSONC_SYNC_PATH), "{}\n", 1_000);
+
+  const fileSync = new FileSync(
+    new MockClient() as unknown as SyncClient,
+    "desktop",
+    BASE_CONFIG,
+    new StateManager("desktop"),
+    () => {},
+  );
+
+  const manifest = await fileSync.computeLocalManifest();
+
+  expect(manifest).toHaveLength(0);
+});
+
+test("downloads ~/.omo/omo.jsonc into the home-rooted path and treats it as functional", async () => {
+  const client = new MockClient();
+  const content = '{"agents":{}}\n';
+  const entry = toManifestEntry(OMO_JSONC_SYNC_PATH, content, 2_000, "laptop");
+  client.manifest = [entry];
+  client.blobs.set(entry.sha256, new Uint8Array(Buffer.from(content)));
+
+  const notified: string[][] = [];
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, omo_json: true },
+    new StateManager("desktop"),
+    () => {},
+    (relpaths) => notified.push(relpaths),
+  );
+
+  const result = await fileSync.sync();
+
+  expect(fs.readFileSync(path.join(HOME, OMO_JSONC_SYNC_PATH), "utf-8")).toBe(content);
+  expect(fs.existsSync(path.join(CONFIG_BASE, OMO_JSONC_SYNC_PATH))).toBe(false);
+  expect(result.downloaded).toBe(1);
+  expect(result.functionalPulled).toEqual([OMO_JSONC_SYNC_PATH]);
+  expect(notified).toEqual([[OMO_JSONC_SYNC_PATH]]);
 });
 
 test("applies remote tombstones without re-uploading the deleted file", async () => {
