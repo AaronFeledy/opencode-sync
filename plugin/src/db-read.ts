@@ -139,10 +139,22 @@ export class DbReader {
    * session_share. Within each kind rows arrive in SQLite scan order
    * (no explicit ORDER BY) — callers must not depend on cross-kind
    * ordering.
+   *
+   * `sessionScoped` restricts message/part/todo rows to sessions whose
+   * own `time_updated > since`. opencode.db has no index on
+   * `time_updated`, so the plain `WHERE time_updated > ?` is a full
+   * table scan — on a multi-GB DB with millions of `part` rows that is
+   * minutes of launch-blocking I/O. The session table is small and the
+   * child tables all carry a `session_id` index, so the scoped variant
+   * touches only the pages belonging to recently-active sessions.
+   * opencode bumps `session.time_updated` on every write to a session,
+   * so in practice nothing is missed; any stragglers are still covered
+   * by the unscoped background sync, which keeps its own push cursor.
    */
   *iterateAllEnvelopes(
     since: number,
     machineId: string,
+    options: { sessionScoped?: boolean } = {},
   ): Generator<SyncEnvelope> {
     const kinds: SyncKind[] = [
       "project",
@@ -154,12 +166,16 @@ export class DbReader {
       "session_share",
     ];
 
+    const scopedKinds = new Set<SyncKind>(["message", "part", "todo"]);
+
     for (const kind of kinds) {
       // session_share's table column is shared with its kind, so the
       // template-literal SQL is safe — kinds are a closed enum.
-      const stmt = this.db.query<Record<string, unknown>, [number]>(
-        `SELECT * FROM ${kind} WHERE time_updated > ?`,
-      );
+      const sql = options.sessionScoped && scopedKinds.has(kind)
+        ? `SELECT * FROM ${kind} WHERE session_id IN ` +
+          `(SELECT id FROM session WHERE time_updated > ?1) AND time_updated > ?1`
+        : `SELECT * FROM ${kind} WHERE time_updated > ?1`;
+      const stmt = this.db.query<Record<string, unknown>, [number]>(sql);
       for (const row of stmt.iterate(since)) {
         yield {
           id: rowPrimaryKey(kind, row),

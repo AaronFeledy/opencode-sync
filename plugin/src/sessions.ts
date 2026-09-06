@@ -43,6 +43,12 @@ type SessionSyncOptions = {
   skipDeletions?: boolean;
   /** Don't advance lastPushedRowTime (startup recent push must not skip older local rows). */
   freezePushCursor?: boolean;
+  /**
+   * Restrict message/part/todo scans to sessions updated since the
+   * cursor (startup path). Avoids a full scan of the unindexed
+   * `time_updated` column on the largest tables.
+   */
+  sessionScoped?: boolean;
 };
 
 /**
@@ -464,7 +470,9 @@ export class SessionSync {
     // Stream rows from every kind. Generator yields one envelope at a
     // time, so peak memory is roughly PUSH_BATCH_SIZE envelopes plus
     // whatever bun:sqlite buffers internally for the active statement.
-    for (const env of this.dbReader.iterateAllEnvelopes(since, this.machineId)) {
+    for (const env of this.dbReader.iterateAllEnvelopes(since, this.machineId, {
+      sessionScoped: options.sessionScoped === true,
+    })) {
       pendingBatch.push(env);
       totalSeen++;
       if (env.time_updated > maxCheckedLiveTime) maxCheckedLiveTime = env.time_updated;
@@ -1008,6 +1016,7 @@ export class SessionSync {
       since: cutoff,
       skipDeletions: true,
       freezePushCursor: true,
+      sessionScoped: true,
     });
   }
 
