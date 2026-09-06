@@ -4,45 +4,16 @@
  * For v0.1-v0.2 we write directly via SQLite during idle windows.
  */
 import { Database, type SQLQueryBindings } from "bun:sqlite";
-import type { SyncEnvelope, SyncKind } from "@opencode-sync/shared";
-import { parseRowPrimaryKey } from "@opencode-sync/shared";
+import { SYNC_KINDS, parseRowPrimaryKey, type SyncEnvelope, type SyncKind } from "@opencode-sync/shared";
 import { logger } from "./logger.js";
-
-// ── Column definitions per kind ────────────────────────────────────
-
-const TABLE_COLUMNS: Record<SyncKind, string[]> = {
-  project: [
-    "id", "worktree", "vcs", "name", "icon_url", "icon_color",
-    "time_created", "time_updated", "time_initialized",
-    "sandboxes", "commands",
-  ],
-  session: [
-    "id", "project_id", "parent_id", "slug", "directory", "title",
-    "version", "share_url", "summary_additions", "summary_deletions",
-    "summary_files", "summary_diffs", "revert", "permission",
-    "time_created", "time_updated", "time_compacting", "time_archived",
-    "workspace_id",
-  ],
-  message: ["id", "session_id", "time_created", "time_updated", "data"],
-  part: ["id", "message_id", "session_id", "time_created", "time_updated", "data"],
-  todo: [
-    "session_id", "content", "status", "priority", "position",
-    "time_created", "time_updated",
-  ],
-  permission: ["project_id", "time_created", "time_updated", "data"],
-  session_share: ["session_id", "id", "secret", "url", "time_created", "time_updated"],
-};
-
-/** Primary key column(s) for each kind — used for DELETE and conflict checks */
-const PK_COLUMNS: Record<SyncKind, string[]> = {
-  project: ["id"],
-  session: ["id"],
-  message: ["id"],
-  part: ["id"],
-  todo: ["session_id", "position"],
-  permission: ["project_id"],
-  session_share: ["session_id"],
-};
+import {
+  quoteIdent,
+  readTableSchema,
+  requiredColumnMissing,
+  schemaSignature,
+  writableColumns,
+  type TableSchema,
+} from "./local-schema.js";
 
 // ── Apply result ───────────────────────────────────────────────────
 
@@ -51,18 +22,21 @@ const PK_COLUMNS: Record<SyncKind, string[]> = {
  *
  * - `applied`  — the local row was inserted, updated, or deleted.
  * - `skipped`  — local row exists with the same `time_updated`; no work needed.
+ * - `incompatible` — envelope fields cannot satisfy the local table
+ *                (schema drift). Skip without retry/poison; do not remember.
  * - `conflict` — local row exists with a STRICTLY NEWER `time_updated`; the
  *                remote version was rejected to preserve the local edit. The
  *                caller should surface this to the user.
  * - `error`    — applying failed (e.g. SQL constraint violation, malformed
  *                envelope). Caller should log; not the same as a conflict.
  */
-export type ApplyResult = "applied" | "skipped" | "conflict" | "error";
+export type ApplyResult = "applied" | "skipped" | "incompatible" | "conflict" | "error";
 
 // ── Writer ─────────────────────────────────────────────────────────
 
 export class DbWriter {
   private db: Database;
+  private readonly schemas = new Map<SyncKind, TableSchema | null>();
 
   constructor(dbPath: string) {
     this.db = new Database(dbPath);
@@ -85,11 +59,8 @@ export class DbWriter {
 
     // Defensive guard: kind is typed as SyncKind, but envelopes come off the
     // wire as JSON, so an old/buggy/misbehaving server (or future kind we
-    // don't know about yet) could send something we can't process. Without
-    // this check, the downstream PK_COLUMNS[kind]! and TABLE_COLUMNS[kind]!
-    // dereferences would throw a TypeError that escapes applyEnvelope, when
-    // the contract is to return "error" instead.
-    if (!(kind in TABLE_COLUMNS)) {
+    // don't know about yet) could send something we can't process.
+    if (!(SYNC_KINDS as readonly string[]).includes(kind)) {
       logger.error(`unknown envelope kind: ${kind}`);
       return "error";
     }
@@ -121,6 +92,18 @@ export class DbWriter {
     if (!data) return "error";
 
     const row = data as unknown as Record<string, SQLQueryBindings>;
+    const schema = this.schemaFor(kind);
+    if (!schema) {
+      logger.error(`missing local table for kind: ${kind}`);
+      return "error";
+    }
+    if (requiredColumnMissing(schema, row)) {
+      logger.log("skipping envelope incompatible with local schema", {
+        kind,
+        id: envelope.id,
+      });
+      return "incompatible";
+    }
 
     const localUpdated = this.getLocalTimeUpdated(kind, row);
     if (localUpdated !== null) {
@@ -171,12 +154,32 @@ export class DbWriter {
 
   // ── Private helpers ─────────────────────────────────────────────
 
+  schemaSignature(kind: SyncKind): string | null {
+    const schema = this.schemaFor(kind);
+    return schema ? schemaSignature(schema) : null;
+  }
+
+  private schemaFor(kind: SyncKind): TableSchema | null {
+    if (!this.schemas.has(kind)) {
+      this.schemas.set(kind, readTableSchema(this.db, kind));
+    }
+    return this.schemas.get(kind) ?? null;
+  }
+
+  private pkColumns(kind: SyncKind): readonly string[] | null {
+    const schema = this.schemaFor(kind);
+    if (!schema || schema.pkColumns.length === 0) return null;
+    return schema.pkColumns;
+  }
+
   private getLocalTimeUpdated(
     kind: SyncKind,
     data: Record<string, SQLQueryBindings>,
   ): number | null {
-    const pkCols = PK_COLUMNS[kind]!;
+    const pkCols = this.pkColumns(kind);
+    if (!pkCols) return null;
     const params = pkCols.map((col) => data[col]) as SQLQueryBindings[];
+    if (params.some((value) => value === undefined || value === null)) return null;
 
     return this.getLocalTimeUpdatedForPk(kind, params);
   }
@@ -185,12 +188,13 @@ export class DbWriter {
     kind: SyncKind,
     pkValues: SQLQueryBindings[],
   ): number | null {
-    const pkCols = PK_COLUMNS[kind]!;
-    const where = pkCols.map((col) => `${col} = ?`).join(" AND ");
+    const pkCols = this.pkColumns(kind);
+    if (!pkCols) return null;
+    const where = pkCols.map((col) => `${quoteIdent(col)} = ?`).join(" AND ");
 
     const row = this.db
       .query<{ time_updated: number }, SQLQueryBindings[]>(
-        `SELECT time_updated FROM ${kind} WHERE ${where}`,
+        `SELECT time_updated FROM ${quoteIdent(kind)} WHERE ${where}`,
       )
       .get(...pkValues);
 
@@ -198,20 +202,23 @@ export class DbWriter {
   }
 
   private rowExists(kind: SyncKind, pkValues: SQLQueryBindings[]): boolean {
-    const pkCols = PK_COLUMNS[kind]!;
-    if (pkValues.length !== pkCols.length) return false;
-    const where = pkCols.map((col) => `${col} = ?`).join(" AND ");
+    const pkCols = this.pkColumns(kind);
+    if (!pkCols || pkValues.length !== pkCols.length) return false;
+    const where = pkCols.map((col) => `${quoteIdent(col)} = ?`).join(" AND ");
     const row = this.db
       .query<{ n: number }, SQLQueryBindings[]>(
-        `SELECT 1 AS n FROM ${kind} WHERE ${where}`,
+        `SELECT 1 AS n FROM ${quoteIdent(kind)} WHERE ${where}`,
       )
       .get(...pkValues);
     return row !== null && row !== undefined;
   }
 
   private upsertRow(kind: SyncKind, data: Record<string, SQLQueryBindings>): boolean {
-    const columns = TABLE_COLUMNS[kind]!;
-    const pkCols = PK_COLUMNS[kind]!;
+    const schema = this.schemaFor(kind);
+    if (!schema) return false;
+    const columns = writableColumns(schema, data);
+    const pkCols = schema.pkColumns;
+    if (columns.length === 0 || pkCols.length === 0) return false;
     const pkSet = new Set(pkCols);
     const nonPkCols = columns.filter((c) => !pkSet.has(c));
 
@@ -231,14 +238,14 @@ export class DbWriter {
     // error on an empty SET list. (No table in SYNC_KINDS currently
     // falls into that case, but the guard is free.)
     const placeholders = columns.map(() => "?").join(", ");
-    const colList = columns.join(", ");
-    const pkList = pkCols.join(", ");
-    const setList = nonPkCols.map((c) => `${c} = excluded.${c}`).join(", ");
+    const colList = columns.map(quoteIdent).join(", ");
+    const pkList = pkCols.map(quoteIdent).join(", ");
+    const setList = nonPkCols.map((c) => `${quoteIdent(c)} = excluded.${quoteIdent(c)}`).join(", ");
     const onConflict =
       nonPkCols.length === 0
         ? `ON CONFLICT(${pkList}) DO NOTHING`
         : `ON CONFLICT(${pkList}) DO UPDATE SET ${setList}`;
-    const sql = `INSERT INTO ${kind} (${colList}) VALUES (${placeholders}) ${onConflict}`;
+    const sql = `INSERT INTO ${quoteIdent(kind)} (${colList}) VALUES (${placeholders}) ${onConflict}`;
 
     const params: SQLQueryBindings[] = columns.map((col) => {
       const val = data[col];
@@ -257,7 +264,8 @@ export class DbWriter {
   }
 
   private deleteRow(kind: SyncKind, envelope: SyncEnvelope): ApplyResult {
-    const pkCols = PK_COLUMNS[kind]!;
+    const pkCols = this.pkColumns(kind);
+    if (!pkCols) return "error";
 
     // Use the shared parser instead of `envelope.id.split(":")` — the latter
     // silently drops the deletion whenever a single-PK id happens to contain
@@ -279,8 +287,8 @@ export class DbWriter {
       return "skipped";
     }
 
-    const where = pkCols.map((col) => `${col} = ?`).join(" AND ");
-    const sql = `DELETE FROM ${kind} WHERE ${where}`;
+    const where = pkCols.map((col) => `${quoteIdent(col)} = ?`).join(" AND ");
+    const sql = `DELETE FROM ${quoteIdent(kind)} WHERE ${where}`;
 
     try {
       this.db.run(sql, pkValues);
