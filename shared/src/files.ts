@@ -39,6 +39,12 @@ export interface FileSyncConfig {
    * lives outside opencode's config root.
    */
   home_agents: boolean;
+  /**
+   * Sync `~/.omo/omo.jsonc` (and `.json`) — OhMyOpenCode's home config.
+   * Home-rooted; the rest of `~/.omo/` (plans, session state) is not
+   * synced.
+   */
+  omo_json: boolean;
 }
 
 export const AUTH_SYNC_PATH = ".local/share/opencode/auth.json";
@@ -53,6 +59,18 @@ export const AUTH_LOCK_SYNC_PATH = `${AUTH_SYNC_PATH}.lock`;
 export const HOME_AGENTS_SYNC_PATH = ".agents";
 
 /**
+ * Sync prefix for `~/.omo/omo.json` — OhMyOpenCode's non-commented
+ * home config. Paired with `OMO_JSONC_SYNC_PATH`; neither prefix is
+ * `.omo` itself, so sibling files under `~/.omo/` stay local.
+ */
+export const OMO_JSON_SYNC_PATH = ".omo/omo.json";
+
+/**
+ * Sync prefix for `~/.omo/omo.jsonc` — OhMyOpenCode's home config.
+ */
+export const OMO_JSONC_SYNC_PATH = ".omo/omo.jsonc";
+
+/**
  * Manifest-path prefixes that are resolved relative to `$HOME` instead
  * of the opencode config base. The plugin uses this to map manifest
  * relpaths back to filesystem paths and to choose the right `baseDir`
@@ -63,6 +81,8 @@ export const HOME_ROOTED_PATH_PREFIXES: readonly string[] = [
   ANTHROPIC_ACCOUNTS_SYNC_PATH,
   AUTH_LOCK_SYNC_PATH,
   HOME_AGENTS_SYNC_PATH,
+  OMO_JSON_SYNC_PATH,
+  OMO_JSONC_SYNC_PATH,
 ];
 
 export function isHomeRootedRelpath(relpath: string): boolean {
@@ -81,14 +101,15 @@ export const DEFAULT_FILE_SYNC_CONFIG: FileSyncConfig = {
   tui_json: true,
   auth_json: false, // off by default — contains API keys
   home_agents: false, // off by default — opt-in cross-tool agent home
+  omo_json: true,
 };
 
 /**
  * Directories and files to sync, keyed by config flag.
  *
  * Most paths are relative to `~/.config/opencode/`. Entries listed in
- * `HOME_ROOTED_PATH_PREFIXES` (currently `auth_json` and `home_agents`)
- * are resolved relative to `$HOME` instead.
+ * `HOME_ROOTED_PATH_PREFIXES` (currently `auth_json`, `home_agents`,
+ * and `omo_json`) are resolved relative to `$HOME` instead.
  */
 export const FILE_SYNC_PATHS: Record<keyof FileSyncConfig, string[]> = {
   agents: ["agents"],
@@ -105,22 +126,25 @@ export const FILE_SYNC_PATHS: Record<keyof FileSyncConfig, string[]> = {
   tui_json: ["tui.json", "tui.jsonc"],
   auth_json: [AUTH_SYNC_PATH, ANTHROPIC_ACCOUNTS_SYNC_PATH],
   home_agents: [HOME_AGENTS_SYNC_PATH],
+  omo_json: [OMO_JSON_SYNC_PATH, OMO_JSONC_SYNC_PATH],
 };
 
 /**
  * Config flags whose files directly affect opencode's running behaviour —
- * its configuration (`opencode.json` / `tui.json`) and credentials
- * (`auth.json`). These are synced ahead of everything else, and when a
- * change to one of them is *pulled down* from another machine the running
- * opencode process must be restarted to pick it up (opencode reads these
- * at startup). Less-critical scopes (agents, commands, skills, modes,
- * `AGENTS.md`, `~/.agents`) are hot-reloaded or read per-invocation, so
- * they neither need to go first nor require a restart.
+ * its configuration (`opencode.json` / `tui.json` / `~/.omo/omo.jsonc`)
+ * and credentials (`auth.json`). These are synced ahead of everything
+ * else, and when a change to one of them is *pulled down* from another
+ * machine the running opencode process must be restarted to pick it up
+ * (opencode reads these at startup). Less-critical scopes (agents,
+ * commands, skills, modes, `AGENTS.md`, `~/.agents`) are hot-reloaded or
+ * read per-invocation, so they neither need to go first nor require a
+ * restart.
  */
 export const FUNCTIONAL_FILE_SYNC_FLAGS: readonly (keyof FileSyncConfig)[] = [
   "opencode_json",
   "tui_json",
   "auth_json",
+  "omo_json",
 ];
 
 /**

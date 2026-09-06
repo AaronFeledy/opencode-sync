@@ -139,3 +139,26 @@ test("getKnownTime does not require loading every known row", () => {
   expect(sm2.getKnownTime("session:s1")).toBe(50);
   expect(sm2.getKnownTime("session:missing")).toBeUndefined();
 });
+
+test("incompatibleSince survives save/load and rewinds cursors on schema change", () => {
+  const sm = new StateManager("desktop");
+  sm.load();
+  sm.updateSeq(50);
+  sm.updateRecentSeq(60);
+  sm.recordIncompatible("permission", 20, "project_id!,data!");
+  sm.recordIncompatible("permission", 30, "project_id!,data!");
+  sm.recordIncompatible("permission", 10, "project_id!,data!");
+  sm.save();
+
+  const reloaded = new StateManager("desktop");
+  reloaded.load();
+  expect(reloaded.state.incompatibleSince.permission).toEqual({ server_seq: 10, schema: "project_id!,data!" });
+
+  expect(reloaded.rewindForSchemaChange(() => "project_id!,data!")).toEqual([]);
+  expect(reloaded.state.lastPulledSeq).toBe(50);
+
+  expect(reloaded.rewindForSchemaChange(() => "id!,project_id!")).toEqual(["permission"]);
+  expect(reloaded.state.lastPulledSeq).toBe(9);
+  expect(reloaded.state.lastRecentPulledSeq).toBe(9);
+  expect(reloaded.state.incompatibleSince.permission).toBeUndefined();
+});

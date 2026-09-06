@@ -1,15 +1,6 @@
 import { expect, test } from "bun:test";
 import { parseRowPrimaryKey, rowPrimaryKey } from "./types.js";
 
-test("parseRowPrimaryKey returns single-element array for single-PK kinds", () => {
-  expect(parseRowPrimaryKey("project", "proj_1")).toEqual(["proj_1"]);
-  expect(parseRowPrimaryKey("session", "ses_abc")).toEqual(["ses_abc"]);
-  expect(parseRowPrimaryKey("message", "msg_xyz")).toEqual(["msg_xyz"]);
-  expect(parseRowPrimaryKey("part", "part_1")).toEqual(["part_1"]);
-  expect(parseRowPrimaryKey("permission", "proj_1")).toEqual(["proj_1"]);
-  expect(parseRowPrimaryKey("session_share", "ses_abc")).toEqual(["ses_abc"]);
-});
-
 test("parseRowPrimaryKey preserves colons in single-PK ids", () => {
   // Regression test for #4: a session id containing a colon must NOT be
   // split. The naive `id.split(":")` would silently drop the deletion.
@@ -34,6 +25,11 @@ test("parseRowPrimaryKey returns null for malformed todo ids", () => {
   expect(parseRowPrimaryKey("todo", "no_colon_here")).toBeNull();
 });
 
+test("rowPrimaryKey prefers permission.id and falls back to project_id", () => {
+  expect(rowPrimaryKey("permission", { id: "perm_1", project_id: "proj_1" })).toBe("perm_1");
+  expect(rowPrimaryKey("permission", { project_id: "proj_1" })).toBe("proj_1");
+});
+
 test("parseRowPrimaryKey is the inverse of rowPrimaryKey", () => {
   // Round-trip every kind to make sure the two helpers stay aligned.
   const cases: Array<{ kind: Parameters<typeof rowPrimaryKey>[0]; row: Record<string, unknown>; expected: string[] }> = [
@@ -41,7 +37,7 @@ test("parseRowPrimaryKey is the inverse of rowPrimaryKey", () => {
     { kind: "session", row: { id: "ses_1" }, expected: ["ses_1"] },
     { kind: "message", row: { id: "msg_1" }, expected: ["msg_1"] },
     { kind: "part", row: { id: "part_1" }, expected: ["part_1"] },
-    { kind: "permission", row: { project_id: "proj_1" }, expected: ["proj_1"] },
+    { kind: "permission", row: { id: "perm_1", project_id: "proj_1" }, expected: ["perm_1"] },
     { kind: "session_share", row: { session_id: "ses_1" }, expected: ["ses_1"] },
     { kind: "todo", row: { session_id: "ses_1", position: 5 }, expected: ["ses_1", "5"] },
   ];

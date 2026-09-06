@@ -147,7 +147,7 @@ export class SyncClient {
   // ── Public API ──────────────────────────────────────────────────
 
   async health(): Promise<HealthResponse> {
-    return this.fetchJson<HealthResponse>("GET", "/health");
+    return this.fetchJson<HealthResponse>("GET", "/health", undefined, 8_000);
   }
 
   async push(machineId: string, envelopes: SyncEnvelope[]): Promise<PushResponse> {
@@ -214,7 +214,7 @@ export class SyncClient {
   }
 
   async getManifest(): Promise<FileManifest> {
-    return this.fetchJson<FileManifest>("GET", "/files/manifest");
+    return this.fetchJson<FileManifest>("GET", "/files/manifest", undefined, 8_000);
   }
 
   async getBlob(sha256: string): Promise<ArrayBuffer> {
@@ -263,6 +263,7 @@ export class SyncClient {
     body?: unknown,
     contentType?: string,
     extraHeaders?: Record<string, string>,
+    timeoutMs?: number,
   ): Promise<Response> {
     const url = `${this.baseUrl}${urlPath}`;
     const structured = body !== undefined && !(body instanceof Uint8Array);
@@ -272,8 +273,9 @@ export class SyncClient {
     const headers = { ...this.headers(ct), ...extraHeaders };
 
     let lastError: Error | null = null;
+    const retries = timeoutMs !== undefined ? 0 : MAX_RETRIES;
 
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    for (let attempt = 0; attempt <= retries; attempt++) {
       if (attempt > 0) {
         const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1);
         await sleep(delay);
@@ -305,6 +307,7 @@ export class SyncClient {
           method,
           headers: { ...headers, ...encodingHeaders },
           body: outBody,
+          signal: timeoutMs !== undefined ? AbortSignal.timeout(timeoutMs) : undefined,
         });
 
         // 409 Conflict — LWW-stale writes. Surface as a typed error so
@@ -343,7 +346,7 @@ export class SyncClient {
         // as DOMException/AbortError (different constructor), so matching
         // on TypeError alone is strictly correct here and avoids fragile
         // substring checks against platform-specific message text.
-        if (err instanceof TypeError) {
+        if (err instanceof TypeError || (err instanceof Error && err.name === "TimeoutError")) {
           lastError = err;
           continue;
         }
@@ -355,8 +358,13 @@ export class SyncClient {
     throw lastError ?? new Error(`opencode-sync: ${method} ${urlPath} failed after ${MAX_RETRIES} retries`);
   }
 
-  private async fetchJson<T>(method: string, urlPath: string, body?: unknown): Promise<T> {
-    const res = await this.request(method, urlPath, body);
+  private async fetchJson<T>(
+    method: string,
+    urlPath: string,
+    body?: unknown,
+    timeoutMs?: number,
+  ): Promise<T> {
+    const res = await this.request(method, urlPath, body, undefined, undefined, timeoutMs);
     if (isMsgpackContentType(res.headers.get("content-type"))) {
       return decodeMsgpack(new Uint8Array(await res.arrayBuffer())) as T;
     }

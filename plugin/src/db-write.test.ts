@@ -440,3 +440,224 @@ test("applyPage commits child-before-parent envelopes in one transaction", () =>
   expect(countRows(dbPath, "session")).toBe(2);
   expect(countRows(dbPath, "message")).toBe(4);
 });
+
+function initCurrentOpencodeSchema(dbPath: string): void {
+  const db = new Database(dbPath);
+  db.exec("PRAGMA foreign_keys = ON");
+  db.exec(`
+    CREATE TABLE project (
+      id TEXT PRIMARY KEY,
+      worktree TEXT NOT NULL,
+      vcs TEXT,
+      name TEXT,
+      icon_url TEXT,
+      icon_color TEXT,
+      time_created INTEGER NOT NULL,
+      time_updated INTEGER NOT NULL,
+      time_initialized INTEGER,
+      sandboxes TEXT NOT NULL,
+      commands TEXT,
+      icon_url_override TEXT
+    );
+    CREATE TABLE session (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+      parent_id TEXT,
+      slug TEXT NOT NULL,
+      directory TEXT NOT NULL,
+      title TEXT NOT NULL,
+      version TEXT NOT NULL,
+      share_url TEXT,
+      summary_additions INTEGER,
+      summary_deletions INTEGER,
+      summary_files INTEGER,
+      summary_diffs TEXT,
+      revert TEXT,
+      permission TEXT,
+      time_created INTEGER NOT NULL,
+      time_updated INTEGER NOT NULL,
+      time_compacting INTEGER,
+      time_archived INTEGER,
+      workspace_id TEXT,
+      path TEXT,
+      agent TEXT,
+      model TEXT,
+      cost REAL NOT NULL DEFAULT 0,
+      tokens_input INTEGER NOT NULL DEFAULT 0,
+      tokens_output INTEGER NOT NULL DEFAULT 0,
+      tokens_reasoning INTEGER NOT NULL DEFAULT 0,
+      tokens_cache_read INTEGER NOT NULL DEFAULT 0,
+      tokens_cache_write INTEGER NOT NULL DEFAULT 0,
+      metadata TEXT
+    );
+    CREATE TABLE permission (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+      action TEXT NOT NULL,
+      resource TEXT NOT NULL,
+      time_created INTEGER NOT NULL,
+      time_updated INTEGER NOT NULL
+    );
+  `);
+  db.run(
+    `INSERT INTO project (id, worktree, vcs, name, icon_url, icon_color, time_created, time_updated, time_initialized, sandboxes, commands, icon_url_override)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ["proj_1", "/tmp/p", "git", "Test", null, null, 1, 1, 1, "[]", null, null],
+  );
+  db.close();
+}
+
+test("applies OpenCode 1.18 permission rows keyed by id", () => {
+  const dbPath = tempDbPath();
+  initCurrentOpencodeSchema(dbPath);
+  const writer = new DbWriter(dbPath);
+
+  const result = writer.applyEnvelope({
+    kind: "permission",
+    id: "perm_1",
+    machine_id: "peer",
+    server_seq: 1,
+    time_updated: 200,
+    deleted: false,
+    data: {
+      id: "perm_1",
+      project_id: "proj_1",
+      action: "edit",
+      resource: "*",
+      time_created: 200,
+      time_updated: 200,
+    },
+  });
+  writer.close();
+
+  expect(result).toBe("applied");
+  const db = new Database(dbPath, { readonly: true });
+  const row = db.query<{ id: string; action: string }, []>(
+    "SELECT id, action FROM permission WHERE id = 'perm_1'",
+  ).get();
+  db.close();
+  expect(row?.id).toBe("perm_1");
+  expect(row?.action).toBe("edit");
+});
+
+test("skips legacy permission.data envelopes instead of SQL-erroring", () => {
+  const dbPath = tempDbPath();
+  initCurrentOpencodeSchema(dbPath);
+  const writer = new DbWriter(dbPath);
+
+  const result = writer.applyEnvelope({
+    kind: "permission",
+    id: "proj_1",
+    machine_id: "peer",
+    server_seq: 4366116,
+    time_updated: 200,
+    deleted: false,
+    data: {
+      project_id: "proj_1",
+      time_created: 200,
+      time_updated: 200,
+      data: '{"allow":[]}',
+    },
+  });
+  writer.close();
+
+  expect(result).toBe("incompatible");
+  expect(countRows(dbPath, "permission")).toBe(0);
+});
+
+test("persists newer session columns present on both sides", () => {
+  const dbPath = tempDbPath();
+  initCurrentOpencodeSchema(dbPath);
+  const writer = new DbWriter(dbPath);
+
+  const result = writer.applyEnvelope({
+    kind: "session",
+    id: "ses_new",
+    machine_id: "peer",
+    server_seq: 1,
+    time_updated: 300,
+    deleted: false,
+    data: {
+      id: "ses_new",
+      project_id: "proj_1",
+      parent_id: null,
+      slug: "s1",
+      directory: "/tmp/p",
+      title: "Patched",
+      version: "1",
+      share_url: null,
+      summary_additions: null,
+      summary_deletions: null,
+      summary_files: null,
+      summary_diffs: null,
+      revert: null,
+      permission: null,
+      time_created: 300,
+      time_updated: 300,
+      time_compacting: null,
+      time_archived: null,
+      workspace_id: null,
+      path: "/tmp/p/src",
+      agent: "build",
+      model: "xai/grok-4.6",
+      cost: 1.5,
+      tokens_input: 10,
+      tokens_output: 20,
+      tokens_reasoning: 5,
+      tokens_cache_read: 0,
+      tokens_cache_write: 0,
+      metadata: "{}",
+    },
+  });
+  writer.close();
+
+  expect(result).toBe("applied");
+  const db = new Database(dbPath, { readonly: true });
+  const row = db.query<{ path: string; agent: string; cost: number }, []>(
+    "SELECT path, agent, cost FROM session WHERE id = 'ses_new'",
+  ).get();
+  db.close();
+  expect(row?.path).toBe("/tmp/p/src");
+  expect(row?.agent).toBe("build");
+  expect(row?.cost).toBe(1.5);
+});
+
+test("applies older session envelopes onto a newer local schema", () => {
+  const dbPath = tempDbPath();
+  initCurrentOpencodeSchema(dbPath);
+  const writer = new DbWriter(dbPath);
+
+  const result = writer.applyEnvelope({
+    kind: "session",
+    id: "ses_old",
+    machine_id: "peer",
+    server_seq: 1,
+    time_updated: 300,
+    deleted: false,
+    data: {
+      id: "ses_old",
+      project_id: "proj_1",
+      parent_id: null,
+      slug: "s1",
+      directory: "/tmp/p",
+      title: "Legacy",
+      version: "1",
+      share_url: null,
+      summary_additions: null,
+      summary_deletions: null,
+      summary_files: null,
+      summary_diffs: null,
+      revert: null,
+      permission: null,
+      time_created: 300,
+      time_updated: 300,
+      time_compacting: null,
+      time_archived: null,
+      workspace_id: null,
+    },
+  });
+  writer.close();
+
+  expect(result).toBe("applied");
+  expect(countRows(dbPath, "session")).toBe(1);
+});

@@ -43,6 +43,12 @@ type SessionSyncOptions = {
   skipDeletions?: boolean;
   /** Don't advance lastPushedRowTime (startup recent push must not skip older local rows). */
   freezePushCursor?: boolean;
+  /**
+   * Restrict message/part/todo scans to sessions updated since the
+   * cursor (startup path). Avoids a full scan of the unindexed
+   * `time_updated` column on the largest tables.
+   */
+  sessionScoped?: boolean;
 };
 
 /**
@@ -464,7 +470,9 @@ export class SessionSync {
     // Stream rows from every kind. Generator yields one envelope at a
     // time, so peak memory is roughly PUSH_BATCH_SIZE envelopes plus
     // whatever bun:sqlite buffers internally for the active statement.
-    for (const env of this.dbReader.iterateAllEnvelopes(since, this.machineId)) {
+    for (const env of this.dbReader.iterateAllEnvelopes(since, this.machineId, {
+      sessionScoped: options.sessionScoped === true,
+    })) {
       pendingBatch.push(env);
       totalSeen++;
       if (env.time_updated > maxCheckedLiveTime) maxCheckedLiveTime = env.time_updated;
@@ -611,6 +619,16 @@ export class SessionSync {
       if (seqCursor === "recent") this.stateManager.updateRecentSeq(seq);
       else this.stateManager.updateSeq(seq);
     };
+    const rewound = this.stateManager.rewindForSchemaChange((kind) =>
+      this.dbWriter.schemaSignature(kind),
+    );
+    if (rewound.length > 0) {
+      this.log("local schema changed; rewinding pull cursor to re-fetch incompatible rows", {
+        kinds: rewound,
+        lastPulledSeq: this.stateManager.state.lastPulledSeq,
+      });
+    }
+
     let lookaheadPages = 0;
     let fetchSince = readSeq();
     let cycleBlocked = false;
@@ -742,6 +760,25 @@ export class SessionSync {
         }
 
         const { result, thrownError, firstAttemptError } = outcome;
+
+        if (result === "incompatible") {
+          this.log("skipping envelope incompatible with local schema", {
+            kind: envelope.kind,
+            id: envelope.id,
+            server_seq: envelope.server_seq,
+          });
+          const schema = this.dbWriter.schemaSignature(envelope.kind);
+          if (schema !== null) {
+            this.stateManager.recordIncompatible(envelope.kind, envelope.server_seq, schema);
+          }
+          if (envelopeKey in this.stateManager.state.pullErrorCounts) {
+            this.stateManager.clearPullErrorCount(envelopeKey);
+          }
+          if (firstErrorSeq === null) {
+            lastGoodSeq = Math.max(lastGoodSeq, Math.min(envelope.server_seq, pageCursorSeq));
+          }
+          continue;
+        }
 
         if (result === "applied" || result === "skipped") {
           const rowKey = rowStateKey(envelope.kind, envelope.id);
@@ -979,6 +1016,7 @@ export class SessionSync {
       since: cutoff,
       skipDeletions: true,
       freezePushCursor: true,
+      sessionScoped: true,
     });
   }
 
@@ -1034,8 +1072,40 @@ export class SessionSync {
    * `currentEnvelopes` set. Otherwise an old, unchanged row would be
    * absent from the delta and we'd falsely tombstone it.
    */
+  /**
+   * opencode migrated `permission` from one blob row per project (PK
+   * `project_id`) to one row per rule (PK `id`). Once the local table
+   * has an `id` column, `readAllRowKeys` emits `permission:<id>` keys,
+   * so every pre-migration `permission:<project_id>` entry in
+   * `knownRows` would look like a deletion and be tombstoned on the
+   * server — which deletes the legacy rows on peers still running the
+   * old schema. Those entries are stale bookkeeping, not user
+   * deletions: drop them from `knownRows` instead. A key is classified
+   * as legacy when its id is a project id (new-schema rule ids never
+   * collide with project ids).
+   */
+  private forgetLegacyPermissionKeys(liveKeys: Set<string>): void {
+    if (!this.dbReader.permissionUsesIdKey()) return;
+    const knownRows = this.stateManager.state.knownRows;
+    const legacy: string[] = [];
+    for (const rowKey of Object.keys(knownRows)) {
+      if (!rowKey.startsWith("permission:") || liveKeys.has(rowKey)) continue;
+      const projectKey = `project:${rowKey.slice("permission:".length)}`;
+      if (liveKeys.has(projectKey) || projectKey in knownRows) legacy.push(rowKey);
+    }
+    if (legacy.length === 0) return;
+    this.log("forgetting legacy project-keyed permission rows after schema migration", {
+      count: legacy.length,
+      sample: legacy.slice(0, 10),
+    });
+    this.stateManager.forgetRows(legacy);
+    this.stateManager.removePendingTombstones(legacy);
+    for (const rowKey of legacy) this.expectedDeletions.delete(rowKey);
+  }
+
   private async buildDeletionEnvelopes(): Promise<SyncEnvelope[] | null> {
     const liveKeys = this.dbReader.readAllRowKeys();
+    this.forgetLegacyPermissionKeys(liveKeys);
     const knownRows = this.stateManager.state.knownRows;
     const knownSize = Object.keys(knownRows).length;
 

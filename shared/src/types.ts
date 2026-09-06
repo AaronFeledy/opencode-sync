@@ -17,6 +17,7 @@ export interface Project {
   time_initialized: number | null;
   sandboxes: string; // JSON
   commands: string | null; // JSON
+  icon_url_override?: string | null;
 }
 
 export interface Session {
@@ -39,6 +40,16 @@ export interface Session {
   time_compacting: number | null;
   time_archived: number | null;
   workspace_id: string | null;
+  path?: string | null;
+  agent?: string | null;
+  model?: string | null;
+  cost?: number;
+  tokens_input?: number;
+  tokens_output?: number;
+  tokens_reasoning?: number;
+  tokens_cache_read?: number;
+  tokens_cache_write?: number;
+  metadata?: string | null;
 }
 
 export interface Message {
@@ -68,12 +79,21 @@ export interface Todo {
   time_updated: number;
 }
 
-export interface Permission {
-  project_id: string;
-  time_created: number;
-  time_updated: number;
-  data: string; // JSON blob
-}
+export type Permission =
+  | {
+      id: string;
+      project_id: string;
+      action: string;
+      resource: string;
+      time_created: number;
+      time_updated: number;
+    }
+  | {
+      project_id: string;
+      time_created: number;
+      time_updated: number;
+      data: string;
+    };
 
 export interface SessionShare {
   session_id: string;
@@ -119,6 +139,7 @@ export function rowPrimaryKey(kind: SyncKind, row: Record<string, unknown>): str
     return `${row.session_id}:${row.position}`;
   }
   if (kind === "permission") {
+    if (typeof row.id === "string" && row.id.length > 0) return row.id;
     return row.project_id as string;
   }
   if (kind === "session_share") {

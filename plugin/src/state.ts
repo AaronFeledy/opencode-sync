@@ -7,7 +7,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Database } from "bun:sqlite";
-import type { FileManifestEntry, SyncKind } from "@opencode-sync/shared";
+import { SYNC_KINDS, type FileManifestEntry, type SyncKind } from "@opencode-sync/shared";
 import { logger } from "./logger.js";
 
 /**
@@ -142,6 +142,16 @@ export interface SyncState {
    * stored. See FINDINGS.md M1.
    */
   rowParents: Record<string, string>;
+  /**
+   * Per-kind low-water mark of envelopes skipped as `incompatible`
+   * (remote row needs columns the local table lacks — opencode on this
+   * machine is older than the peer that pushed). The pull cursor moves
+   * past them so an old peer doesn't stall, but the server never
+   * re-sends rows below the cursor. `schema` is the local table
+   * signature at skip time; when it changes (opencode upgraded), the
+   * cursors rewind to `server_seq - 1` so the rows are fetched again.
+   */
+  incompatibleSince: Partial<Record<SyncKind, { server_seq: number; schema: string }>>;
 }
 
 /** JSON-serialisable representation of SyncState */
@@ -165,6 +175,7 @@ interface SyncStateJson {
     lastError?: string;
   }>;
   rowParents?: Record<string, string>;
+  incompatibleSince?: Partial<Record<SyncKind, { server_seq: number; schema: string }>>;
 }
 
 /**
@@ -236,6 +247,7 @@ export class StateManager {
       pullErrorCounts: {},
       poisonedEnvelopes: [],
       rowParents: {},
+      incompatibleSince: {},
     };
   }
 
@@ -636,6 +648,43 @@ export class StateManager {
     return this._poisonKeys.has(`${kind}:${id}:${serverSeq}`);
   }
 
+  recordIncompatible(kind: SyncKind, serverSeq: number, schema: string): void {
+    const existing = this._state.incompatibleSince[kind];
+    if (existing && existing.schema === schema && existing.server_seq <= serverSeq) return;
+    this._state.incompatibleSince[kind] = {
+      server_seq: existing && existing.schema === schema
+        ? Math.min(existing.server_seq, serverSeq)
+        : serverSeq,
+      schema,
+    };
+    this.maybeSave();
+  }
+
+  /**
+   * Rewind both pull cursors to just before the oldest `incompatible`
+   * envelope of any kind whose local table schema has changed since the
+   * skip. Returns the kinds that triggered a rewind.
+   */
+  rewindForSchemaChange(currentSchema: (kind: SyncKind) => string | null): SyncKind[] {
+    const rewound: SyncKind[] = [];
+    let floor = Number.POSITIVE_INFINITY;
+    for (const [kind, entry] of Object.entries(this._state.incompatibleSince) as Array<
+      [SyncKind, { server_seq: number; schema: string }]
+    >) {
+      const schema = currentSchema(kind);
+      if (schema === null || schema === entry.schema) continue;
+      floor = Math.min(floor, entry.server_seq - 1);
+      rewound.push(kind);
+      delete this._state.incompatibleSince[kind];
+    }
+    if (rewound.length === 0) return rewound;
+    floor = Math.max(0, floor);
+    this._state.lastPulledSeq = Math.min(this._state.lastPulledSeq, floor);
+    this._state.lastRecentPulledSeq = Math.min(this._state.lastRecentPulledSeq, floor);
+    this.maybeSave();
+    return rewound;
+  }
+
   getKnownTime(rowKey: string): number | undefined {
     if (this._heavyLoaded || !this._db) return this._state.knownRows[rowKey];
     const row = this._db.prepare<{ time_updated: number }, [string]>(
@@ -706,6 +755,10 @@ export class StateManager {
     this._lastDeletionReconcileAt = Number(meta("lastDeletionReconcileAt") ?? 0) || 0;
     const fp = meta("dbFingerprint");
     this._state.dbFingerprint = fp ? this.parseDbFingerprint(JSON.parse(fp)) : null;
+    const incompatible = meta("incompatibleSince");
+    this._state.incompatibleSince = incompatible
+      ? this.parseIncompatibleSince(JSON.parse(incompatible))
+      : {};
 
     this._state.lastPushedRowIds = new Set(
       db.prepare<{ id: string }, []>("SELECT id FROM last_pushed").all().map((row) => row.id),
@@ -761,6 +814,7 @@ export class StateManager {
     upsert.run("lastFileSyncTime", String(this._state.lastFileSyncTime));
     upsert.run("lastDeletionReconcileAt", String(this._lastDeletionReconcileAt));
     upsert.run("dbFingerprint", JSON.stringify(this._state.dbFingerprint));
+    upsert.run("incompatibleSince", JSON.stringify(this._state.incompatibleSince));
   }
 
   private ensureHeavy(): void {
@@ -840,7 +894,26 @@ export class StateManager {
     this._state.pullErrorCounts = this.parsePullErrorCounts(json.pullErrorCounts);
     this._state.poisonedEnvelopes = this.parsePoisonedEnvelopes(json.poisonedEnvelopes);
     this._state.rowParents = this.parseRowParents(json.rowParents);
+    this._state.incompatibleSince = this.parseIncompatibleSince(json.incompatibleSince);
     this.rebuildPoisonKeys();
+  }
+
+  private parseIncompatibleSince(
+    value: unknown,
+  ): Partial<Record<SyncKind, { server_seq: number; schema: string }>> {
+    if (!value || typeof value !== "object") return {};
+    const out: Partial<Record<SyncKind, { server_seq: number; schema: string }>> = {};
+    for (const [kind, raw] of Object.entries(value as Record<string, unknown>)) {
+      if (!(SYNC_KINDS as readonly string[]).includes(kind)) continue;
+      if (!raw || typeof raw !== "object") continue;
+      const e = raw as Record<string, unknown>;
+      const serverSeq = e["server_seq"];
+      const schema = e["schema"];
+      if (typeof serverSeq !== "number" || !Number.isFinite(serverSeq)) continue;
+      if (typeof schema !== "string") continue;
+      out[kind as SyncKind] = { server_seq: serverSeq, schema };
+    }
+    return out;
   }
 
   private parseKnownRows(value: unknown): Record<string, number> {

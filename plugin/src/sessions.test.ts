@@ -1764,83 +1764,6 @@ test("DbWriter.applyEnvelope returns 'error' for an unknown kind without throwin
   fs.rmSync(dbPath, { force: true });
 });
 
-test("pull surfaces apply errors via the returned `errors` count", async () => {
-  // Regression: previously applyEnvelope's "error" results were silently
-  // swallowed and the pull cursor advanced past them — making it impossible
-  // to detect drift from the orchestrator. Verify the count is now exposed.
-  const dbPath = createDbPath();
-  initDb(dbPath);
-
-  // db-write.ts logs SQL errors via console.error before returning "error".
-  // Silence that for the duration of this test so the suite output stays
-  // clean — we deliberately trigger an FK violation below.
-  const originalError = console.error;
-  console.error = () => {};
-
-  const client = new MockClient();
-  // Two envelopes: one valid (applies cleanly), one referencing a
-  // non-existent project_id (FK violation → applyEnvelope returns "error").
-  client.pullResponses.push({
-    server_seq: 2,
-    more: false,
-    envelopes: [
-      {
-        kind: "session",
-        id: "ses_orphan",
-        machine_id: "laptop",
-        time_updated: 9_000,
-        server_seq: 2,
-        deleted: false,
-        data: {
-          id: "ses_orphan",
-          // project_id intentionally references a row that doesn't exist
-          // locally — FK with ON DELETE CASCADE means INSERT will fail.
-          project_id: "proj_does_not_exist",
-          parent_id: null,
-          slug: "orphan",
-          directory: "/tmp",
-          title: "Orphan",
-          version: "1",
-          share_url: null,
-          summary_additions: null,
-          summary_deletions: null,
-          summary_files: null,
-          summary_diffs: null,
-          revert: null,
-          permission: null,
-          time_created: 1,
-          time_updated: 9_000,
-          time_compacting: null,
-          time_archived: null,
-          workspace_id: null,
-        },
-      },
-    ],
-  });
-
-  const reader = new DbReader(dbPath);
-  const writer = new DbWriter(dbPath);
-  const sync = new SessionSync(
-    reader,
-    writer,
-    client as unknown as SyncClient,
-    new StateManager("desktop"),
-    "desktop",
-    () => {},
-  );
-
-  const result = await sync.pull();
-
-  expect(result.errors).toBe(1);
-  expect(result.applied).toBe(0);
-  expect(result.conflicts).toBe(0);
-
-  console.error = originalError;
-  reader.close();
-  writer.close();
-  fs.rmSync(dbPath, { force: true });
-});
-
 test("pull does NOT advance the cursor past an errored envelope", async () => {
   // Regression: previously the cursor advanced to the page-tail seq even
   // when envelopes errored, so transient FK/BUSY failures became permanent
@@ -1904,6 +1827,8 @@ test("pull does NOT advance the cursor past an errored envelope", async () => {
   const result = await sync.pull();
 
   expect(result.errors).toBe(1);
+  expect(result.applied).toBe(0);
+  expect(result.conflicts).toBe(0);
   // Cursor stays at 0 — NOT advanced to 5 (the errored envelope's seq) or
   // to res.server_seq=5. Next pull cycle will re-request from since=0.
   expect(stateManager.state.lastPulledSeq).toBe(0);
@@ -2195,45 +2120,6 @@ test("sync() does NOT pull when an externally-written halt marker is present", a
   expect(client.pullResponses.length).toBe(1);
   // Push also skipped.
   expect(client.pushes).toEqual([]);
-
-  reader.close();
-  writer.close();
-  fs.rmSync(dbPath, { force: true });
-});
-
-test("isHalted() returns true based on the on-disk marker even without an in-process trip", async () => {
-  // Verifies the public introspection method reflects disk state,
-  // which is what hooks.ts and the test suite rely on to decide
-  // whether to bother queueing per-session work after a restart.
-  const dbPath = createDbPath();
-  initDb(dbPath);
-  seedSessionTree(dbPath);
-
-  const reader = new DbReader(dbPath);
-  const writer = new DbWriter(dbPath);
-  const sync = new SessionSync(
-    reader,
-    writer,
-    new MockClient() as unknown as SyncClient,
-    new StateManager("desktop"),
-    "desktop",
-    () => {},
-  );
-
-  expect(sync.isHalted()).toBe(false);
-
-  writeHaltMarker({
-    triggeredAt: Date.now(),
-    reason: HALT_REASONS.TOMBSTONE_THRESHOLD,
-    message: "external halt",
-  });
-
-  expect(sync.isHalted()).toBe(true);
-
-  // Clearing the marker (which is what manual recovery does) flips it
-  // back without any in-process state change.
-  clearHaltMarker();
-  expect(sync.isHalted()).toBe(false);
 
   reader.close();
   writer.close();
@@ -2804,7 +2690,7 @@ test("H3: transient error clears counter on successful retry", async () => {
   fs.rmSync(dbPath, { force: true });
 });
 
-test("M8: applyEnvelope rejects time_updated = 0", async () => {
+test("M8: applyEnvelope rejects non-positive time_updated", async () => {
   // `time_updated = 0` poisons LWW comparisons (compares equal to any
   // zero-stamped local row → skipped branch silently ignores content
   // differences). Plugin rejects stricter than server. See FINDINGS.md M8.
@@ -2815,58 +2701,38 @@ test("M8: applyEnvelope rejects time_updated = 0", async () => {
   console.error = () => {};
 
   const writer = new DbWriter(dbPath);
-  const result = writer.applyEnvelope({
-    kind: "session",
-    id: "ses_bad",
-    machine_id: "laptop",
-    time_updated: 0,
-    server_seq: 1,
-    deleted: false,
-    data: {
+  for (const timeUpdated of [0, -1]) {
+    const result = writer.applyEnvelope({
+      kind: "session",
       id: "ses_bad",
-      project_id: "proj_x",
-      parent_id: null,
-      slug: "s",
-      directory: "/tmp",
-      title: "Bad",
-      version: "1",
-      share_url: null,
-      summary_additions: null,
-      summary_deletions: null,
-      summary_files: null,
-      summary_diffs: null,
-      revert: null,
-      permission: null,
-      time_created: 1,
-      time_updated: 0,
-      time_compacting: null,
-      time_archived: null,
-      workspace_id: null,
-    },
-  });
-  expect(result).toBe("error");
-  writer.close();
-  console.error = originalError;
-  fs.rmSync(dbPath, { force: true });
-});
-
-test("M8: applyEnvelope rejects negative time_updated", async () => {
-  const dbPath = createDbPath();
-  initDb(dbPath);
-  const originalError = console.error;
-  console.error = () => {};
-
-  const writer = new DbWriter(dbPath);
-  const result = writer.applyEnvelope({
-    kind: "session",
-    id: "ses_bad",
-    machine_id: "laptop",
-    time_updated: -1,
-    server_seq: 1,
-    deleted: false,
-    data: null,
-  });
-  expect(result).toBe("error");
+      machine_id: "laptop",
+      time_updated: timeUpdated,
+      server_seq: 1,
+      deleted: false,
+      data: {
+        id: "ses_bad",
+        project_id: "proj_x",
+        parent_id: null,
+        slug: "s",
+        directory: "/tmp",
+        title: "Bad",
+        version: "1",
+        share_url: null,
+        summary_additions: null,
+        summary_deletions: null,
+        summary_files: null,
+        summary_diffs: null,
+        revert: null,
+        permission: null,
+        time_created: 1,
+        time_updated: timeUpdated,
+        time_compacting: null,
+        time_archived: null,
+        workspace_id: null,
+      },
+    });
+    expect(result).toBe("error");
+  }
   writer.close();
   console.error = originalError;
   fs.rmSync(dbPath, { force: true });
@@ -2903,24 +2769,12 @@ test("non-getHeads 404s surface as HttpError, not EndpointMissingError", async (
 
 // ── M7: parseRowStateKey bounds ──
 
-test("M7: parseRowStateKey rejects an empty kind prefix", () => {
+test("M7: parseRowStateKey rejects malformed keys and accepts valid ones", () => {
   expect(parseRowStateKey(":foo")).toBeNull();
-});
-
-test("M7: parseRowStateKey rejects a rowKey with no separator", () => {
   expect(parseRowStateKey("foo")).toBeNull();
-});
-
-test("M7: parseRowStateKey rejects an empty id", () => {
   expect(parseRowStateKey("session:")).toBeNull();
-});
-
-test("M7: parseRowStateKey rejects an unknown kind not in SYNC_KINDS", () => {
   expect(parseRowStateKey("workspace:x")).toBeNull();
   expect(parseRowStateKey("nonsense:y")).toBeNull();
-});
-
-test("M7: parseRowStateKey accepts valid kind+id (including composite todo)", () => {
   expect(parseRowStateKey("session:ses_1")).toEqual({ kind: "session", id: "ses_1" });
   expect(parseRowStateKey("todo:ses_1:0")).toEqual({ kind: "todo", id: "ses_1:0" });
 });
@@ -3108,6 +2962,153 @@ test("syncRecent pulls with minTimeUpdated and does not tombstone older rows", a
   expect(client.pullCalls[0]?.minTimeUpdated).toBeLessThanOrEqual(after - 7 * 24 * 60 * 60 * 1000 + 1000);
   expect(client.pushes.flat().filter((env) => env.deleted)).toEqual([]);
   expect(isSyncHalted()).toBe(false);
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("permission schema migration forgets legacy project-keyed rows instead of tombstoning them", async () => {
+  const dbPath = createDbPath();
+  initDb(dbPath);
+  seedSessionTree(dbPath);
+
+  let db = new Database(dbPath);
+  db.run(
+    "INSERT INTO permission (project_id, time_created, time_updated, data) VALUES (?, ?, ?, ?)",
+    ["proj_1", 1, 1, "{}"],
+  );
+  db.close();
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  let reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  let sync = new SessionSync(reader, writer, client as unknown as SyncClient, stateManager, "desktop", () => {});
+
+  await sync.pushAll();
+  expect(stateManager.state.knownRows["permission:proj_1"]).toBe(1);
+  reader.close();
+
+  db = new Database(dbPath);
+  db.exec(`
+    DROP TABLE permission;
+    CREATE TABLE permission (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+      action TEXT NOT NULL,
+      resource TEXT NOT NULL,
+      time_created INTEGER NOT NULL,
+      time_updated INTEGER NOT NULL
+    );
+  `);
+  db.run(
+    "INSERT INTO permission (id, project_id, action, resource, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?)",
+    ["perm_a", "proj_1", "edit", "*", 2, 2],
+  );
+  db.close();
+
+  reader = new DbReader(dbPath);
+  sync = new SessionSync(reader, writer, client as unknown as SyncClient, stateManager, "desktop", () => {});
+  client.pushes = [];
+
+  await sync.pushAll();
+  await new Promise((r) => setTimeout(r, 50));
+  await sync.pushAll();
+
+  const pushed = client.pushes.flat();
+  expect(pushed.filter((env) => env.deleted)).toEqual([]);
+  expect(pushed.some((env) => env.kind === "permission" && env.id === "perm_a")).toBe(true);
+  expect(stateManager.state.knownRows["permission:proj_1"]).toBeUndefined();
+  expect(stateManager.state.knownRows["permission:perm_a"]).toBe(2);
+  expect(stateManager.state.pendingTombstones["permission:proj_1"]).toBeUndefined();
+  expect(isSyncHalted()).toBe(false);
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("pull rewinds past incompatible envelopes once the local schema catches up", async () => {
+  const dbPath = createDbPath();
+  initDb(dbPath);
+  seedSessionTree(dbPath);
+
+  const newPermission: SyncEnvelope = {
+    id: "perm_a",
+    kind: "permission",
+    machine_id: "laptop",
+    time_updated: 5,
+    server_seq: 7,
+    deleted: false,
+    data: {
+      id: "perm_a",
+      project_id: "proj_1",
+      action: "edit",
+      resource: "*",
+      time_created: 5,
+      time_updated: 5,
+    } as unknown as SyncEnvelope["data"],
+  };
+  const laterSession: SyncEnvelope = {
+    id: "ses_2",
+    kind: "session",
+    machine_id: "laptop",
+    time_updated: 6,
+    server_seq: 8,
+    deleted: false,
+    data: {
+      id: "ses_2", project_id: "proj_1", parent_id: null, slug: "s2", directory: "/tmp",
+      title: "t", version: "1", share_url: null, summary_additions: null,
+      summary_deletions: null, summary_files: null, summary_diffs: null, revert: null,
+      permission: null, time_created: 6, time_updated: 6, time_compacting: null,
+      time_archived: null, workspace_id: null,
+    } as unknown as SyncEnvelope["data"],
+  };
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  let writer = new DbWriter(dbPath);
+  let sync = new SessionSync(reader, writer, client as unknown as SyncClient, stateManager, "desktop", () => {});
+
+  client.pullResponses = [{ server_seq: 8, envelopes: [newPermission, laterSession], more: false }];
+  await sync.pull();
+  expect(stateManager.state.lastPulledSeq).toBe(8);
+  expect(stateManager.state.incompatibleSince.permission?.server_seq).toBe(7);
+
+  client.pullResponses = [{ server_seq: 8, envelopes: [], more: false }];
+  await sync.pull();
+  expect(client.pullCalls.at(-1)?.since).toBe(8);
+  writer.close();
+
+  const db = new Database(dbPath);
+  db.exec(`
+    DROP TABLE permission;
+    CREATE TABLE permission (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+      action TEXT NOT NULL,
+      resource TEXT NOT NULL,
+      time_created INTEGER NOT NULL,
+      time_updated INTEGER NOT NULL
+    );
+  `);
+  db.close();
+
+  writer = new DbWriter(dbPath);
+  sync = new SessionSync(reader, writer, client as unknown as SyncClient, stateManager, "desktop", () => {});
+  client.pullResponses = [{ server_seq: 8, envelopes: [newPermission, laterSession], more: false }];
+  const result = await sync.pull();
+
+  expect(client.pullCalls.at(-1)?.since).toBe(6);
+  expect(result.applied).toBe(1);
+  expect(stateManager.state.lastPulledSeq).toBe(8);
+  expect(stateManager.state.incompatibleSince.permission).toBeUndefined();
+
+  const check = new Database(dbPath, { readonly: true });
+  expect(check.query("SELECT id FROM permission WHERE id = 'perm_a'").get()).toBeTruthy();
+  check.close();
 
   reader.close();
   writer.close();

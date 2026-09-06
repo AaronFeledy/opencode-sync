@@ -105,6 +105,7 @@ export type LegacyMigrateOptions = {
 };
 
 const LEGACY_MIGRATE_CURSOR_KEY = "legacy_migrate_rowid";
+const LEGACY_MIGRATE_DONE_KEY = "legacy_migrate_done";
 const DEFAULT_MIN_FREE_BYTES = 1024 * 1024 * 1024;
 
 function isNoSpaceError(err: unknown): boolean {
@@ -633,6 +634,9 @@ export class LedgerDB {
   }
 
   async migrateLegacyPayloads(opts: LegacyMigrateOptions = {}): Promise<LegacyMigrateResult> {
+    if (this.isLegacyMigrateDone()) {
+      return { migrated: 0, done: true };
+    }
     type LegacyRow = SyncRow & { rowid: number };
     const batchSize = opts.batchSize && opts.batchSize > 0 ? opts.batchSize : 50;
     const maxRows = opts.maxRows && opts.maxRows > 0 ? opts.maxRows : Number.POSITIVE_INFINITY;
@@ -663,6 +667,7 @@ export class LedgerDB {
       const rows = stmt.all(afterRowid, batchSize);
       if (rows.length === 0) {
         this.stmtSetState.run(LEGACY_MIGRATE_CURSOR_KEY, "0");
+        this.stmtSetState.run(LEGACY_MIGRATE_DONE_KEY, "1");
         if (migrated > 0) {
           this.reclaimFreelist();
           this.logger.info("migrated legacy row payloads to compressed blobs", { migrated });
@@ -723,6 +728,11 @@ export class LedgerDB {
       }
       persistCursor();
     }
+  }
+
+  private isLegacyMigrateDone(): boolean {
+    const row = this.stmtGetState.get(LEGACY_MIGRATE_DONE_KEY);
+    return row?.v === "1";
   }
 
   private readMigrateCursor(): number {

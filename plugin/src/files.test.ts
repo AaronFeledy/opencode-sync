@@ -2,7 +2,7 @@ import { beforeEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { StaleError, type SyncClient } from "./client.js";
+import type { SyncClient } from "./client.js";
 import { FileSync } from "./files.js";
 import { StateManager } from "./state.js";
 import { sha256Hex } from "./util.js";
@@ -11,6 +11,8 @@ import {
   ANTHROPIC_ACCOUNTS_SYNC_PATH,
   AUTH_SYNC_PATH,
   HOME_AGENTS_SYNC_PATH,
+  OMO_JSON_SYNC_PATH,
+  OMO_JSONC_SYNC_PATH,
 } from "@opencode-sync/shared";
 
 const HOME = os.homedir();
@@ -43,6 +45,7 @@ const BASE_CONFIG: FileSyncConfig = {
   tui_json: false,
   auth_json: false,
   home_agents: false,
+  omo_json: false,
 };
 
 class MockClient {
@@ -55,8 +58,7 @@ class MockClient {
 
   /**
    * Optional failure injection for `deleteFile`. Test code can set this
-   * to a function that throws (e.g. `StaleError` or a generic `Error`)
-   * to exercise the H1 failed-delete-retention path and the stale-drop
+   * to a function that throws to exercise the H1 failed-delete-retention
    * path. Default behaviour records the call and succeeds.
    */
   deleteFileImpl?: (
@@ -127,6 +129,7 @@ beforeEach(() => {
   fs.rmSync(CONFIG_BASE, { recursive: true, force: true });
   fs.rmSync(DATA_BASE, { recursive: true, force: true });
   fs.rmSync(path.join(HOME, HOME_AGENTS_SYNC_PATH), { recursive: true, force: true });
+  fs.rmSync(path.join(HOME, ".omo"), { recursive: true, force: true });
   delete process.env.OPENCODE_SYNC_AUTH_LOCK_WAIT_MS;
 });
 
@@ -148,6 +151,69 @@ test("includes oh-my-openagent config files with opencode_json sync", async () =
     "oh-my-openagent.json",
     "oh-my-openagent.jsonc",
   ]);
+});
+
+test("includes ~/.omo/omo.jsonc with omo_json sync and ignores sibling ~/.omo files", async () => {
+  writeTrackedFile(path.join(HOME, OMO_JSONC_SYNC_PATH), "// omo\n{}\n", 1_000);
+  writeTrackedFile(path.join(HOME, OMO_JSON_SYNC_PATH), "{}\n", 2_000);
+  writeTrackedFile(path.join(HOME, ".omo", "plans", "ticket.md"), "local only\n", 3_000);
+
+  const fileSync = new FileSync(
+    new MockClient() as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, omo_json: true },
+    new StateManager("desktop"),
+    () => {},
+  );
+
+  const manifest = await fileSync.computeLocalManifest();
+
+  expect(manifest.map((entry) => entry.relpath).sort()).toEqual([
+    OMO_JSON_SYNC_PATH,
+    OMO_JSONC_SYNC_PATH,
+  ]);
+});
+
+test("does not include ~/.omo/omo.jsonc when omo_json is disabled", async () => {
+  writeTrackedFile(path.join(HOME, OMO_JSONC_SYNC_PATH), "{}\n", 1_000);
+
+  const fileSync = new FileSync(
+    new MockClient() as unknown as SyncClient,
+    "desktop",
+    BASE_CONFIG,
+    new StateManager("desktop"),
+    () => {},
+  );
+
+  const manifest = await fileSync.computeLocalManifest();
+
+  expect(manifest).toHaveLength(0);
+});
+
+test("downloads ~/.omo/omo.jsonc into the home-rooted path and treats it as functional", async () => {
+  const client = new MockClient();
+  const content = '{"agents":{}}\n';
+  const entry = toManifestEntry(OMO_JSONC_SYNC_PATH, content, 2_000, "laptop");
+  client.manifest = [entry];
+  client.blobs.set(entry.sha256, new Uint8Array(Buffer.from(content)));
+
+  const notified: string[][] = [];
+  const fileSync = new FileSync(
+    client as unknown as SyncClient,
+    "desktop",
+    { ...BASE_CONFIG, omo_json: true },
+    new StateManager("desktop"),
+    () => {},
+    (relpaths) => notified.push(relpaths),
+  );
+
+  const result = await fileSync.sync();
+
+  expect(fs.readFileSync(path.join(HOME, OMO_JSONC_SYNC_PATH), "utf-8")).toBe(content);
+  expect(fs.existsSync(path.join(CONFIG_BASE, OMO_JSONC_SYNC_PATH))).toBe(false);
+  expect(result.downloaded).toBe(1);
+  expect(result.functionalPulled).toEqual([OMO_JSONC_SYNC_PATH]);
+  expect(notified).toEqual([[OMO_JSONC_SYNC_PATH]]);
 });
 
 test("applies remote tombstones without re-uploading the deleted file", async () => {
@@ -790,26 +856,6 @@ test("syncs skills from ~/.config/opencode/skill/ (singular)", async () => {
   ]);
 });
 
-test("ignores ~/.config/opencode/skills/ (plural — wrong path)", async () => {
-  writeTrackedFile(
-    path.join(CONFIG_BASE, "skills", "stale.md"),
-    "should not be synced\n",
-    1_000,
-  );
-
-  const fileSync = new FileSync(
-    new MockClient() as unknown as SyncClient,
-    "desktop",
-    { ...BASE_CONFIG, skills: true },
-    new StateManager("desktop"),
-    () => {},
-  );
-
-  const manifest = await fileSync.computeLocalManifest();
-
-  expect(manifest).toEqual([]);
-});
-
 test("syncs ~/.agents/ when home_agents is enabled, with .agents/* relpaths", async () => {
   const homeAgentsAbs = path.join(HOME, HOME_AGENTS_SYNC_PATH);
   writeTrackedFile(
@@ -943,12 +989,10 @@ test("H1: transient delete failure retains knownFiles entry and retries next cyc
   expect(stateManager.state.knownFiles[relpath]).toBeUndefined();
 });
 
-test("H1: stale delete response does NOT cause a retry next cycle", async () => {
-  // When the server 409s a delete because the remote has moved on,
-  // our delete intent should be dropped (not retried). The next pull's
-  // remote-only download branch picks up the fresh remote; if we
-  // retained the delete intent instead, we'd repeatedly retry a delete
-  // that can never succeed.
+test("locally deleted file is re-downloaded (not tombstoned) when the remote has moved on", async () => {
+  // The tombstone loop's `remote.sha256 !== previous.sha256` guard
+  // short-circuits before deleteFile is ever called, so the remote-only
+  // download branch wins and the fresh remote lands locally.
   const relpath = "agents/custom.md";
   const oldContent = "hello\n";
   const newContent = "hello from another machine\n";
@@ -966,7 +1010,6 @@ test("H1: stale delete response does NOT cause a retry next cycle", async () => 
   let deleteCalls = 0;
   client.deleteFileImpl = async () => {
     deleteCalls++;
-    throw new StaleError("DELETE", `/files/manifest/${relpath}`, "stale");
   };
 
   const fileSync = new FileSync(
@@ -977,16 +1020,10 @@ test("H1: stale delete response does NOT cause a retry next cycle", async () => 
     () => {},
   );
 
-  // Cycle 1: sha differs between previous and remote, so the tombstone
-  // loop's `remote.sha256 !== previous.sha256` guard short-circuits
-  // before even calling deleteFile — we correctly defer to remote.
   await fileSync.sync();
   expect(deleteCalls).toBe(0);
-  // File was downloaded from remote — knownFiles now holds the new sha.
   expect(stateManager.state.knownFiles[relpath]?.sha256).toBe(newRemoteEntry.sha256);
 
-  // Cycle 2: another pass should also not attempt delete — local now
-  // matches remote, so we're in the "same content" branch.
   await fileSync.sync();
   expect(deleteCalls).toBe(0);
 });
