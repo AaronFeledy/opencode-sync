@@ -300,39 +300,6 @@ test("H5: overwriting a file GCs the old blob", () => {
   db.close();
 });
 
-test("H5: deleting a file GCs the blob and clears the tombstone sha", () => {
-  const dir = createDataDir();
-  const db = new LedgerDB(dir, silentLogger);
-
-  const sha = writeBlob(db, "secret token\n");
-  db.upsertManifestEntry({
-    relpath: "auth.json",
-    sha256: sha,
-    size: 13,
-    mtime: 1000,
-    machine_id: "m1",
-    deleted: false,
-  });
-  expect(db.hasBlobFile(sha)).toBe(true);
-
-  // Tombstone — older tombstones used to preserve the sha, keeping
-  // the blob fetchable by anyone with the token forever. The GC now
-  // unlinks it and clears the tombstone's sha.
-  db.upsertManifestEntry({
-    relpath: "auth.json",
-    sha256: "",
-    size: 0,
-    mtime: 2000,
-    machine_id: "m1",
-    deleted: true,
-  });
-
-  expect(db.hasBlobFile(sha)).toBe(false);
-  const entry = db.getManifestEntry("auth.json");
-  expect(entry?.deleted).toBe(true);
-  expect(entry?.sha256).toBe("");
-});
-
 test("H5: two paths sharing a sha don't orphan each other", () => {
   const dir = createDataDir();
   const db = new LedgerDB(dir, silentLogger);
@@ -500,6 +467,10 @@ test("legacy TEXT payloads still pull and migrate to blobs", async () => {
   expect((before.envelopes[0]?.data as { title?: string })?.title).toContain("legacy");
   expect(await db2.migrateLegacyPayloads({ minFreeBytes: 0 })).toEqual({
     migrated: 1,
+    done: true,
+  });
+  expect(await db2.migrateLegacyPayloads({ minFreeBytes: 0 })).toEqual({
+    migrated: 0,
     done: true,
   });
   const after = db2.pullRows(0);

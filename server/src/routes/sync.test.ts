@@ -76,124 +76,39 @@ async function seedRows(db: LedgerDB, envelopes: SyncEnvelope[]): Promise<void> 
 // → undefined → TypeError on each pull. Reject malformed envelopes at the
 // API boundary so the ledger never accepts them.
 
-test("handleSyncPush rejects an envelope with an unknown kind", async () => {
-  const db = new LedgerDB(createDataDir(), silentLogger);
+test("handleSyncPush rejects malformed envelope fields and persists nothing", async () => {
+  const valid = {
+    id: "x",
+    kind: "session",
+    machine_id: "m1",
+    time_updated: 1,
+    server_seq: 0,
+    deleted: false,
+    data: { id: "x" },
+  };
+  const cases: Array<{ patch: Record<string, unknown>; error: RegExp }> = [
+    { patch: { kind: "definitely_not_a_real_kind" }, error: /envelope\.kind/ },
+    { patch: { time_updated: "not a number" }, error: /time_updated/ },
+    { patch: { machine_id: null }, error: /machine_id/ },
+    { patch: { deleted: "true" }, error: /deleted/ },
+  ];
 
-  const res = await handleSyncPush(
-    pushRequest({
-      machine_id: "m1",
-      envelopes: [
-        {
-          id: "x",
-          kind: "definitely_not_a_real_kind",
-          machine_id: "m1",
-          time_updated: 1,
-          server_seq: 0,
-          deleted: false,
-          data: { id: "x" },
-        },
-      ],
-    }),
-    db,
-    silentLogger,
-  );
+  for (const { patch, error } of cases) {
+    const db = new LedgerDB(createDataDir(), silentLogger);
 
-  expect(res.status).toBe(400);
-  const body = (await res.json()) as { error: string };
-  expect(body.error).toMatch(/envelope\.kind/);
+    const res = await handleSyncPush(
+      pushRequest({ machine_id: "m1", envelopes: [{ ...valid, ...patch }] }),
+      db,
+      silentLogger,
+    );
 
-  // Critically: nothing was persisted.
-  const pulled = db.pullRows(0, undefined, 100);
-  expect(pulled.envelopes).toHaveLength(0);
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(error);
+    expect(db.pullRows(0, undefined, 100).envelopes).toHaveLength(0);
 
-  db.close();
-});
-
-test("handleSyncPush rejects envelopes with non-numeric time_updated", async () => {
-  const db = new LedgerDB(createDataDir(), silentLogger);
-
-  const res = await handleSyncPush(
-    pushRequest({
-      machine_id: "m1",
-      envelopes: [
-        {
-          id: "x",
-          kind: "session",
-          machine_id: "m1",
-          time_updated: "not a number",
-          server_seq: 0,
-          deleted: false,
-          data: { id: "x" },
-        },
-      ],
-    }),
-    db,
-    silentLogger,
-  );
-
-  expect(res.status).toBe(400);
-  const body = (await res.json()) as { error: string };
-  expect(body.error).toMatch(/time_updated/);
-
-  db.close();
-});
-
-test("handleSyncPush rejects envelopes with non-string machine_id", async () => {
-  const db = new LedgerDB(createDataDir(), silentLogger);
-
-  const res = await handleSyncPush(
-    pushRequest({
-      machine_id: "m1",
-      envelopes: [
-        {
-          id: "x",
-          kind: "session",
-          machine_id: null,
-          time_updated: 1,
-          server_seq: 0,
-          deleted: false,
-          data: { id: "x" },
-        },
-      ],
-    }),
-    db,
-    silentLogger,
-  );
-
-  expect(res.status).toBe(400);
-  const body = (await res.json()) as { error: string };
-  expect(body.error).toMatch(/machine_id/);
-
-  db.close();
-});
-
-test("handleSyncPush rejects envelopes with non-boolean deleted flag", async () => {
-  const db = new LedgerDB(createDataDir(), silentLogger);
-
-  const res = await handleSyncPush(
-    pushRequest({
-      machine_id: "m1",
-      envelopes: [
-        {
-          id: "x",
-          kind: "session",
-          machine_id: "m1",
-          time_updated: 1,
-          server_seq: 0,
-          deleted: "true",
-          data: { id: "x" },
-        },
-      ],
-    }),
-    db,
-    silentLogger,
-  );
-
-  expect(res.status).toBe(400);
-  const body = (await res.json()) as { error: string };
-  expect(body.error).toMatch(/deleted/);
-
-  db.close();
+    db.close();
+  }
 });
 
 test("handleSyncPull includes later parent dependencies without advancing cursor past the page", async () => {
@@ -413,81 +328,31 @@ test("handleSyncHeads accepts an empty row_keys array (vacuous OK)", async () =>
   db.close();
 });
 
-test("handleSyncHeads rejects an unknown kind", async () => {
-  // Same defence as handleSyncPush: an unknown kind shouldn't make it
-  // into the SQL builder. Reject at the API boundary.
-  const db = new LedgerDB(createDataDir(), silentLogger);
-
-  const res = await handleSyncHeads(
-    headsRequest({
-      machine_id: "m1",
-      row_keys: [{ kind: "definitely_not_a_real_kind", id: "x" }],
-    }),
-    db,
-    silentLogger,
-  );
-
-  expect(res.status).toBe(400);
-  const body = (await res.json()) as { error: string };
-  expect(body.error).toMatch(/kind/);
-
-  db.close();
-});
-
-test("handleSyncHeads rejects a row_keys batch larger than the cap", async () => {
-  // Batch size cap protects against denial-of-service via huge IN-lists
-  // and keeps SQLite parameter usage well under the default
-  // SQLITE_MAX_VARIABLE_NUMBER. Verify the boundary.
-  const db = new LedgerDB(createDataDir(), silentLogger);
-
+test("handleSyncHeads rejects malformed requests", async () => {
+  // Unknown kinds are rejected at the API boundary before reaching the
+  // SQL builder; the batch cap keeps IN-lists under SQLITE_MAX_VARIABLE_NUMBER.
   const oversized = Array.from({ length: 5001 }, (_, i) => ({
     kind: "session",
     id: `ses_${i}`,
   }));
+  const cases: Array<{ body: unknown; error: RegExp }> = [
+    { body: { machine_id: "m1", row_keys: [{ kind: "definitely_not_a_real_kind", id: "x" }] }, error: /kind/ },
+    { body: { machine_id: "m1", row_keys: oversized }, error: /maximum batch/ },
+    { body: { row_keys: [] }, error: /machine_id/ },
+    { body: { machine_id: "m1", row_keys: "not an array" }, error: /row_keys/ },
+  ];
 
-  const res = await handleSyncHeads(
-    headsRequest({ machine_id: "m1", row_keys: oversized }),
-    db,
-    silentLogger,
-  );
+  for (const { body, error } of cases) {
+    const db = new LedgerDB(createDataDir(), silentLogger);
 
-  expect(res.status).toBe(400);
-  const body = (await res.json()) as { error: string };
-  expect(body.error).toMatch(/maximum batch/);
+    const res = await handleSyncHeads(headsRequest(body), db, silentLogger);
 
-  db.close();
-});
+    expect(res.status).toBe(400);
+    const parsed = (await res.json()) as { error: string };
+    expect(parsed.error).toMatch(error);
 
-test("handleSyncHeads rejects missing or non-string machine_id", async () => {
-  const db = new LedgerDB(createDataDir(), silentLogger);
-
-  const res = await handleSyncHeads(
-    headsRequest({ row_keys: [] }),
-    db,
-    silentLogger,
-  );
-
-  expect(res.status).toBe(400);
-  const body = (await res.json()) as { error: string };
-  expect(body.error).toMatch(/machine_id/);
-
-  db.close();
-});
-
-test("handleSyncHeads rejects non-array row_keys", async () => {
-  const db = new LedgerDB(createDataDir(), silentLogger);
-
-  const res = await handleSyncHeads(
-    headsRequest({ machine_id: "m1", row_keys: "not an array" }),
-    db,
-    silentLogger,
-  );
-
-  expect(res.status).toBe(400);
-  const body = (await res.json()) as { error: string };
-  expect(body.error).toMatch(/row_keys/);
-
-  db.close();
+    db.close();
+  }
 });
 
 test("H4: handleSyncPush rejects batches exceeding PUSH_MAX_BATCH", async () => {
