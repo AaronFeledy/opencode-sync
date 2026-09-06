@@ -17,6 +17,7 @@ import type {
   SessionShare,
 } from "@opencode-sync/shared";
 import { rowPrimaryKey } from "@opencode-sync/shared";
+import { quoteIdent, readTableSchema } from "./local-schema.js";
 
 // ── Reader ─────────────────────────────────────────────────────────
 
@@ -69,6 +70,16 @@ export class DbReader {
   // ── Deletion detection ──────────────────────────────────────────
 
   /**
+   * True when the local `permission` table carries an `id` column —
+   * i.e. opencode has migrated permissions from the legacy
+   * `project_id`-keyed blob shape to per-rule rows keyed by `id`.
+   * `rowPrimaryKey` mirrors this: it prefers `id` when present.
+   */
+  permissionUsesIdKey(): boolean {
+    return readTableSchema(this.db, "permission")?.columnNames.has("id") === true;
+  }
+
+  /**
    * Return the set of all live row keys across every synced table, in the
    * `${kind}:${primaryKey}` format used by `state.knownRows`.
    *
@@ -80,12 +91,17 @@ export class DbReader {
   readAllRowKeys(): Set<string> {
     const keys = new Set<string>();
 
+    const permissionSchema = readTableSchema(this.db, "permission");
+    const permissionIdSql = permissionSchema?.columnNames.has("id")
+      ? `SELECT ${quoteIdent("id")} AS id FROM ${quoteIdent("permission")}`
+      : `SELECT ${quoteIdent("project_id")} AS id FROM ${quoteIdent("permission")}`;
+
     const singlePkQueries: Array<[SyncKind, string]> = [
       ["project", "SELECT id FROM project"],
       ["session", "SELECT id FROM session"],
       ["message", "SELECT id FROM message"],
       ["part", "SELECT id FROM part"],
-      ["permission", "SELECT project_id AS id FROM permission"],
+      ["permission", permissionIdSql],
       ["session_share", "SELECT session_id AS id FROM session_share"],
     ];
 

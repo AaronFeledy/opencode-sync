@@ -3113,3 +3113,150 @@ test("syncRecent pulls with minTimeUpdated and does not tombstone older rows", a
   writer.close();
   fs.rmSync(dbPath, { force: true });
 });
+
+test("permission schema migration forgets legacy project-keyed rows instead of tombstoning them", async () => {
+  const dbPath = createDbPath();
+  initDb(dbPath);
+  seedSessionTree(dbPath);
+
+  let db = new Database(dbPath);
+  db.run(
+    "INSERT INTO permission (project_id, time_created, time_updated, data) VALUES (?, ?, ?, ?)",
+    ["proj_1", 1, 1, "{}"],
+  );
+  db.close();
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  let reader = new DbReader(dbPath);
+  const writer = new DbWriter(dbPath);
+  let sync = new SessionSync(reader, writer, client as unknown as SyncClient, stateManager, "desktop", () => {});
+
+  await sync.pushAll();
+  expect(stateManager.state.knownRows["permission:proj_1"]).toBe(1);
+  reader.close();
+
+  db = new Database(dbPath);
+  db.exec(`
+    DROP TABLE permission;
+    CREATE TABLE permission (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+      action TEXT NOT NULL,
+      resource TEXT NOT NULL,
+      time_created INTEGER NOT NULL,
+      time_updated INTEGER NOT NULL
+    );
+  `);
+  db.run(
+    "INSERT INTO permission (id, project_id, action, resource, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?)",
+    ["perm_a", "proj_1", "edit", "*", 2, 2],
+  );
+  db.close();
+
+  reader = new DbReader(dbPath);
+  sync = new SessionSync(reader, writer, client as unknown as SyncClient, stateManager, "desktop", () => {});
+  client.pushes = [];
+
+  await sync.pushAll();
+  await new Promise((r) => setTimeout(r, 50));
+  await sync.pushAll();
+
+  const pushed = client.pushes.flat();
+  expect(pushed.filter((env) => env.deleted)).toEqual([]);
+  expect(pushed.some((env) => env.kind === "permission" && env.id === "perm_a")).toBe(true);
+  expect(stateManager.state.knownRows["permission:proj_1"]).toBeUndefined();
+  expect(stateManager.state.knownRows["permission:perm_a"]).toBe(2);
+  expect(stateManager.state.pendingTombstones["permission:proj_1"]).toBeUndefined();
+  expect(isSyncHalted()).toBe(false);
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
+
+test("pull rewinds past incompatible envelopes once the local schema catches up", async () => {
+  const dbPath = createDbPath();
+  initDb(dbPath);
+  seedSessionTree(dbPath);
+
+  const newPermission: SyncEnvelope = {
+    id: "perm_a",
+    kind: "permission",
+    machine_id: "laptop",
+    time_updated: 5,
+    server_seq: 7,
+    deleted: false,
+    data: {
+      id: "perm_a",
+      project_id: "proj_1",
+      action: "edit",
+      resource: "*",
+      time_created: 5,
+      time_updated: 5,
+    } as unknown as SyncEnvelope["data"],
+  };
+  const laterSession: SyncEnvelope = {
+    id: "ses_2",
+    kind: "session",
+    machine_id: "laptop",
+    time_updated: 6,
+    server_seq: 8,
+    deleted: false,
+    data: {
+      id: "ses_2", project_id: "proj_1", parent_id: null, slug: "s2", directory: "/tmp",
+      title: "t", version: "1", share_url: null, summary_additions: null,
+      summary_deletions: null, summary_files: null, summary_diffs: null, revert: null,
+      permission: null, time_created: 6, time_updated: 6, time_compacting: null,
+      time_archived: null, workspace_id: null,
+    } as unknown as SyncEnvelope["data"],
+  };
+
+  const client = new MockClient();
+  const stateManager = new StateManager("desktop");
+  const reader = new DbReader(dbPath);
+  let writer = new DbWriter(dbPath);
+  let sync = new SessionSync(reader, writer, client as unknown as SyncClient, stateManager, "desktop", () => {});
+
+  client.pullResponses = [{ server_seq: 8, envelopes: [newPermission, laterSession], more: false }];
+  await sync.pull();
+  expect(stateManager.state.lastPulledSeq).toBe(8);
+  expect(stateManager.state.incompatibleSince.permission?.server_seq).toBe(7);
+
+  client.pullResponses = [{ server_seq: 8, envelopes: [], more: false }];
+  await sync.pull();
+  expect(client.pullCalls.at(-1)?.since).toBe(8);
+  writer.close();
+
+  const db = new Database(dbPath);
+  db.exec(`
+    DROP TABLE permission;
+    CREATE TABLE permission (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+      action TEXT NOT NULL,
+      resource TEXT NOT NULL,
+      time_created INTEGER NOT NULL,
+      time_updated INTEGER NOT NULL
+    );
+  `);
+  db.close();
+
+  writer = new DbWriter(dbPath);
+  sync = new SessionSync(reader, writer, client as unknown as SyncClient, stateManager, "desktop", () => {});
+  client.pullResponses = [{ server_seq: 8, envelopes: [newPermission, laterSession], more: false }];
+  const result = await sync.pull();
+
+  expect(client.pullCalls.at(-1)?.since).toBe(6);
+  expect(result.applied).toBe(1);
+  expect(stateManager.state.lastPulledSeq).toBe(8);
+  expect(stateManager.state.incompatibleSince.permission).toBeUndefined();
+
+  const check = new Database(dbPath, { readonly: true });
+  expect(check.query("SELECT id FROM permission WHERE id = 'perm_a'").get()).toBeTruthy();
+  check.close();
+
+  reader.close();
+  writer.close();
+  fs.rmSync(dbPath, { force: true });
+});
