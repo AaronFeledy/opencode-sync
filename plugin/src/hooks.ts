@@ -24,15 +24,16 @@ interface PluginEvent {
 }
 
 /**
- * Extract a non-empty string `sessionId` from an event's properties, or
- * null if absent or the wrong type. Centralises the defensive type
+ * Extract a non-empty string `sessionID` from an event's properties, or
+ * null if absent or the wrong type. opencode puts `sessionID` on every
+ * session, message, part, and todo event. Centralises the defensive type
  * check every event handler would otherwise duplicate — a buggy
- * opencode release that changed `sessionId` to an object or number
+ * opencode release that changed `sessionID` to an object or number
  * would otherwise poison downstream state with a garbage rowKey.
  * See FINDINGS.md L7.
  */
 function asSessionId(props: Record<string, unknown>): string | null {
-  const v = props["sessionId"];
+  const v = props["sessionID"];
   return typeof v === "string" && v.length > 0 ? v : null;
 }
 
