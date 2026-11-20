@@ -76,7 +76,7 @@ test("session.deleted does NOT call markExpectedDeletion or pushAll while halted
   await handler({
     event: {
       type: "session.deleted",
-      properties: { sessionId: "ses_doomed" },
+      properties: { sessionID: "ses_doomed" },
     },
   });
 
@@ -97,7 +97,7 @@ test("session.deleted DOES call markExpectedDeletion + pushAll when not halted",
   await handler({
     event: {
       type: "session.deleted",
-      properties: { sessionId: "ses_real" },
+      properties: { sessionID: "ses_real" },
     },
   });
 
@@ -123,4 +123,25 @@ test("server.connected calls sync.sync() — relies on sync()'s entry guard for 
   });
 
   expect(calls).toEqual(["sync"]);
+});
+
+test("session.created pushes the session named by opencode's sessionID property", async () => {
+  // Regression: the handler read `sessionId`, but opencode events carry
+  // `sessionID`, so no event ever queued a push.
+  const { stub, calls } = makeStubSync();
+  const handler = createEventHandler({
+    sessionSync: stub,
+    fileSync: noopFileSync,
+    machineId: "desktop",
+    log: () => {},
+  });
+
+  await handler({
+    event: {
+      type: "session.created",
+      properties: { sessionID: "ses_new", info: { id: "ses_new" } },
+    },
+  });
+
+  expect(calls).toEqual(["pushSession:ses_new"]);
 });
