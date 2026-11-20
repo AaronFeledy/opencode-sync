@@ -139,12 +139,11 @@ function createBootStatus(name: string): BootStatus {
 
 // ── Plugin module exports ──────────────────────────────────────────
 //
-// opencode loads plugin files from ~/.config/opencode/plugins/ and iterates
-// every named export, requiring each to be a function. We MUST NOT export a
-// non-function named binding (e.g. a string `id`) at module top level —
-// that would trip opencode's plugin loader with "Plugin export is not a
-// function". The plugin's identity for our own logging is just the string
-// `opencode-sync` baked into every line written by `logger.log` below.
+// The default export serves both opencode lines: v1 (1.4+) calls its
+// `server`, v2 calls its `setup`, and each ignores the other's key. With a
+// default object present, v1 no longer treats every named export as a plugin.
+// The root package.json `exports` points v2 at this file; without it, v2
+// resolves the repo's `server/` workspace and loads the sync server instead.
 
 export const server: Plugin = async (input, _options) => {
   // All log output goes to a file — see `logger.ts` for the rationale
@@ -517,3 +516,20 @@ export const server: Plugin = async (input, _options) => {
     }),
   };
 };
+
+/** The part of opencode v2's plugin context this plugin checks for. */
+type V2Context = { readonly session?: unknown };
+
+/**
+ * opencode v2 entry point. v2 stores sessions in a different schema than the
+ * v1 tables the sync engine reads and writes, so on v2 the plugin loads but
+ * syncs nothing yet: no sessions, files, or config overrides.
+ */
+async function setup(ctx: V2Context): Promise<void> {
+  // v1.19 also calls `setup` from an early v2 host without a session domain;
+  // `server` already runs the sync engine there.
+  if (ctx.session === undefined) return;
+  logger.log("opencode v2 detected: sync is not supported on v2 yet, sync engine is off");
+}
+
+export default { id: "opencode-sync", server, setup };

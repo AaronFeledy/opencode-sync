@@ -40,7 +40,7 @@ opencode-sync/
 ## Requirements
 
 - [Bun](https://bun.com) 1.1+
-- opencode 0.15+
+- opencode 1.4+. opencode v2 loads the plugin, but it syncs nothing there yet: v2 stores sessions in a different schema.
 - ZeroTier (or any other private network between the three machines)
 
 ## Installation
